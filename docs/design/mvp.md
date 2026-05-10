@@ -1362,6 +1362,696 @@ private:
 
 ---
 
+
+
+---
+
+## 12A. Runtime Device API 抽象
+
+前面 MVP 文档只提到了 `Tensor / Storage / MemoryPool / CUDA cubin load`，但这还不够。  
+Runtime 必须有一层统一的 **Device API**，否则 CPU / CUDA / 后续 NPU / Metal / Vulkan / vendor backend 都会直接侵入 VM。
+
+devproc2 runtime 不应该在 VM 执行逻辑里直接写 CUDA API。VM 应该只知道：
+
+```text
+我要在某个 device 上分配 storage；
+我要在某个 device 上拷贝数据；
+我要在某个 stream 上 launch kernel；
+我要做 device sync / stream sync。
+```
+
+具体怎么实现，由 DeviceAPI 负责。
+
+### 12A.1 Device 抽象
+
+Runtime 需要定义统一 device 标识：
+
+```cpp
+enum class DeviceType {
+    kCPU,
+    kCUDA,
+    kNPU,
+    kMetal,
+    kVulkan,
+};
+
+struct Device {
+    DeviceType type;
+    int device_id;
+};
+```
+
+示例：
+
+```text
+cpu(0)
+cuda(0)
+cuda(1)
+npu(0)
+```
+
+Tensor / Storage 都必须携带 device：
+
+```cpp
+class StorageObj : public Object {
+public:
+    Device device;
+    void* data;
+    size_t nbytes;
+};
+
+class TensorObj : public Object {
+public:
+    Storage storage;
+    int64_t offset;
+    ShapeTuple shape;
+    DataType dtype;
+    Device device;
+};
+```
+
+---
+
+### 12A.2 DeviceAPI 接口
+
+MVP 至少需要：
+
+```cpp
+class DeviceAPI {
+public:
+    virtual ~DeviceAPI() = default;
+
+    virtual void* Alloc(Device dev, size_t nbytes, size_t alignment) = 0;
+    virtual void Free(Device dev, void* ptr) = 0;
+
+    virtual void CopyDataFromTo(
+        const void* from,
+        void* to,
+        size_t nbytes,
+        Device from_dev,
+        Device to_dev,
+        void* stream
+    ) = 0;
+
+    virtual void StreamSync(Device dev, void* stream) = 0;
+    virtual void DeviceSync(Device dev) = 0;
+
+    virtual void* CreateStream(Device dev) = 0;
+    virtual void FreeStream(Device dev, void* stream) = 0;
+
+    virtual void SetDevice(Device dev) = 0;
+};
+```
+
+MVP 可以先实现：
+
+```text
+CPUDeviceAPI
+CUDADeviceAPI
+```
+
+后续再扩展：
+
+```text
+NPUDeviceAPI
+MetalDeviceAPI
+VulkanDeviceAPI
+VendorDeviceAPI
+```
+
+---
+
+### 12A.3 DeviceAPI Registry
+
+Runtime 通过 registry 查找 device API：
+
+```cpp
+class DeviceAPIRegistry {
+public:
+    static DeviceAPI* Get(DeviceType type);
+    static void Register(DeviceType type, DeviceAPI* api);
+};
+```
+
+使用方式：
+
+```cpp
+auto* api = DeviceAPIRegistry::Get(DeviceType::kCUDA);
+void* ptr = api->Alloc(Device{kCUDA, 0}, nbytes, 256);
+```
+
+VM / MemoryPool / Tensor copy 不直接依赖 CUDA。
+
+---
+
+### 12A.4 MemoryPool 与 DeviceAPI 的关系
+
+MemoryPool 不应该直接调用 `cudaMalloc`。
+
+正确关系是：
+
+```text
+VM
+  -> StoragePool / MemoryPool
+      -> DeviceAPI
+          -> cudaMalloc / cudaFree / cudaMemcpyAsync
+```
+
+StoragePlan 决定需要哪些 storage：
+
+```text
+storage_0: device=cuda(0), size=64MB
+storage_1: device=cpu(0), size=4MB
+```
+
+Runtime 执行时：
+
+```cpp
+Storage storage = memory_pool.Alloc(device, nbytes, alignment);
+```
+
+MemoryPool 内部再调用对应 DeviceAPI。
+
+---
+
+### 12A.5 Stream 抽象
+
+CUDA runtime 必须支持 stream。  
+但 VM 不应该直接知道 `cudaStream_t`。
+
+建议 runtime 定义：
+
+```cpp
+class StreamObj : public Object {
+public:
+    Device device;
+    void* handle;
+};
+```
+
+VMState 中保存默认 stream：
+
+```cpp
+class VMStateObj : public Object {
+public:
+    std::unordered_map<Device, Stream> default_streams;
+};
+```
+
+Kernel launch 时从 VMState 取 stream：
+
+```text
+Call kernel.matmul_add_silu
+  -> resolve CUDA kernel
+  -> get cuda stream from VMState
+  -> cuLaunchKernel(..., stream)
+```
+
+MVP 至少支持：
+
+```text
+1. 每个 device 一个 default stream；
+2. 用户可选传入外部 stream；
+3. stateful invoke 复用 stream；
+4. benchmark 时支持 stream sync。
+```
+
+---
+
+### 12A.6 Zero-copy 与 External Buffer
+
+Zero-copy input/output 本质上是用户把外部 buffer 包装成 Tensor。
+
+需要 API：
+
+```cpp
+Tensor Tensor::FromExternalBuffer(
+    void* data,
+    Device device,
+    ShapeTuple shape,
+    DataType dtype,
+    std::vector<int64_t> strides,
+    Deleter deleter = nullptr
+);
+```
+
+如果是外部 buffer：
+
+```text
+StorageObj owns_data = false
+```
+
+Runtime 不负责释放。
+
+Memory planner 也必须知道：
+
+```text
+1. input external storage 不参与 reuse；
+2. output external storage 不参与 reuse；
+3. external mutable state，比如 k_cache/v_cache，不参与临时 storage reuse。
+```
+
+---
+
+## 12B. Runtime Shape / PrimExpr 计算
+
+MVP 文档里提到了 dynamic shape 和 upper bound，但还缺少一个关键点：
+
+> 动态 shape 相关的表达式，最终必须在 runtime 里计算。
+
+例如：
+
+```text
+B = shape_of(x)[0]
+S = shape_of(x)[1]
+out_shape = [B, S, 4096]
+storage_size = upper(B) * upper(S) * 4096 * sizeof(float16)
+grid_x = ceildiv(S, BLOCK_M)
+grid_y = B
+```
+
+其中一部分可以 compile-time 静态化，一部分必须 runtime 计算。
+
+---
+
+### 12B.1 ShapeExpr / PrimExpr 分类
+
+建议把 shape 表达式分成两类：
+
+```text
+1. Compile-time shape expr
+2. Runtime shape expr
+```
+
+例如：
+
+```text
+H = 4096
+BLOCK_M = 16
+```
+
+是 compile-time constant。
+
+而：
+
+```text
+B = shape_of(x)[0]
+S = shape_of(x)[1]
+ceildiv(S, 16)
+```
+
+需要 runtime 计算。
+
+---
+
+### 12B.2 Runtime 需要支持的 PrimExpr
+
+MVP 不需要完整符号代数系统，但至少需要支持：
+
+```text
+const
+dim
+add
+sub
+mul
+floordiv
+ceildiv
+mod
+min
+max
+eq
+lt
+le
+gt
+ge
+and
+or
+```
+
+其中最关键的是：
+
+```text
+add / mul / ceildiv / min / max / le
+```
+
+这些会用于：
+
+```text
+1. output shape 计算；
+2. storage size 计算；
+3. runtime shape assert；
+4. kernel launch grid 计算；
+5. for/range loop bound 计算。
+```
+
+---
+
+### 12B.3 ShapeExpr Lowering 到 VM
+
+不要为每个 shape op 增加 VM opcode。
+
+仍然保持 VM 四指令：
+
+```text
+call
+ret
+if
+goto
+```
+
+shape 计算通过 builtin function table 完成：
+
+```text
+@vm.builtin.shape_of
+@vm.builtin.get_shape_dim
+@vm.builtin.add_i64
+@vm.builtin.mul_i64
+@vm.builtin.ceildiv_i64
+@vm.builtin.min_i64
+@vm.builtin.max_i64
+@vm.builtin.assert_le_i64
+```
+
+例如：
+
+```text
+%shape = call @vm.builtin.shape_of(%x)
+%B = call @vm.builtin.get_shape_dim(%shape, 0)
+%S = call @vm.builtin.get_shape_dim(%shape, 1)
+%grid_x = call @vm.builtin.ceildiv_i64(%S, 16)
+call @vm.builtin.assert_le_i64(%S, 2048)
+```
+
+VM opcode 仍然只有 `call`，但 function table 里有 shape builtin。
+
+---
+
+### 12B.4 Runtime Shape Heap / Shape Register
+
+VM register 可以直接保存 int64 shape value，也可以保存 ShapeTuple。
+
+建议：
+
+```text
+单个 dim: VMValue::Int
+shape tuple: ShapeTuple ObjectRef
+```
+
+例如：
+
+```text
+B -> Int
+S -> Int
+[B, S, H] -> ShapeTuple
+```
+
+这样 `alloc_tensor` 可以接受：
+
+```text
+storage, offset, shape_tuple, dtype, device
+```
+
+---
+
+### 12B.5 Upper Bound 的 Runtime 检查
+
+对于：
+
+```text
+S <= 2048
+```
+
+VM codegen 插入：
+
+```text
+call @vm.builtin.assert_le_i64(%S, 2048)
+```
+
+如果失败，runtime 报错：
+
+```text
+RuntimeShapeError: dimension S actual value 4096 exceeds upper bound 2048.
+```
+
+这是 memory planning 正确性的底线。
+
+---
+
+## 12C. `@devproc.kernel` 中的 div / mul / grid 计算怎么实现
+
+`@devproc.kernel` 中会出现两类 div / mul：
+
+```text
+1. kernel 内部的 div/mul
+2. kernel launch 参数中的 div/mul
+```
+
+它们处理方式不同。
+
+---
+
+### 12C.1 Kernel 内部 div / mul
+
+例如 Triton kernel 里：
+
+```python
+offs = pid * BLOCK + tl.arange(0, BLOCK)
+mask = offs < N
+```
+
+或者：
+
+```python
+row = idx // N
+col = idx % N
+```
+
+这些属于 kernel 内部计算。
+
+处理方式：
+
+```text
+@devproc.kernel backend=triton
+  -> 保留在 Triton source / Triton IR 中
+  -> Triton 编译成 cubin
+  -> runtime 不理解这些 div / mul
+```
+
+也就是说，kernel 内部 arithmetic 不由 devproc2 runtime 执行。
+
+Runtime 只负责 launch cubin。
+
+---
+
+### 12C.2 Kernel launch grid 中的 div / mul
+
+例如：
+
+```text
+grid = (ceildiv(M, BLOCK_M), ceildiv(N, BLOCK_N), B)
+```
+
+这里的 `ceildiv / mul / add` 是 runtime 需要计算的。
+
+因为 M / N / B 可能是动态 shape。
+
+解决方案：
+
+```text
+1. kernel metadata 记录 grid expression；
+2. VM codegen 将 grid expression lower 成 shape builtin call；
+3. runtime 算出 grid_x / grid_y / grid_z；
+4. kernel launcher 使用计算后的 grid launch cubin。
+```
+
+示例 kernel metadata：
+
+```json
+{
+  "name": "matmul_kernel",
+  "grid": [
+    {"op": "ceildiv", "args": ["M", "BLOCK_M"]},
+    {"op": "ceildiv", "args": ["N", "BLOCK_N"]},
+    1
+  ],
+  "block": [256, 1, 1]
+}
+```
+
+VM lowering 后：
+
+```text
+%grid_x = call @vm.builtin.ceildiv_i64(%M, %BLOCK_M)
+%grid_y = call @vm.builtin.ceildiv_i64(%N, %BLOCK_N)
+call @kernel.matmul(%a, %b, %out, %M, %N, %K, %grid_x, %grid_y)
+```
+
+---
+
+### 12C.3 Kernel ABI 中的 shape 参数
+
+DPS kernel ABI 应该明确 shape 参数如何传递。
+
+例如：
+
+```python
+@dp.kernel
+def matmul(a, b, out, M: int, N: int, K: int):
+    ...
+```
+
+高层 op：
+
+```python
+y = dp.ops.matmul(a, b)
+```
+
+中端 lowering：
+
+```text
+%M = shape_of(a)[0]
+%K = shape_of(a)[1]
+%N = shape_of(b)[1]
+%y = dp.empty([M, N], dtype=float16, device=cuda)
+call_dps @kernel.matmul(inputs=[%a, %b, %M, %N, %K], output=%y)
+```
+
+这样 kernel 内部不需要自己解析 Tensor shape metadata。  
+它直接拿到展开后的 int64 shape 参数。
+
+MVP 推荐这样做，ABI 更明确。
+
+---
+
+### 12C.4 Kernel launch builtin
+
+VM 可以把 kernel launch 统一封装成 builtin / kernel function：
+
+```text
+call @kernel.matmul(args...)
+```
+
+底层 runtime 做：
+
+```text
+1. 解析 Tensor 参数；
+2. 解析 scalar shape 参数；
+3. 根据 kernel metadata 计算或读取 grid/block；
+4. 准备 CUDA kernel 参数；
+5. 使用 DeviceAPI 获取 stream；
+6. cuLaunchKernel。
+```
+
+如果 grid 已经由 VM shape builtin 计算好，也可以作为 hidden args 传给 launcher。
+
+---
+
+### 12C.5 MVP 推荐规则
+
+MVP 里建议明确规定：
+
+```text
+1. kernel 内部 arithmetic 由 backend 编译器处理；
+2. kernel launch arithmetic 由 devproc2 runtime shape builtin 处理；
+3. dynamic dim 在 VM 中表现为 int64；
+4. kernel ABI 显式传 shape scalar；
+5. grid expression 进入 kernel metadata；
+6. runtime 只支持有限 PrimExpr：add/mul/ceildiv/min/max/compare。
+```
+
+这样边界清晰：
+
+```text
+Triton 负责 kernel 内部计算；
+VM/runtime 负责 shape 和 launch 参数计算；
+DeviceAPI 负责实际 device 操作。
+```
+
+---
+
+## 12D. Device API / Shape Runtime 相关新增里程碑
+
+### Milestone X1：Runtime Device API MVP
+
+目标：建立跨设备执行抽象。
+
+任务：
+
+```text
+- [ ] Device / DeviceType
+- [ ] DeviceAPI interface
+- [ ] DeviceAPIRegistry
+- [ ] CPUDeviceAPI
+- [ ] CUDADeviceAPI
+- [ ] Stream abstraction
+- [ ] MemoryPool 通过 DeviceAPI 分配内存
+- [ ] Tensor external buffer / zero-copy
+- [ ] device copy API
+```
+
+验收：
+
+```text
+VM 不直接调用 cudaMalloc / cudaMemcpy / cudaStreamSynchronize；
+所有设备操作都经过 DeviceAPI；
+CUDA tensor allocation / copy / stream sync 可运行。
+```
+
+---
+
+### Milestone X2：Runtime Shape Builtin MVP
+
+目标：支持 dynamic shape runtime 计算。
+
+任务：
+
+```text
+- [ ] ShapeTuple Object
+- [ ] shape_of builtin
+- [ ] get_shape_dim builtin
+- [ ] add_i64 / sub_i64 / mul_i64 builtin
+- [ ] floordiv_i64 / ceildiv_i64 builtin
+- [ ] min_i64 / max_i64 builtin
+- [ ] compare builtin
+- [ ] assert_le_i64 builtin
+- [ ] ShapeExpr lowering to VM call
+```
+
+验收：
+
+```text
+动态输入 Tensor[(B, S, H)] 能在 runtime 计算 B/S；
+能检查 S <= upper_bound；
+能用 ceildiv(S, BLOCK) 计算 kernel grid；
+能用动态 shape 创建 output tensor view。
+```
+
+---
+
+### Milestone X3：Kernel Launch Expression MVP
+
+目标：支持动态 shape kernel launch。
+
+任务：
+
+```text
+- [ ] kernel metadata 记录 grid expression
+- [ ] VM codegen lower grid expression
+- [ ] kernel ABI 支持 scalar shape args
+- [ ] CUDA launcher 接收 runtime grid/block
+- [ ] Triton cubin launch 支持 dynamic grid
+```
+
+验收：
+
+```text
+同一个 cubin 能在不同 S 下 launch；
+grid_x = ceildiv(S, BLOCK) 在 runtime 正确计算；
+kernel 输出正确。
+```
+
+
+
 ## 13. ABI 与编译产物
 
 ### 13.1 Artifact 结构
@@ -1475,10 +2165,12 @@ MVP pipeline：
 13. StorageSizeAnalyzePass
 14. StoragePlanPass
 15. LowerTensorCreateToAllocPass
-16. VMCodegenPass
-17. TritonAOTCompilePass
-18. ExecutableEmitPass
-19. ABIEmitPass
+16. ShapeExprLoweringPass
+17. KernelLaunchExprLoweringPass
+18. VMCodegenPass
+19. TritonAOTCompilePass
+20. ExecutableEmitPass
+21. ABIEmitPass
 ```
 
 关键点：
@@ -2203,6 +2895,11 @@ text
 - [ ] CUDA cubin load
 - [ ] zero-copy input/output
 - [ ] memory pool
+- [ ] DeviceAPI / DeviceAPIRegistry
+- [ ] CPUDeviceAPI / CUDADeviceAPI
+- [ ] Stream abstraction
+- [ ] runtime shape builtin
+- [ ] dynamic kernel launch grid expression
 ```
 
 ---
