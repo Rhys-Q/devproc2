@@ -1,0 +1,82 @@
+# Build artifacts
+build/
+build_*/
+/tmp/build_*/
+cmake-build-*/
+out/
+dist/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+*.cmake
+!CMakeLists.txt
+
+# FetchContent / CPM cache
+_deps/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.uv/
+uv.lock
+dist/
+*.whl
+
+# Python binding (generated)
+python/devproc2/runtime/*.so
+python/devproc2/runtime/*.pyd
+
+# Kernel build artifacts
+kernels/build/
+build/kernels/
+*.cubin
+*.ptx
+*.fatbin
+
+# VM artifacts
+*.vm
+*.devproc2_module
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and profiling
+*.log
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+
+# Generated docs
+docs/_build/
+site/
