@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, TypeAlias, Union
+
+if TYPE_CHECKING:
+    import numpy as np
+
+from devproc2.ir.prim_expr import IntImm, PrimExpr
 
 
 class Expr:
@@ -13,46 +18,23 @@ class StructInfo:
     """Base class for all struct info types (type + runtime structural info)."""
 
 
-class ShapeExpr:
-    """Base class for shape dimension expressions."""
-
-
-@dataclass(frozen=True)
-class SymbolicDim:
-    name: str
-    upper: Optional[int] = None
-
-
-@dataclass(frozen=True)
-class ConstDim(ShapeExpr):
-    value: int
-
-
-@dataclass(frozen=True)
-class SymDimRef(ShapeExpr):
-    dim: SymbolicDim
-
-
-@dataclass(frozen=True)
-class BinOpDim(ShapeExpr):
-    """Arithmetic combination of two shape expressions.
-
-    op must be one of: add, sub, mul, floordiv, ceildiv, min, max
-    """
-    op: str
-    lhs: ShapeExpr
-    rhs: ShapeExpr
-
-
 @dataclass(frozen=True)
 class TensorStructInfo(StructInfo):
-    shape: tuple[ShapeExpr, ...]
+    shape: tuple[PrimExpr, ...]
     dtype: str
     device: str
+
+    def __post_init__(self) -> None:
+        # Coerce bare int literals in shape to IntImm for ergonomic construction.
+        object.__setattr__(
+            self, "shape",
+            tuple(IntImm(s) if isinstance(s, int) else s for s in self.shape),
+        )
 
 
 @dataclass(frozen=True)
 class Var(Expr):
+    """SSA binding variable. Distinct from prim_expr.PrimVar."""
     name: str
     struct_info: Optional[StructInfo] = None
 
@@ -83,7 +65,8 @@ class OpaqueEffect(EffectInfo):
 
 @dataclass(frozen=True)
 class Constant(Expr):
-    value: object
+    # Scalar literal or numpy array (tensor constant loaded from weights).
+    value: Union[int, float, bool, None, "np.ndarray"]
 
 
 class CalleeKind(Enum):
@@ -129,11 +112,25 @@ class TensorCreateKind(Enum):
 @dataclass(frozen=True)
 class TensorCreateOp(Expr):
     kind: TensorCreateKind
-    shape: tuple[ShapeExpr, ...]
+    shape: tuple[PrimExpr, ...]  # must be () for empty_like
     dtype: str
     device: str
-    fill_value: Optional[object] = None
-    like: Optional[Var] = None
+    fill_value: Optional[object] = None  # only for full
+    like: Optional[Var] = None           # only for empty_like
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "shape",
+            tuple(IntImm(s) if isinstance(s, int) else s for s in self.shape),
+        )
+        if self.kind == TensorCreateKind.empty_like:
+            if self.like is None:
+                raise ValueError("TensorCreateOp(empty_like) requires 'like'")
+            if self.shape:
+                raise ValueError("TensorCreateOp(empty_like) must not specify 'shape'")
+        else:
+            if self.like is not None:
+                raise ValueError(f"TensorCreateOp({self.kind.name}) must not specify 'like'")
 
 
 @dataclass(frozen=True)
@@ -141,14 +138,14 @@ class Return(Expr):
     value: Expr
 
 
-# A Binding is (Optional[Var], Expr): var=None means a bare statement (no-output CallDPS).
-Binding = tuple[Optional[Var], Expr]
+# var=None means a bare statement (no-output CallDPS with no binding LHS).
+Binding: TypeAlias = tuple[Optional[Var], Expr]
 
 
 @dataclass(frozen=True)
 class Block:
     bindings: tuple[Binding, ...]
-    body: Expr
+    body: Expr  # must be Return (enforced by verifier)
 
 
 @dataclass(frozen=True)

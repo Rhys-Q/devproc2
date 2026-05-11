@@ -4,23 +4,16 @@ from dataclasses import fields
 from typing import Iterator
 
 from devproc2.ir.nodes import (
-    BinOpDim,
     Binding,
     Block,
     Call,
     CallDPS,
-    Constant,
+    EffectInfo,
     Expr,
     Function,
     IRModule,
     Return,
-    ShapeExpr,
-    SymDimRef,
-    TensorCreateOp,
-    TupleExpr,
-    TupleGetItem,
     Var,
-    WriteEffect,
 )
 
 _FORBIDDEN_CALLEES = frozenset({"@alloc_storage", "@alloc_tensor"})
@@ -43,16 +36,22 @@ class Verifier:
                     f"In @{name}: parameter '%{p.name}' defined more than once"
                 )
             defined.add(p.name)
-
         self._verify_block(name, fn.body, defined)
 
     def _verify_block(self, fn_name: str, block: Block, defined: set[str]) -> None:
+        # Note: `defined` is mutated in place. M3 If/For branches must copy it
+        # before recursing into sub-blocks to avoid cross-branch contamination.
+        if not isinstance(block.body, Return):
+            raise IRVerificationError(
+                f"In @{fn_name}: block body must be Return, "
+                f"got {type(block.body).__name__}"
+            )
         for binding in block.bindings:
             var, expr = binding
             self._check_forbidden(fn_name, expr)
             if isinstance(expr, Return):
                 raise IRVerificationError(
-                    f"In @{fn_name}: Return node must only appear as block body, not in bindings"
+                    f"In @{fn_name}: Return must only appear as block body, not in bindings"
                 )
             self._check_refs_defined(fn_name, expr, defined)
             if isinstance(expr, CallDPS):
@@ -62,7 +61,7 @@ class Verifier:
                     )
                 if expr.output is not None and var is None:
                     raise IRVerificationError(
-                        f"In @{fn_name}: CallDPS with output var must be bound in binding"
+                        f"In @{fn_name}: CallDPS with output set must be bound in binding"
                     )
             if var is not None:
                 if var.name in defined:
@@ -75,42 +74,57 @@ class Verifier:
         self._check_refs_defined(fn_name, block.body, defined)
 
     def _check_refs_defined(self, fn_name: str, expr: Expr, defined: set[str]) -> None:
-        for ref in _refs_in_expr(expr):
+        for ref in _value_refs(expr):
             if ref.name not in defined:
                 raise IRVerificationError(
                     f"In @{fn_name}: Variable '%{ref.name}' used before definition"
                 )
 
-    def _check_forbidden(self, fn_name: str, expr: Expr) -> None:
-        if isinstance(expr, (Call, CallDPS)):
-            callee = expr.callee
-            if callee in _FORBIDDEN_CALLEES:
-                node_name = callee.lstrip("@")
+    def _check_forbidden(self, fn_name: str, node: object) -> None:
+        if isinstance(node, (int, float, bool, str, type(None))):
+            return
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                self._check_forbidden(fn_name, item)
+            return
+        if isinstance(node, (Call, CallDPS)):
+            if node.callee in _FORBIDDEN_CALLEES:
+                node_name = node.callee.lstrip("@")
                 raise IRVerificationError(
                     f"In @{fn_name}: {node_name} is forbidden in high-level IR "
                     f"(use TensorCreateOp instead)"
                 )
+        try:
+            fs = fields(node)  # type: ignore[arg-type]
+        except TypeError:
+            return
+        for f in fs:
+            self._check_forbidden(fn_name, getattr(node, f.name))
 
 
-def _refs_in_expr(expr: object) -> Iterator[Var]:
-    """Depth-first walk collecting all Var nodes referenced in an expression tree."""
+def _value_refs(expr: object) -> Iterator[Var]:
+    """Depth-first walk collecting IR Var value-uses in an expression tree.
+
+    EffectInfo subtrees are skipped: WriteEffect.vars declares side-effect
+    metadata, not SSA value uses.
+    """
     if isinstance(expr, Var):
         yield expr
+        return
+    if isinstance(expr, EffectInfo):
         return
     if isinstance(expr, (int, float, bool, str, type(None))):
         return
     if isinstance(expr, (list, tuple)):
         for item in expr:
-            yield from _refs_in_expr(item)
+            yield from _value_refs(item)
         return
-    # dataclass nodes: recurse into all fields
     try:
         fs = fields(expr)  # type: ignore[arg-type]
     except TypeError:
         return
     for f in fs:
-        child = getattr(expr, f.name)
-        yield from _refs_in_expr(child)
+        yield from _value_refs(getattr(expr, f.name))
 
 
 def verify(module: IRModule) -> None:
