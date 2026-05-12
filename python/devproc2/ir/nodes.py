@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional, TypeAlias, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
     import numpy as np
@@ -10,12 +10,45 @@ if TYPE_CHECKING:
 from devproc2.ir.prim_expr import IntImm, PrimExpr
 
 
-class Expr:
-    """Base class for all IR expression nodes."""
+# ---------------------------------------------------------------------------
+# Value hierarchy — operands passed to Ops
+# ---------------------------------------------------------------------------
 
+class Value:
+    """Base class for Op operands (Var, OpResult, or Constant)."""
+
+
+@dataclass(frozen=True)
+class Var(Value):
+    """Block argument — defined at block entry (function params, iter args)."""
+    name: str
+    struct_info: Optional[StructInfo] = None
+
+
+@dataclass(frozen=True)
+class Constant(Value):
+    """Compile-time scalar or tensor constant."""
+    value: Union[int, float, bool, None, "np.ndarray"]
+
+
+@dataclass(frozen=True)
+class OpResult(Value):
+    """SSA value produced by an Op.
+
+    op.results[index] gives this value.  The name for printing is stored
+    on the defining Op (result_name / result_names), not here.
+    """
+    op: Op
+    index: int
+    struct_info: Optional[StructInfo] = None
+
+
+# ---------------------------------------------------------------------------
+# StructInfo — type + shape metadata attached to Vars / OpResults
+# ---------------------------------------------------------------------------
 
 class StructInfo:
-    """Base class for all struct info types (type + runtime structural info)."""
+    """Base class for structural type info (shape + dtype + device)."""
 
 
 @dataclass(frozen=True)
@@ -25,19 +58,15 @@ class TensorStructInfo(StructInfo):
     device: str
 
     def __post_init__(self) -> None:
-        # Coerce bare int literals in shape to IntImm for ergonomic construction.
         object.__setattr__(
             self, "shape",
             tuple(IntImm(s) if isinstance(s, int) else s for s in self.shape),
         )
 
 
-@dataclass(frozen=True)
-class Var(Expr):
-    """SSA binding variable. Distinct from prim_expr.PrimVar."""
-    name: str
-    struct_info: Optional[StructInfo] = None
-
+# ---------------------------------------------------------------------------
+# EffectInfo — side-effect annotation for CallDPSOp
+# ---------------------------------------------------------------------------
 
 class EffectInfo:
     """Base class for effect annotations."""
@@ -63,96 +92,75 @@ class OpaqueEffect(EffectInfo):
     pass
 
 
-@dataclass(frozen=True)
-class Constant(Expr):
-    # Scalar literal or numpy array (tensor constant loaded from weights).
-    value: Union[int, float, bool, None, "np.ndarray"]
-
-
-class CalleeKind(Enum):
-    vm_func = auto()
-    builtin = auto()
-    packed_func = auto()
-    kernel = auto()
-
+# ---------------------------------------------------------------------------
+# Op — base class for all IR operations
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class Call(Expr):
-    callee: str
-    args: tuple[Expr, ...]
+class Op:
+    """Base class for all IR operations.
+
+    results is populated by subclass __post_init__ via object.__setattr__.
+    Subclasses store result names in result_name / result_names fields;
+    the printer reads those to assign display names.
+    """
+    results: tuple[OpResult, ...] = field(default_factory=tuple, init=False)
 
 
 @dataclass(frozen=True)
-class CallDPS(Expr):
-    callee: str
-    inputs: tuple[Expr, ...]
-    output: Optional[Var]
-    effect: EffectInfo
-    callee_kind: CalleeKind
+class TerminatorOp(Op):
+    """Marker base class for block-terminating ops (ReturnOp, YieldOp)."""
 
 
-@dataclass(frozen=True)
-class TupleExpr(Expr):
-    elems: tuple[Expr, ...]
-
-
-@dataclass(frozen=True)
-class TupleGetItem(Expr):
-    tup: Expr
-    index: int
-
-
-class TensorCreateKind(Enum):
-    empty = auto()
-    zeros = auto()
-    full = auto()
-    empty_like = auto()
-
-
-@dataclass(frozen=True)
-class TensorCreateOp(Expr):
-    kind: TensorCreateKind
-    shape: tuple[PrimExpr, ...]  # must be () for empty_like
-    dtype: str
-    device: str
-    fill_value: Optional[object] = None  # only for full
-    like: Optional[Var] = None           # only for empty_like
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "shape",
-            tuple(IntImm(s) if isinstance(s, int) else s for s in self.shape),
-        )
-        if self.kind == TensorCreateKind.empty_like:
-            if self.like is None:
-                raise ValueError("TensorCreateOp(empty_like) requires 'like'")
-            if self.shape:
-                raise ValueError("TensorCreateOp(empty_like) must not specify 'shape'")
-        else:
-            if self.like is not None:
-                raise ValueError(f"TensorCreateOp({self.kind.name}) must not specify 'like'")
-
-
-@dataclass(frozen=True)
-class Return(Expr):
-    value: Expr
-
-
-# var=None means a bare statement (no-output CallDPS with no binding LHS).
-Binding: TypeAlias = tuple[Optional[Var], Expr]
-
+# ---------------------------------------------------------------------------
+# Block — linear sequence of Ops
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Block:
-    bindings: tuple[Binding, ...]
-    body: Expr  # must be Return (enforced by verifier)
+    """A basic block: block arguments followed by a sequence of Ops.
 
+    args: SSA values defined at block entry (Var — function params, iter vars).
+    ops:  Ordered Op sequence.  The last Op MUST be a TerminatorOp.
+    """
+    args: tuple[Var, ...]
+    ops:  tuple[Op, ...]
+
+
+# ---------------------------------------------------------------------------
+# Region — container of one or more Blocks
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Region:
+    """A region holds one or more Blocks.
+
+    For structured control flow (MVP), each region contains exactly one Block.
+    """
+    blocks: tuple[Block, ...]
+
+    @property
+    def entry_block(self) -> Block:
+        return self.blocks[0]
+
+
+# ---------------------------------------------------------------------------
+# Function / IRModule
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Function:
-    params: tuple[Var, ...]
-    body: Block
+    """A named function with a single body Region.
+
+    params is a convenience property derived from the entry block's args —
+    there is no separate stored field to avoid redundancy.
+    """
+    body: Region
     ret_struct_info: Optional[StructInfo] = None
+
+    @property
+    def params(self) -> tuple[Var, ...]:
+        return self.body.entry_block.args
 
 
 @dataclass
