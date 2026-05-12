@@ -102,26 +102,131 @@ verifier 能检测到 `alloc_storage` 出现时报错。
 
 ## M3：Control Flow MVP
 
-**目标**：支持 Python `if/elif/else` 和 `for/dp.range`，IR 采用结构化表达（不引入 CFG / φ 节点）。
+**目标**：支持 Python `if/elif/else` 和 `for/dp.range`，IR 采用结构化表达（Structured CF + Region + Yield），不引入 CFG / φ 节点。详细设计见 [docs/design/control_flow.md](../design/control_flow.md)。
+
+### 子里程碑
+
+| 子里程碑 | 目标 |
+|---|---|
+| M3.1 IR Skeleton | 建立控制流 IR 骨架（If / For / Yield / Range / IterArg） |
+| M3.2 If Frontend | Python if/elif/else → IR |
+| M3.3 For Frontend | dp.range for-loop → IR |
+| M3.4 Nested CF | if/for 嵌套支持 |
+| M3.5 Normalize + Verify | 合法性保证 |
 
 ### 任务清单
 
 **IR 节点（`python/devproc2/ir/control_flow.py`）**
-- [ ] `If`：condition + true_branch(Block) + false_branch(Block)
-- [ ] `For`：loop_var + range + iter_args（loop-carried variables）+ body(Block) + yield
+- [ ] `Terminator`：region 终结语句基类
+- [ ] `Yield(Terminator)`：`values: list[Value]`，values 可为空（effect-only region）
+- [ ] `Range`：`start: Value, end: Value, step: Value`
+- [ ] `IterArg`：`var: Var, init: Value`，表达 loop-carried variable
+- [ ] `If`：`cond + true_branch(Block) + false_branch(Block|None) + result_structs: list[StructInfo]`
+  - `result_structs` 非空 → 有 SSA result（纯函数式分支）
+  - `result_structs` 为空 → effect-only 分支（结果通过 effect 写入已有 buffer）
+- [ ] `For`：`loop_var + range(Range) + iter_args(list[IterArg]) + body(Block) + result_structs: list[StructInfo]`
+  - iter_args 可为空（effect-only loop）
+  - result_structs 可为空（effect-only loop）
 
-**前端 DSL（`python/devproc2/frontend/dsl.py`）**
-- [ ] 通过 `ast` 模块捕获 Python `if/elif/else`
-- [ ] 通过 `ast` 模块捕获 `for i in dp.range(start, end, step)`
-- [ ] loop-carried variable 检测（循环体内被重新赋值的变量）
+**Block 扩展（`python/devproc2/ir/nodes.py`）**
+- [ ] 扩展 `Block.body` 接受 `Yield`（control-flow region）和 `Return`（function block）
+  - 函数顶层 Block：body 为 `Return`
+  - If / For region Block：body 为 `Yield`（values 可为空）
 
-**Pass（`python/devproc2/compiler/passes/control_flow_normalize.py`）**
-- [ ] `elif` → nested `if` 展平
-- [ ] `for` body 内对外部变量的读写转为 iter_args
+**Printer 扩展（`python/devproc2/ir/printer.py`）**
+- [ ] 打印 `If`（有 result 和 effect-only 两种格式）
+- [ ] 打印 `For`（有 iter_args 和 effect-only 两种格式）
+- [ ] 打印 `Yield`（有 values 和空两种格式）
+- [ ] 打印 `Range`
+
+**Verifier 扩展（`python/devproc2/ir/verifier.py`）**
+- [ ] `If` 校验：result_structs 非空时 then/else 必须 yield values，数量/类型一致；result_structs 为空时 yield 必须为空
+- [ ] `For` 校验：iter_args 数量 == yield values 数量 == result_structs 数量
+- [ ] `Yield` 位置校验：只能作为 region terminator，不能出现在 region 中间
+
+**前端 DSL（`python/devproc2/frontend/`）**
+- [ ] `scope.py`：`ScopeFrame(bindings: dict[str, Value])`、`ScopeStack`，支持嵌套 if/for 作用域
+- [ ] `dsl.py`：
+  - `visit_If`：捕获 `ast.If`，分析两侧 scope，检测变量合流，生成 SSA result（纯函数式）或 effect-only If
+  - `visit_For`：捕获 `ast.For`，iter 必须为 `dp.range`，lower start/end/step，检测 loop-carried variable，生成 iter_args
+  - `lower_dp_range`：`dp.range(start, end[, step=1])` → `Range`
+  - `loop_carried_analysis`：loop 外变量在 body 内被重新赋值 → 转为 iter_arg
+
+**Pass（`python/devproc2/compiler/passes/`）**
+- [ ] `control_flow_normalize.py`：
+  - `elif` → nested `If` 展平
+  - `dp.range` 默认参数补齐（step 缺省为 1）
+  - 规范化 `Yield`（确保每个 region 都有 Yield terminator）
+  - 推导 `result_structs`（从 yield values 的 StructInfo 推导）
+- [ ] `control_flow_verify.py`：
+  - If 校验（result_structs / yield values 数量类型一致）
+  - For 校验（iter_args / yield values / result_structs 三者数量一致）
+  - Scope 校验：禁止 loop_var 泄漏到 loop 外；禁止 Yield 后还有语句；拒绝 unsupported 控制流（while / break / continue）
 
 ### 验收标准
 
-以下代码通过编译并输出正确 IR：
+**场景 1：有 SSA result 的 If（纯函数式）**
+
+```python
+@dp.function
+def branch_relu_silu(x, flag):
+    if flag:
+        y = dp.ops.relu(x)
+    else:
+        y = dp.ops.silu(x)
+    return y
+```
+
+IR：`%y = if %flag { yield %v0 } else { yield %v1 }`，`If.result_structs` 非空。
+
+---
+
+**场景 2：effect-only If（无 SSA result）**
+
+```python
+@dp.function
+def update(k_cache, v_cache, cond, k, v, pos):
+    if cond:
+        dp.ops.update_kvcache(k_cache, v_cache, k, v, pos)
+    else:
+        dp.ops.noop(k_cache)
+    return k_cache
+```
+
+IR：`If.result_structs == []`，两个分支 `yield`（无 values），结果通过 effect 写入 buffer。
+
+---
+
+**场景 3：loop-carried For**
+
+```python
+@dp.function
+def loop_accum(x, n):
+    acc = dp.ops.zeros_like(x)
+    for i in dp.range(0, n):
+        acc = dp.ops.add(acc, x)
+    return acc
+```
+
+IR：`acc` 转为 iter_arg，body `yield %next_acc`，For 有 SSA result。
+
+---
+
+**场景 4：effect-only For（无 iter_args，无 result）**
+
+```python
+@dp.function
+def write_loop(k_cache, v_cache, keys, vals, n):
+    for i in dp.range(0, n):
+        dp.ops.update_kvcache(k_cache, v_cache, keys[i], vals[i], i)
+    return k_cache
+```
+
+IR：`iter_args == []`，`result_structs == []`，body `yield`（无 values）。
+
+---
+
+**场景 5：嵌套控制流 + elif 展平（综合场景）**
 
 ```python
 @dp.function
@@ -139,7 +244,7 @@ def decode_step(x, flag, n):
     return y
 ```
 
-生成的 IR 中 elif 被展平为嵌套 if，loop-carried `y` 通过 iter_args 正确传递。
+IR 中 `elif` 被展平为嵌套 If；loop-carried `y` 通过 iter_args 正确传递；verifier 通过。
 
 ---
 
