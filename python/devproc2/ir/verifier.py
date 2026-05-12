@@ -122,6 +122,29 @@ class Verifier:
     # Op-level verification
     # ------------------------------------------------------------------
 
+    def _chk_value(
+        self,
+        fn_name: str,
+        v: Value,
+        defined_names: set[str],
+        defined_results: set[int],
+    ) -> None:
+        """Assert that v (Var or OpResult) has been defined in the current scope.
+
+        id(OpResult) is used as identity: within one IR tree construction
+        all OpResult objects are alive, so id() is stable and unique.
+        """
+        if isinstance(v, Var):
+            if v.name not in defined_names:
+                raise IRVerificationError(
+                    f"In @{fn_name}: Variable '%{v.name}' used before definition"
+                )
+        elif isinstance(v, OpResult):
+            if id(v) not in defined_results:
+                raise IRVerificationError(
+                    f"In @{fn_name}: OpResult used before definition"
+                )
+
     def _verify_op(
         self,
         fn_name: str,
@@ -132,16 +155,7 @@ class Verifier:
         self._check_forbidden(fn_name, op)
 
         def chk(v: Value) -> None:
-            if isinstance(v, Var):
-                if v.name not in defined_names:
-                    raise IRVerificationError(
-                        f"In @{fn_name}: Variable '%{v.name}' used before definition"
-                    )
-            elif isinstance(v, OpResult):
-                if id(v) not in defined_results:
-                    raise IRVerificationError(
-                        f"In @{fn_name}: OpResult used before definition"
-                    )
+            self._chk_value(fn_name, v, defined_names, defined_results)
 
         if isinstance(op, CallOp):
             for v in _value_refs(op.args):
@@ -194,14 +208,7 @@ class Verifier:
         defined_results: set[int],
     ) -> None:
         def chk(v: Value) -> None:
-            if isinstance(v, Var) and v.name not in defined_names:
-                raise IRVerificationError(
-                    f"In @{fn_name}: Variable '%{v.name}' used before definition"
-                )
-            elif isinstance(v, OpResult) and id(v) not in defined_results:
-                raise IRVerificationError(
-                    f"In @{fn_name}: OpResult used before definition"
-                )
+            self._chk_value(fn_name, v, defined_names, defined_results)
 
         chk(op.cond)
         self._verify_region(fn_name, op.then_region, set(defined_names), set(defined_results), YieldOp)
@@ -238,14 +245,7 @@ class Verifier:
         defined_results: set[int],
     ) -> None:
         def chk(v: Value) -> None:
-            if isinstance(v, Var) and v.name not in defined_names:
-                raise IRVerificationError(
-                    f"In @{fn_name}: Variable '%{v.name}' used before definition"
-                )
-            elif isinstance(v, OpResult) and id(v) not in defined_results:
-                raise IRVerificationError(
-                    f"In @{fn_name}: OpResult used before definition"
-                )
+            self._chk_value(fn_name, v, defined_names, defined_results)
 
         for v in _value_refs((op.range_.start, op.range_.end, op.range_.step)):
             chk(v)

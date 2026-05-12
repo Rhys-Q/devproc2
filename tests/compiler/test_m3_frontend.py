@@ -245,3 +245,58 @@ def bad(x, n):
     fn_def = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
     with pytest.raises(DSLError, match="break"):
         DSLBuilder().build(fn_def)
+
+
+# ---------------------------------------------------------------------------
+# IRRewriter correctness: nested IfOp result substitution (issue 9)
+# ---------------------------------------------------------------------------
+
+def test_normalize_pass_nested_if_result_substitution():
+    """ControlFlowNormalizePass must correctly propagate result substitution
+    through nested IfOps so verify() passes after the rewrite."""
+    @dp.function
+    def f(x, a, b):
+        if a:
+            if b:
+                y = dp.ops.relu(x)
+            else:
+                y = dp.ops.silu(x)
+        else:
+            y = dp.ops.gelu(x)
+        return y
+
+    module = dp.get_module()
+    normalized = ControlFlowNormalizePass().run(module)
+    verify(normalized)
+    assert "f" in normalized.functions
+
+
+# ---------------------------------------------------------------------------
+# ControlFlowVerifyPass error cases (issue 10)
+# ---------------------------------------------------------------------------
+
+def test_cf_verify_rejects_effect_only_if_with_yielded_values():
+    """An effect-only IfOp (no result_names) whose branches yield values
+    passes the base verifier but must be caught by ControlFlowVerifyPass."""
+    from devproc2.ir import Block, CallOp, Function, IfOp, IRModule, Region, ReturnOp, Var, YieldOp
+    from devproc2.ir.verifier import IRVerificationError
+
+    x = Var("x"); flag = Var("flag")
+    relu_op = CallOp(callee="@relu", args=(x,), result_name="v"); v = relu_op.results[0]
+    silu_op = CallOp(callee="@silu", args=(x,), result_name="v2"); v2 = silu_op.results[0]
+
+    # result_names=() means effect-only, but both branches yield a value —
+    # base verifier doesn't catch this; ControlFlowVerifyPass must.
+    then_region = Region((Block(args=(), ops=(relu_op, YieldOp((v,)))),))
+    else_region = Region((Block(args=(), ops=(silu_op, YieldOp((v2,)))),))
+    if_op = IfOp(cond=flag, then_region=then_region, else_region=else_region)
+    block = Block(args=(x, flag), ops=(if_op, ReturnOp((x,))))
+    module = IRModule({"f": Function(Region((block,)))})
+
+    # Base verifier passes (yield counts are consistent: 1 == 1).
+    verify(module)
+
+    # ControlFlowVerifyPass must reject it.
+    with pytest.raises(IRVerificationError, match="effect-only"):
+        ControlFlowVerifyPass().run(module)
+

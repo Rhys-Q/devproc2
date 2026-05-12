@@ -22,6 +22,12 @@ class IRRewriter:
     Subclasses override `rewrite_op` to transform specific Op types.
     The base `rewrite_block` applies `rewrite_op` to each op and maintains
     a substitution map so that downstream ops automatically see new results.
+
+    Scope note: `_sub` is a single dict shared across nested rewrite_region
+    calls.  Inner-region results get registered in the same dict as outer
+    results.  This is safe because SSA guarantees that inner results are never
+    referenced outside their containing region; the stale entries are simply
+    never looked up from outer scopes.
     """
 
     def __init__(self) -> None:
@@ -112,4 +118,12 @@ class IRRewriter:
             return op  # shape is PrimExpr, not Value; no substitution needed
         if isinstance(op, ShapeAssertOp):
             return op  # tensor is a Var (block arg), no substitution needed
+        # Unknown op type returned as-is.  Safe only when the op carries no
+        # Value-typed operands that might reference substituted OpResults.
+        # If a new Op with Value fields is added, add an explicit case above —
+        # omitting it will cause "OpResult used before definition" in verify().
+        assert not op.results, (
+            f"Unhandled Op type with results in IRRewriter._subst_op: "
+            f"{type(op).__name__}. Add an explicit case to preserve operand substitution."
+        )
         return op

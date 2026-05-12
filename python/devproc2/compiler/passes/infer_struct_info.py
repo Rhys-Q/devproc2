@@ -28,11 +28,15 @@ class InferStructInfoPass(IRRewriter):
             # Record existing struct_info.
             if op.results[0].struct_info is not None:
                 self._type_env[id(op.results[0])] = op.results[0].struct_info
-            # Propagate from first arg if result has none.
+            # MVP: propagate from the first argument only (element-wise ops).
+            # Binary/multi-arg ops whose result shape differs from args[0] are
+            # not inferred here; extend this method when needed.
             elif op.args:
-                first = op.args[0]
-                # First, apply substitution (in case first was mapped)
-                first = self.sv(first)
+                # Apply any pending substitution before the id() lookup so we
+                # find the type_env entry for the canonical (possibly replaced)
+                # value.  Timing: sv() uses _sub populated by earlier ops in
+                # the same rewrite_block pass, so this is always up-to-date.
+                first = self.sv(op.args[0])
                 si = self._type_env.get(id(first))
                 if si is not None:
                     new_op = CallOp(

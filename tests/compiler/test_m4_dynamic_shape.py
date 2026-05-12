@@ -65,6 +65,12 @@ def test_tensor_annotation_three_args():
     assert si.device == "cuda"
 
 
+def test_tensor_annotation_rejects_wrong_arity():
+    B = dp.symbolic_dim("B", upper=8)
+    with pytest.raises(TypeError):
+        dp.Tensor[(B, 4096), "float16", "cuda", "extra"]  # 4 args
+
+
 # ---------------------------------------------------------------------------
 # @dp.function with type annotations
 # ---------------------------------------------------------------------------
@@ -270,6 +276,13 @@ def test_shape_constraint_verify_violation_B():
     module = _make_asserted_module()
     with pytest.raises(RuntimeShapeError, match="B"):
         ShapeConstraintVerifyPass().run(module, bindings={"B": 16, "S": 512})
+
+
+def test_shape_constraint_verify_violation_B_at_boundary():
+    """B=9 is exactly one over the upper bound of 8; must raise."""
+    module = _make_asserted_module()
+    with pytest.raises(RuntimeShapeError, match="B"):
+        ShapeConstraintVerifyPass().run(module, bindings={"B": 9, "S": 512})
 
 
 def test_shape_constraint_verify_no_bindings_noop():

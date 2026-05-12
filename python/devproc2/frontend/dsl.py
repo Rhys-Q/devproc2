@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import builtins as _builtins
 import inspect
 import textwrap
 from typing import Optional
@@ -53,13 +54,13 @@ class Tensor:
     """dp.Tensor[(B, S, 4096), "float16", "cuda"] → TensorStructInfo."""
 
     def __class_getitem__(cls, args):
-        if not isinstance(args, tuple) or len(args) < 2:
+        if not isinstance(args, tuple) or len(args) not in (2, 3):
             raise TypeError("dp.Tensor requires (shape, dtype) or (shape, dtype, device)")
         if len(args) == 2:
             shape_tpl, dtype = args
             device = "cuda"
         else:
-            shape_tpl, dtype, device = args[0], args[1], args[2]
+            shape_tpl, dtype, device = args
         if not isinstance(shape_tpl, tuple):
             shape_tpl = (shape_tpl,)
         return TensorStructInfo(shape_tpl, dtype, device)
@@ -87,11 +88,8 @@ def reset_module() -> None:
 
 class _RangeStub:
     def __call__(self, start, end, step=1):
-        return builtins_range(int(start), int(end), int(step))
+        return _builtins.range(int(start), int(end), int(step))
 
-
-import builtins
-builtins_range = builtins.range
 
 class _OpsStub:
     def __getattr__(self, name: str):

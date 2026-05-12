@@ -37,6 +37,11 @@ class OpResult(Value):
 
     op.results[index] gives this value.  The name for printing is stored
     on the defining Op (result_name / result_names), not here.
+
+    Design note: OpResult holds a strong back-reference to its defining Op,
+    and Op.results holds all its OpResults — a deliberate cyclic reference.
+    Python's cyclic GC handles this; the cycle is broken when the IR tree
+    is no longer reachable.
     """
     op: Op
     index: int
