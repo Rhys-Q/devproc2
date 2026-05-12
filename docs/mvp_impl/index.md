@@ -6,7 +6,7 @@
 |---|---|
 | [00_infra.md](00_infra.md) | 项目基建：目录结构、Python uv 环境、CMakeLists.txt、工具链配置 |
 | [01_milestones.md](01_milestones.md) | 15 个里程碑（M1-M12 + X1-X3）：任务清单 + 验收标准 |
-| [02_compiler_pipeline.md](02_compiler_pipeline.md) | 21 步编译 Pass 流水线：每步输入/输出/关键不变量 |
+| [02_compiler_pipeline.md](02_compiler_pipeline.md) | 18 步编译 Pass 流水线：每步输入/输出/关键不变量 |
 | [03_runtime_design.md](03_runtime_design.md) | C++ Runtime 详细设计：Object 系统、VM、DeviceAPI、PackedFunc、ABI |
 
 ## 设计文档（上游参考）
@@ -15,6 +15,7 @@
 |---|---|
 | [docs/design/overview.md](../design/overview.md) | 系统整体架构、模块分解、长期路线图 |
 | [docs/design/mvp.md](../design/mvp.md) | IR 设计、控制流、内存规划、VM、里程碑 1–12 + X1–X3 |
+| [docs/design/control_flow.md](../design/control_flow.md) | M3 控制流详细设计：Structured CF + Region + Yield + IterArgs + Effect-aware IR |
 | [docs/design/从llama.cpp中学到了什么.md](../design/从llama.cpp中学到了什么.md) | 从 llama.cpp 学到的关键设计经验和四阶段演进路线 |
 
 ## 推荐开发顺序

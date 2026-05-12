@@ -480,9 +480,14 @@ public:
         return std::aligned_alloc(alignment, (nbytes + alignment - 1) / alignment * alignment);
     }
     void Free(Device, void* ptr) override { std::free(ptr); }
-    void CopyDataFromTo(const void* from, void* to, size_t nbytes,
-                        Device, Device, void*) override {
-        std::memcpy(to, from, nbytes);
+    void CopyDataFromTo(DLTensor* from, DLTensor* to, void* /*stream*/) override {
+        size_t nbytes = 1;
+        for (int i = 0; i < from->ndim; ++i) nbytes *= from->shape[i];
+        nbytes *= (from->dtype.bits * from->dtype.lanes + 7) / 8;
+        std::memcpy(
+            static_cast<char*>(to->data) + to->byte_offset,
+            static_cast<const char*>(from->data) + from->byte_offset,
+            nbytes);
     }
     void StreamSync(Device, void*) override {}
     void DeviceSync(Device) override {}
