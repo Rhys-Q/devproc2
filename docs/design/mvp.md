@@ -706,81 +706,172 @@ MVP 对 opaque 保守处理：
 
 ## 5. Control Flow 设计
 
-MVP 必须支持：
+> 详细设计见 [docs/design/control_flow.md](control_flow.md)。本节给出核心要点。
+
+### 5.1 设计原则
+
+MVP 采用 **Structured Control Flow + Region + Yield** 方案，不引入 CFG / BasicBlock / φ 节点。
+
+IR 保留嵌套结构：
 
 ```text
-if
-elif
-else
-for
-range
+Function
+  Block
+    If
+      then_region (Block)
+      else_region (Block)
+    For
+      body_region (Block)
 ```
 
-### 5.1 If / Elif / Else
+控制流有两种模式：
 
-DSL：
-
-```python
-@dp.function
-def main(x, flag):
-    if flag:
-        y = dp.ops.relu(x)
-    elif x.shape[0] > 1:
-        y = dp.ops.silu(x)
-    else:
-        y = dp.ops.gelu(x)
-    return y
-```
-
-IR 中 `elif` 可以 normalize 成 nested if：
+**有 SSA result（纯函数式）**：
 
 ```text
-if %flag {
-  %y = call @relu(%x)
+%y = if %flag {
+    %v0 = call @relu(%x)
+    yield %v0
 } else {
-  if %cond {
-    %y = call @silu(%x)
-  } else {
-    %y = call @gelu(%x)
-  }
+    %v1 = call @silu(%x)
+    yield %v1
 }
-return %y
 ```
+
+**Effect-only（无 result）**：
+
+```text
+if %cond {
+    call_dps @kernel.update_kvcache(...)
+    yield
+} else {
+    call_dps @kernel.noop(...)
+    yield
+}
+```
+
+这是 devproc2 DPS + stateful call 场景的必需支持。`If.result_structs == []` 时为 effect-only 分支。
 
 ---
 
-### 5.2 For / Range
+### 5.2 IR 节点
 
-DSL：
+| 节点 | 说明 |
+|---|---|
+| `If` | `cond + true_branch(Block) + false_branch(Block) + result_structs` |
+| `For` | `loop_var + range(Range) + iter_args + body(Block) + result_structs` |
+| `Range` | `start + end + step`（均为 Value） |
+| `IterArg` | `var + init`，表达 loop-carried variable |
+| `Yield` | Region terminator，`values` 可为空 |
+
+`Yield` 是每个 control-flow region 的终结语句，不等同于 `Return`。
+
+---
+
+### 5.3 典型示例
+
+**If / Elif / Else**（`elif` → nested If）：
+
+```python
+if flag:
+    y = dp.ops.relu(x)
+elif x.shape[0] > 1:
+    y = dp.ops.silu(x)
+else:
+    y = dp.ops.gelu(x)
+```
+
+IR（`ControlFlowNormalizePass` 展平后）：
+
+```text
+%y = if %flag {
+    %v0 = call @relu(%x)
+    yield %v0
+} else {
+    %y2 = if %cond {
+        %v1 = call @silu(%x)
+        yield %v1
+    } else {
+        %v2 = call @gelu(%x)
+        yield %v2
+    }
+    yield %y2
+}
+```
+
+**Loop-carried For**：
+
+```python
+acc = init
+for i in dp.range(0, n):
+    acc = acc + x
+```
+
+IR：
+
+```text
+%acc_out = for %i in range(0, %n, 1)
+           iter_args(%acc_iter = %init) {
+    %next = call @add(%acc_iter, %x)
+    yield %next
+}
+```
+
+**Effect-only For**（无 iter_args，无 result）：
 
 ```python
 for i in dp.range(0, n):
-    x = dp.ops.step(x, i)
+    dp.ops.update_kvcache(k_cache, v_cache, k[i], v[i], i)
 ```
 
-IR 推荐结构化表达：
+IR：
 
 ```text
-%x_out = for %i in range(0, %n, 1) iter_args(%x_iter = %x) {
-    %x_next = call @step(%x_iter, %i)
-    yield %x_next
+for %i in range(0, %n, 1) {
+    call_dps @kernel.update_kvcache(
+        inputs=[%k_cache, %v_cache, ...],
+        output=None,
+        effect=write(%k_cache, %v_cache)
+    )
+    yield
 }
 ```
 
-这种方式比 CFG φ 节点更适合结构化 IR。
+---
+
+### 5.4 MVP 支持范围
+
+支持：
+
+```text
+if / elif / else
+for i in dp.range(start, end, step)
+loop-carried variable（iter_args）
+effect-only if / for
+nested if/for
+```
+
+暂不支持：
+
+```text
+while / break / continue
+return inside if/for
+for x in iterable（只支持 dp.range）
+Python object truthiness
+```
 
 ---
 
-### 5.3 Lowering 到 VM
+### 5.5 Lowering 到 VM
 
-结构化控制流最终 lower 到：
+结构化控制流 lower 到 VM 4 指令中的 `if / goto`，不引入新 opcode：
 
 ```text
-if
-goto
+If  → IF cond_reg, true_offset, false_offset + GOTO end
+For → 循环计数 CALL + IF + GOTO 回跳
 ```
 
-VM 层不需要 `for` opcode。
+VM 层没有独立的 `for` 指令。
 
 ---
 
@@ -1444,14 +1535,8 @@ public:
     virtual void* Alloc(Device dev, size_t nbytes, size_t alignment) = 0;
     virtual void Free(Device dev, void* ptr) = 0;
 
-    virtual void CopyDataFromTo(
-        const void* from,
-        void* to,
-        size_t nbytes,
-        Device from_dev,
-        Device to_dev,
-        void* stream
-    ) = 0;
+    // 接受 DLTensor*，可直接传 TensorObj::dl()，与 TVM DeviceAPI 接口对齐
+    virtual void CopyDataFromTo(DLTensor* from, DLTensor* to, void* stream) = 0;
 
     virtual void StreamSync(Device dev, void* stream) = 0;
     virtual void DeviceSync(Device dev) = 0;
@@ -2147,36 +2232,37 @@ PTX 用于：
 
 ## 15. Compiler Pipeline
 
-MVP pipeline：
+MVP pipeline（共 18 步，详见 [docs/mvp_impl/02_compiler_pipeline.md](../mvp_impl/02_compiler_pipeline.md)）：
 
 ```text
-1. Python DSL Capture
-2. High-level IR Build
-3. NormalizeIRPass
-4. ControlFlowNormalizePass
-5. StructInfoInferPass
-6. DynamicShapeAnalyzePass
-7. ShapeConstraintVerifyPass
-8. EffectAnalyzePass
-9. KernelSelectPass
-10. DPSLoweringPass
-11. TensorCreateAnalyzePass
-12. LifetimeAnalyzePass
-13. StorageSizeAnalyzePass
-14. StoragePlanPass
-15. LowerTensorCreateToAllocPass
-16. ShapeExprLoweringPass
-17. KernelLaunchExprLoweringPass
-18. VMCodegenPass
-19. TritonAOTCompilePass
-20. ExecutableEmitPass
-21. ABIEmitPass
+[1]  Python DSL Capture
+[2]  High-level IR Build
+[3]  NormalizeIRPass
+[4]  ControlFlowNormalizePass       ← elif→nested if，loop-carried variable→iter_args
+[5]  StructInfoInferPass
+[6]  DynamicShapeAnalyzePass
+[7]  ShapeConstraintVerifyPass
+[8]  EffectAnalyzePass
+[9]  KernelSelectPass
+[10] DPSLoweringPass
+──────────── 分界线：引入 TensorCreateOp ────────────
+[11] MemoryPlanningPass             ← 合并原 4 个分析阶段（TCA→LA→SSA→SP）
+──────────── 分界线：引入 alloc_storage/alloc_tensor ────────────
+[12] LowerTensorCreateToAllocPass
+[13] ShapeExprLoweringPass
+[14] KernelLaunchExprLoweringPass
+[15] VMCodegenPass
+[16] TritonAOTCompilePass
+[17] ExecutableEmitPass
+[18] ABIEmitPass
 ```
 
 关键点：
 
 ```text
-alloc_storage / alloc_tensor 只在第 15 步之后出现。
+alloc_storage / alloc_tensor 只在第 12 步之后出现。
+ControlFlowNormalizePass（第 4 步）将 elif 展平、loop-carried variable 转 iter_args。
+VMCodegenPass（第 15 步）将 If→IF+GOTO、For→循环计数+GOTO，VM 只有 4 条指令。
 ```
 
 ---
@@ -2231,10 +2317,7 @@ devproc2/
           effect_analyze.py
           kernel_select.py
           dps_lowering.py
-          tensor_create_analyze.py
-          lifetime_analyze.py
-          storage_size_analyze.py
-          storage_plan.py
+          memory_planning.py
           lower_tensor_create_to_alloc.py
           vm_codegen.py
           triton_aot_compile.py

@@ -61,10 +61,7 @@ devproc2/
 │       │       ├── effect_analyze.py
 │       │       ├── kernel_select.py
 │       │       ├── dps_lowering.py
-│       │       ├── tensor_create_analyze.py
-│       │       ├── lifetime_analyze.py
-│       │       ├── storage_size_analyze.py
-│       │       ├── storage_plan.py
+│       │       ├── memory_planning.py          # 合并原 4 个分析 pass（TensorCreateAnalyze → LifetimeAnalyze → StorageSizeAnalyze → StoragePlan）
 │       │       ├── lower_tensor_create_to_alloc.py
 │       │       ├── shape_expr_lowering.py
 │       │       ├── kernel_launch_expr_lowering.py
