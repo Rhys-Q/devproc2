@@ -11,6 +11,7 @@ from devproc2.ir.nodes import (
     Block, Function, IRModule, Op, OpResult, Region, Value, Var,
 )
 from devproc2.ir.ops import (
+    AllocStorageOp, AllocTensorOp,
     CallDPSOp, CallOp, ForOp, IfOp, IterArg, Range,
     ReturnOp, ShapeAssertOp, TensorCreateOp, TupleGetItemOp, TupleOp, YieldOp,
 )
@@ -119,6 +120,16 @@ class IRRewriter:
             )
         if isinstance(op, TensorCreateOp):
             return op  # shape is PrimExpr, not Value; no substitution needed
+        if isinstance(op, AllocStorageOp):
+            return op  # no Value operands
+        if isinstance(op, AllocTensorOp):
+            return AllocTensorOp(
+                result_name=op.result_name,
+                storage=self.sv(op.storage),
+                offset=op.offset,
+                shape=op.shape,
+                dtype=op.dtype,
+            )
         if isinstance(op, ShapeAssertOp):
             return op  # tensor is a Var (block arg), no substitution needed
         # Unknown op type returned as-is.  Safe only when the op carries no

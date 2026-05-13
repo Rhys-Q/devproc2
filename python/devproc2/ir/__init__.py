@@ -18,6 +18,8 @@ from devproc2.ir.nodes import (
     WriteEffect,
 )
 from devproc2.ir.ops import (
+    AllocStorageOp,
+    AllocTensorOp,
     CallDPSOp,
     CalleeKind,
     CallOp,
@@ -77,6 +79,8 @@ __all__ = [
     "Var",
     "WriteEffect",
     # Ops
+    "AllocStorageOp",
+    "AllocTensorOp",
     "CallDPSOp",
     "CalleeKind",
     "CallOp",
