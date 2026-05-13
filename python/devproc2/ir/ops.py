@@ -200,6 +200,45 @@ class ForOp(Op):
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, eq=False)
+class AllocStorageOp(Op):
+    """Allocate a raw storage buffer.  Hoisted to function entry by LowerTensorCreateToAllocPass.
+
+    size_bytes is a PrimExpr so it supports both static shapes (IntImm) and
+    dynamic shapes (symbolic expressions evaluated at runtime).
+    """
+    result_name: str
+    size_bytes:  PrimExpr   # IntImm for static; symbolic expr for dynamic
+    alignment:   int
+    device:      str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.size_bytes, int):
+            object.__setattr__(self, "size_bytes", IntImm(self.size_bytes))
+        object.__setattr__(self, "results", (OpResult(op=self, index=0),))
+
+
+@dataclass(frozen=True, eq=False)
+class AllocTensorOp(Op):
+    """Create a tensor view over a storage buffer."""
+    result_name: str
+    storage:     Value             # OpResult from AllocStorageOp
+    offset:      int               # byte offset; always 0 in MVP
+    shape:       tuple[PrimExpr, ...]
+    dtype:       str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "shape",
+            tuple(IntImm(s) if isinstance(s, int) else s for s in self.shape),
+        )
+        object.__setattr__(self, "results", (OpResult(op=self, index=0),))
+
+
+# ---------------------------------------------------------------------------
+# Shape assertion Op
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, eq=False)
 class ShapeAssertOp(Op):
     """Runtime assertion: tensor.shape[dim_idx] <= upper."""
     tensor:  Var

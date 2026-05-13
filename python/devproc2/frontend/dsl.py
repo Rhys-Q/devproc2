@@ -374,6 +374,15 @@ class DSLBuilder:
     # ------------------------------------------------------------------
 
     def _materialize_value(self, node: ast.expr) -> tuple[list[Op], Value]:
+        if isinstance(node, ast.Tuple):
+            all_pre: list[Op] = []
+            elems: list[Value] = []
+            for elt in node.elts:
+                pre, val = self._materialize_value(elt)
+                all_pre.extend(pre)
+                elems.append(val)
+            tuple_op = TupleOp(result_name=self._fresh("tuple"), elems=tuple(elems))
+            return all_pre + [tuple_op], tuple_op.results[0]
         if isinstance(node, ast.Name):
             v = self.scope.lookup(node.id)
             return [], (v if v is not None else Var(node.id))

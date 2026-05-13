@@ -23,6 +23,8 @@ from devproc2.ir.nodes import (
     WriteEffect,
 )
 from devproc2.ir.ops import (
+    AllocStorageOp,
+    AllocTensorOp,
     CallDPSOp,
     CallOp,
     ForOp,
@@ -58,7 +60,8 @@ from devproc2.ir.prim_expr import (
 
 def _op_result_name(op: Op, index: int) -> Optional[str]:
     """Return the user-given name for result[index], or None for auto-numbering."""
-    if isinstance(op, (CallOp, TensorCreateOp, TupleOp, TupleGetItemOp)):
+    if isinstance(op, (CallOp, TensorCreateOp, TupleOp, TupleGetItemOp,
+                       AllocStorageOp, AllocTensorOp)):
         name = op.result_name
         return name if name else None
     if isinstance(op, (IfOp, ForOp)):
@@ -188,6 +191,23 @@ class Printer:
         elif isinstance(op, ShapeAssertOp):
             self._buf.write(
                 f"{indent}assert %{op.tensor.name}.shape[{op.dim_idx}] <= {op.upper}\n"
+            )
+
+        elif isinstance(op, AllocStorageOp):
+            rname = self._result_names[id(op.results[0])]
+            self._buf.write(
+                f"{indent}%{rname} = alloc_storage("
+                f"size={self.print_prim_expr(op.size_bytes)}, "
+                f"alignment={op.alignment}, device={op.device})\n"
+            )
+
+        elif isinstance(op, AllocTensorOp):
+            rname = self._result_names[id(op.results[0])]
+            shape_str = "(" + ", ".join(self.print_prim_expr(s) for s in op.shape) + ")"
+            self._buf.write(
+                f"{indent}%{rname} = alloc_tensor("
+                f"{self._value_str(op.storage)}, offset={op.offset}, "
+                f"shape={shape_str}, dtype={op.dtype})\n"
             )
 
         else:

@@ -18,6 +18,8 @@ from devproc2.ir.nodes import (
     WriteEffect,
 )
 from devproc2.ir.ops import (
+    AllocStorageOp,
+    AllocTensorOp,
     CallDPSOp,
     CalleeKind,
     CallOp,
@@ -53,6 +55,7 @@ from devproc2.ir.prim_expr import (
     ceildiv,
     pmax,
     pmin,
+    prim_expr_structural_eq,
 )
 from devproc2.ir.printer import Printer, print_module
 from devproc2.ir.verifier import IRVerificationError, verify
@@ -77,6 +80,8 @@ __all__ = [
     "Var",
     "WriteEffect",
     # Ops
+    "AllocStorageOp",
+    "AllocTensorOp",
     "CallDPSOp",
     "CalleeKind",
     "CallOp",
@@ -112,6 +117,7 @@ __all__ = [
     "ceildiv",
     "pmin",
     "pmax",
+    "prim_expr_structural_eq",
     # Printer / verifier
     "IRVerificationError",
     "Printer",
