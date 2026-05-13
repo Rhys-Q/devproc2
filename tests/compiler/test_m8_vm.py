@@ -520,24 +520,14 @@ def test_interpreter_if_effect_only_no_error():
 
 
 def test_interpreter_for_loop_count():
-    """ForOp: effect-only loop body executes exactly n times."""
+    """ForOp: loop terminates without error for various iteration counts."""
     module = _build_for_fn_no_iter_args()
     exe = VMCodegenPass().run(module)
     vm = VMInterpreter(exe)
 
-    call_count = [0]
-
-    def mock_noop(args):
-        call_count[0] += 1
-
-    # Register a side-effect counter as packed_func
-    # But our for_op has no CallDPSOp in body...
-    # We can test by just verifying it terminates with correct n
     for n in [0, 1, 3, 5]:
-        call_count[0] = 0
-        vm.invoke("f", [n])
-        # No kernel call in this loop, just verify it doesn't crash
-        # and terminates
+        result = vm.invoke("f", [n])
+        assert result is None  # void return
 
 
 def test_interpreter_for_loop_termination_various_n():
@@ -635,7 +625,7 @@ def test_serializer_roundtrip_preserves_structure():
         assert len(fe1.const_inits) == len(fe2.const_inits)
 
     assert len(exe2.instructions) == len(exe.instructions)
-    assert exe2.constants[:len(exe.constants)] == exe.constants[:len(exe2.constants)]
+    assert exe2.constants == exe.constants
 
 
 # ---------------------------------------------------------------------------

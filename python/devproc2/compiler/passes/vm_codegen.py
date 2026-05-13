@@ -401,6 +401,12 @@ class VMCodegenPass:
     # ---- IfOp --------------------------------------------------------------
 
     def _lower_if(self, op: IfOp, ctx: _FnCtx) -> None:
+        if op.results and op.else_region is None:
+            raise ValueError(
+                "IfOp with results must have an else_region; "
+                "otherwise false-branch result registers would be uninitialized"
+            )
+
         cond_reg = ctx.reg_of(op.cond)
 
         # Pre-allocate result registers (before either branch is emitted)

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -88,19 +89,23 @@ public:
     }
 
     void Register(const std::string& name, BuiltinFn fn) {
+        std::lock_guard<std::mutex> lock(mu_);
         fns_[name] = std::move(fn);
     }
 
     BuiltinFn Get(const std::string& name) const {
+        std::lock_guard<std::mutex> lock(mu_);
         auto it = fns_.find(name);
         return (it != fns_.end()) ? it->second : BuiltinFn{};
     }
 
     bool Has(const std::string& name) const {
+        std::lock_guard<std::mutex> lock(mu_);
         return fns_.count(name) > 0;
     }
 
 private:
+    mutable std::mutex mu_;
     std::unordered_map<std::string, BuiltinFn> fns_;
 };
 

@@ -93,6 +93,7 @@ void RegisterVMBuiltins() {
         auto* tobj = args[0].AsObjectAs<TupleObj>();
         DEVPROC2_DCHECK(tobj);
         auto idx = static_cast<int>(args[1].AsInt());
+        DEVPROC2_DCHECK(idx >= 0 && idx < static_cast<int>(tobj->size()));
         return VMValue::ObjRef((*tobj)[idx]);
     });
 
@@ -121,6 +122,7 @@ void RegisterVMBuiltins() {
         DEVPROC2_DCHECK(tobj);
         auto dim   = static_cast<int>(args[1].AsInt());
         auto upper = args[2].AsInt();
+        DEVPROC2_DCHECK(dim >= 0 && dim < tobj->dl_tensor.ndim);
         auto actual = tobj->dl_tensor.shape[dim];
         if (actual > upper) {
             throw std::runtime_error(

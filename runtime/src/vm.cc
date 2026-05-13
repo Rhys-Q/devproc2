@@ -130,6 +130,9 @@ VMValue VMState::DispatchExternal(const FunctionEntry& callee,
         }
         PackedArgs pa(args);
         pf->Call(pa);
+        // Return convention: PackedFunc body writes its result into args[0].
+        // A void PackedFunc (no dst_reg caller) is called with an empty args
+        // vector, so guard before accessing.
         return args.empty() ? VMValue{} : args[0];
     }
     case VMCalleeKind::kKernel: {
