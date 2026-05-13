@@ -1,13 +1,15 @@
-"""Kernel registry — maps op_name + device + dtype to KernelSpec.
+"""Kernel registry — two-level dispatch for op → KernelSpec matching.
 
-Dispatch pipeline (from docs/design/kernel_register.md):
-  1. op_name filter
-  2. device filter  ("*" on either side is a wildcard)
-  3. dtype filter   ("*" on either side is a wildcard)
-  4. match(call_op) predicate if provided
-  5. highest priority wins
+Dispatch pipeline:
+  Level 1 — exact dict lookup on (op_name, device, input_dtypes).  O(1).
+             input_dtypes is a tuple with one entry per CallOp arg;
+             non-tensor args contribute "" (empty string).
+  Level 2 — linear scan over candidates sorted by priority (descending):
+             a) SM arch filter: if spec.sm_arches is non-empty and sm_arch
+                is provided, skip specs that don't include the target SM.
+             b) Custom predicate: spec.match(call_op) for shape/attr checks.
 
-launch_rule and attrs fields are reserved for M11 (Triton grid computation).
+launch_rule and attrs fields on CallOp are reserved for M11.
 """
 from __future__ import annotations
 
@@ -20,74 +22,90 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class KernelMatchKey:
-    """Lookup key built from a CallOp's op_name, device, and dtype.
+    """Exact lookup key derived from a CallOp.
 
-    Use "*" for device or dtype to match any registered spec.
+    op_name:      callee name without leading "@"
+    device:       "cuda", "cpu", etc.
+    input_dtypes: one dtype string per positional arg; "" for non-tensor args
     """
-    op_name: str   # "layernorm", "relu", etc. — no leading "@"
-    device:  str   # "cuda", "cpu", or "*"
-    dtype:   str   # "float16", "float32", or "*"
+    op_name:      str
+    device:       str
+    input_dtypes: tuple[str, ...]
 
 
 @dataclass
 class KernelSpec:
-    """Describes a concrete kernel implementation for one op variant.
+    """Concrete kernel descriptor registered in KernelRegistry.
 
-    op_name / device / dtype must be canonical (no wildcards).
-    kernel_name becomes the callee in CallDPSOp after DPS lowering.
-    match, if provided, is a predicate that can inspect the CallOp for
-    attrs or shape constraints (used in M11 for Triton specializations).
+    op_name / device / input_dtypes must be canonical (exact, no wildcards).
+
+    sm_arches: SM compute capabilities this kernel supports, e.g. (80, 90).
+               Empty tuple means the kernel runs on any SM.
+    match:     Optional predicate for shape/attr/custom second-level filtering.
+               Receives the CallOp; return False to skip this spec.
+               When call_op is None at lookup time, the predicate is skipped
+               and the spec is treated as matching.
     """
-    op_name:     str
-    device:      str
-    dtype:       str
-    kernel_name: str                                    # e.g. "kernel.relu_fp16"
-    priority:    int = 0
-    match:       Optional[Callable[["CallOp"], bool]] = None
+    op_name:      str
+    device:       str
+    input_dtypes: tuple[str, ...]
+    kernel_name:  str               # callee in CallDPSOp, e.g. "kernel.relu_fp16"
+    sm_arches:    tuple[int, ...] = ()   # () = any SM
+    priority:     int = 0
+    match:        Optional[Callable[["CallOp"], bool]] = None
 
 
-def _matches(spec: KernelSpec, key: KernelMatchKey) -> bool:
-    def compat(a: str, b: str) -> bool:
-        return a == "*" or b == "*" or a == b
+def build_input_dtypes(args: tuple) -> tuple[str, ...]:
+    """Extract dtype from each arg's struct_info; '' for non-tensor args.
 
-    return (
-        compat(spec.op_name, key.op_name)
-        and compat(spec.device, key.device)
-        and compat(spec.dtype, key.dtype)
-    )
+    Uses duck-typing (getattr) to avoid circular imports with the IR layer.
+    """
+    result = []
+    for arg in args:
+        si = getattr(arg, "struct_info", None)
+        result.append(getattr(si, "dtype", "") if si is not None else "")
+    return tuple(result)
+
+
+# Internal dict key type alias
+_DictKey = tuple[str, str, tuple[str, ...]]  # (op_name, device, input_dtypes)
 
 
 class KernelRegistry:
-    """Per-instance kernel registry. Not thread-safe: concurrent register/lookup
+    """Per-instance registry. Not thread-safe: concurrent register/lookup
     calls require external synchronisation.
 
-    Specs are stored per op_name and sorted by priority (descending)
-    on every register() call so lookup() is a simple linear scan.
+    Specs are pre-sorted by priority (descending) on register() so that
+    lookup() is a simple linear scan over the second-level candidates.
     """
 
     def __init__(self) -> None:
-        self._specs: dict[str, list[KernelSpec]] = {}
+        self._specs: dict[_DictKey, list[KernelSpec]] = {}
 
     def register(self, spec: KernelSpec) -> None:
-        bucket = self._specs.setdefault(spec.op_name, [])
+        key: _DictKey = (spec.op_name, spec.device, spec.input_dtypes)
+        bucket = self._specs.setdefault(key, [])
         bucket.append(spec)
         bucket.sort(key=lambda s: s.priority, reverse=True)
 
     def lookup(
         self,
         key: KernelMatchKey,
+        sm_arch: Optional[int] = None,
         call_op: Optional["CallOp"] = None,
     ) -> Optional[KernelSpec]:
-        """Return the highest-priority KernelSpec for key, or None.
+        """Return the highest-priority KernelSpec that passes all filters.
 
-        If call_op is None and a spec has a match predicate, the predicate is
-        skipped and the spec is treated as matching. Pass the actual CallOp
-        whenever available so that predicates can inspect the call.
+        SM filter:  if spec.sm_arches is non-empty and sm_arch is given,
+                    the spec is skipped unless sm_arch is in spec.sm_arches.
+        Predicate:  if spec.match is non-None and call_op is given,
+                    the spec is skipped unless spec.match(call_op) is True.
         """
-        candidates = self._specs.get(key.op_name, []) + self._specs.get("*", [])
-        for spec in candidates:
-            if not _matches(spec, key):
-                continue
+        dict_key: _DictKey = (key.op_name, key.device, key.input_dtypes)
+        for spec in self._specs.get(dict_key, []):
+            if spec.sm_arches and sm_arch is not None:
+                if sm_arch not in spec.sm_arches:
+                    continue
             if spec.match is not None and call_op is not None:
                 if not spec.match(call_op):
                     continue

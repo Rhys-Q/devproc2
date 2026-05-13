@@ -16,6 +16,8 @@ to WriteEffect once the effect system is implemented.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from devproc2.ir.nodes import (
     Block,
     IRModule,
@@ -29,16 +31,26 @@ from devproc2.ir.ops import (
     TensorCreateKind,
     TensorCreateOp,
 )
-from devproc2.kernel.registry import KernelMatchKey, KernelRegistry, KernelSpec
+from devproc2.kernel.registry import (
+    KernelMatchKey,
+    KernelRegistry,
+    KernelSpec,
+    build_input_dtypes,
+)
 from devproc2.compiler.passes._rewriter import IRRewriter
 
 
 class DPSLoweringPass(IRRewriter):
-    """Lowers matched CallOps to TensorCreateOp + CallDPSOp pairs."""
+    """Lowers matched CallOps to TensorCreateOp + CallDPSOp pairs.
 
-    def __init__(self, registry: KernelRegistry) -> None:
+    sm_arch: target SM compute capability passed to the registry lookup.
+             None = skip SM filter.
+    """
+
+    def __init__(self, registry: KernelRegistry, sm_arch: Optional[int] = None) -> None:
         super().__init__()
         self._registry = registry
+        self._sm_arch = sm_arch
 
     def run(self, module: IRModule) -> IRModule:
         return self.rewrite_module(module)
@@ -82,6 +94,6 @@ class DPSLoweringPass(IRRewriter):
         key = KernelMatchKey(
             op_name=op.callee.lstrip("@"),
             device=si.device,
-            dtype=si.dtype,
+            input_dtypes=build_input_dtypes(op.args),
         )
-        return self._registry.lookup(key, op)
+        return self._registry.lookup(key, self._sm_arch, op)

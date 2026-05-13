@@ -1,21 +1,31 @@
 """KernelSelectPass — pure analysis that maps each matchable CallOp to a KernelSpec."""
 from __future__ import annotations
 
+from typing import Optional
+
 from devproc2.ir.nodes import IRModule, Region, TensorStructInfo
 from devproc2.ir.ops import CallOp
-from devproc2.kernel.registry import KernelMatchKey, KernelRegistry, KernelSpec
+from devproc2.kernel.registry import (
+    KernelMatchKey,
+    KernelRegistry,
+    KernelSpec,
+    build_input_dtypes,
+)
 
 
 class KernelSelectPass:
     """Traverse the module and return {id(CallOp): KernelSpec} for every matchable call.
 
     A call is matchable iff its first result carries a TensorStructInfo (i.e.
-    InferStructInfoPass has already run) and the registry has an entry for it.
+    InferStructInfoPass has already run) and the registry has a matching entry.
     This pass does not modify the IR.
+
+    sm_arch: target SM compute capability (e.g. 80, 90).  None = skip SM filter.
     """
 
-    def __init__(self, registry: KernelRegistry) -> None:
+    def __init__(self, registry: KernelRegistry, sm_arch: Optional[int] = None) -> None:
         self._registry = registry
+        self._sm_arch = sm_arch
 
     def run(self, module: IRModule) -> dict[int, KernelSpec]:
         result: dict[int, KernelSpec] = {}
@@ -32,9 +42,9 @@ class KernelSelectPass:
                         key = KernelMatchKey(
                             op_name=op.callee.lstrip("@"),
                             device=si.device,
-                            dtype=si.dtype,
+                            input_dtypes=build_input_dtypes(op.args),
                         )
-                        spec = self._registry.lookup(key, op)
+                        spec = self._registry.lookup(key, self._sm_arch, op)
                         if spec is not None:
                             result[id(op)] = spec
                 # Recurse into nested regions (IfOp, ForOp).
