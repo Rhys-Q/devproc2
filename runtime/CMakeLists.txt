@@ -3,6 +3,9 @@ set(DEVPROC2_RUNTIME_SOURCES
     src/device_api.cc
     src/storage.cc
     src/tensor.cc
+    src/vm.cc
+    src/builtins.cc
+    src/packed_func.cc
 )
 
 add_library(devproc2_runtime STATIC ${DEVPROC2_RUNTIME_SOURCES})
