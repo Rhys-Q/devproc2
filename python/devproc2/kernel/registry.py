@@ -13,7 +13,7 @@ launch_rule and attrs fields on CallOp are reserved for M11.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,11 +33,12 @@ class KernelMatchKey:
     input_dtypes: tuple[str, ...]
 
 
-@dataclass
+@dataclass(frozen=True)
 class KernelSpec:
     """Concrete kernel descriptor registered in KernelRegistry.
 
     op_name / device / input_dtypes must be canonical (exact, no wildcards).
+    input_dtypes is coerced to tuple in __post_init__ so callers may pass a list.
 
     sm_arches: SM compute capabilities this kernel supports, e.g. (80, 90).
                Empty tuple means the kernel runs on any SM.
@@ -53,6 +54,11 @@ class KernelSpec:
     sm_arches:    tuple[int, ...] = ()   # () = any SM
     priority:     int = 0
     match:        Optional[Callable[["CallOp"], bool]] = None
+
+    def __post_init__(self) -> None:
+        # Coerce sequence fields to tuple so callers may pass lists.
+        object.__setattr__(self, "input_dtypes", tuple(self.input_dtypes))
+        object.__setattr__(self, "sm_arches", tuple(self.sm_arches))
 
 
 def build_input_dtypes(args: tuple) -> tuple[str, ...]:
@@ -103,6 +109,7 @@ class KernelRegistry:
         """
         dict_key: _DictKey = (key.op_name, key.device, key.input_dtypes)
         for spec in self._specs.get(dict_key, []):
+            # sm_arches=() means "any SM" — skip the filter entirely.
             if spec.sm_arches and sm_arch is not None:
                 if sm_arch not in spec.sm_arches:
                     continue

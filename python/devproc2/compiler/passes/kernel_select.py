@@ -14,11 +14,13 @@ from devproc2.kernel.registry import (
 
 
 class KernelSelectPass:
-    """Traverse the module and return {id(CallOp): KernelSpec} for every matchable call.
+    """Traverse the module and return {CallOp: KernelSpec} for every matchable call.
 
     A call is matchable iff its first result carries a TensorStructInfo (i.e.
     InferStructInfoPass has already run) and the registry has a matching entry.
     This pass does not modify the IR.
+
+    CallOp uses identity equality (eq=False), so object keys are unambiguous.
 
     sm_arch: target SM compute capability (e.g. 80, 90).  None = skip SM filter.
     """
@@ -27,13 +29,13 @@ class KernelSelectPass:
         self._registry = registry
         self._sm_arch = sm_arch
 
-    def run(self, module: IRModule) -> dict[int, KernelSpec]:
-        result: dict[int, KernelSpec] = {}
+    def run(self, module: IRModule) -> dict[CallOp, KernelSpec]:
+        result: dict[CallOp, KernelSpec] = {}
         for fn in module.functions.values():
             self._select_region(fn.body, result)
         return result
 
-    def _select_region(self, region: Region, result: dict[int, KernelSpec]) -> None:
+    def _select_region(self, region: Region, result: dict[CallOp, KernelSpec]) -> None:
         for block in region.blocks:
             for op in block.ops:
                 if isinstance(op, CallOp) and op.results:
@@ -46,7 +48,7 @@ class KernelSelectPass:
                         )
                         spec = self._registry.lookup(key, self._sm_arch, op)
                         if spec is not None:
-                            result[id(op)] = spec
+                            result[op] = spec
                 # Recurse into nested regions (IfOp, ForOp).
                 # These attribute names cover all current region-bearing ops;
                 # add new names here if a future Op introduces a region field

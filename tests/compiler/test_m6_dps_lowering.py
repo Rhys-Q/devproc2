@@ -163,8 +163,8 @@ def test_kernel_select_finds_annotated_call():
 
     fn = module.functions["f"]
     call_op = next(op for op in fn.body.entry_block.ops if isinstance(op, CallOp))
-    assert id(call_op) in sel
-    assert sel[id(call_op)].kernel_name == "kernel.relu_fp16"
+    assert call_op in sel
+    assert sel[call_op].kernel_name == "kernel.relu_fp16"
 
 
 def test_kernel_select_skips_unannotated_call():
