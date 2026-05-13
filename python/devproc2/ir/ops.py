@@ -23,13 +23,13 @@ from devproc2.ir.prim_expr import IntImm, PrimExpr
 # Terminator Ops — must be last Op in a Block
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ReturnOp(TerminatorOp):
     """Function return."""
     values: tuple[Value, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class YieldOp(TerminatorOp):
     """Region yield.  values=() means effect-only."""
     values: tuple[Value, ...]
@@ -50,7 +50,7 @@ class CalleeKind(Enum):
 # Compute Ops
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CallOp(Op):
     """Ordinary function/op call.
 
@@ -70,7 +70,7 @@ class CallOp(Op):
             ))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CallDPSOp(Op):
     """Destination-passing-style call.
 
@@ -80,7 +80,7 @@ class CallDPSOp(Op):
     callee:      str
     callee_kind: CalleeKind
     inputs:      tuple[Value, ...]
-    output:      Optional[Var]
+    output:      Optional[Value]
     effect:      EffectInfo
 
 
@@ -91,7 +91,7 @@ class TensorCreateKind(Enum):
     empty_like = auto()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class TensorCreateOp(Op):
     """Allocate / create a tensor buffer."""
     result_name: str
@@ -118,7 +118,7 @@ class TensorCreateOp(Op):
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class TupleOp(Op):
     """Construct a tuple value from its elements."""
     result_name: str
@@ -128,7 +128,7 @@ class TupleOp(Op):
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class TupleGetItemOp(Op):
     """Extract element at `index` from a tuple."""
     tup:         Value
@@ -158,7 +158,7 @@ class IterArg:
     init: Value  # initial value from outer scope
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class IfOp(Op):
     """Structured conditional.
 
@@ -176,7 +176,7 @@ class IfOp(Op):
         ))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ForOp(Op):
     """Structured loop over a Range.
 
@@ -199,7 +199,7 @@ class ForOp(Op):
 # Shape assertion Op
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ShapeAssertOp(Op):
     """Runtime assertion: tensor.shape[dim_idx] <= upper."""
     tensor:  Var

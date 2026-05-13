@@ -75,6 +75,15 @@ def test_primvar_prints():
     assert p.print_prim_expr(B) == "B"
 
 
+def test_prim_var_sym_id_unique():
+    a = PrimVar("B")
+    b = PrimVar("B")
+    c = PrimVar("S")
+    assert a.sym_id != b.sym_id
+    assert a.sym_id != c.sym_id
+    assert a is not b
+
+
 def test_operator_overloads_build_correct_nodes():
     B = PrimVar("B")
     S = PrimVar("S")

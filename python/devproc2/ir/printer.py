@@ -200,7 +200,7 @@ class Printer:
     def _print_calldps(self, op: CallDPSOp, indent: str) -> None:
         inner = indent + "  "
         inputs_str = "[" + ", ".join(self._value_str(a) for a in op.inputs) + "]"
-        output_str = f"%{op.output.name}" if op.output is not None else "None"
+        output_str = self._value_str(op.output) if op.output is not None else "None"
         self._buf.write(f"{indent}call_dps {op.callee}(\n")
         self._buf.write(f"{inner}inputs={inputs_str},\n")
         self._buf.write(f"{inner}output={output_str},\n")

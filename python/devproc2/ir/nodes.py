@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional, Union
-
-if TYPE_CHECKING:
-    import numpy as np
+from typing import Optional, Union
 
 from devproc2.ir.prim_expr import IntImm, PrimExpr
 
@@ -18,7 +15,7 @@ class Value:
     """Base class for Op operands (Var, OpResult, or Constant)."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Var(Value):
     """Block argument — defined at block entry (function params, iter args)."""
     name: str
@@ -27,11 +24,15 @@ class Var(Value):
 
 @dataclass(frozen=True)
 class Constant(Value):
-    """Compile-time scalar or tensor constant."""
-    value: Union[int, float, bool, None, "np.ndarray"]
+    """Compile-time scalar or tensor constant (int, float, bool, or None).
+
+    Not an SSA def — inlined directly into Op operands with no name binding.
+    For tensor constants use a dedicated ConstantTensorOp (future work).
+    """
+    value: Union[int, float, bool, None]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class OpResult(Value):
     """SSA value produced by an Op.
 
@@ -101,7 +102,7 @@ class OpaqueEffect(EffectInfo):
 # Op — base class for all IR operations
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Op:
     """Base class for all IR operations.
 
@@ -112,7 +113,7 @@ class Op:
     results: tuple[OpResult, ...] = field(default_factory=tuple, init=False)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class TerminatorOp(Op):
     """Marker base class for block-terminating ops (ReturnOp, YieldOp)."""
 
@@ -121,7 +122,7 @@ class TerminatorOp(Op):
 # Block — linear sequence of Ops
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Block:
     """A basic block: block arguments followed by a sequence of Ops.
 
@@ -136,7 +137,7 @@ class Block:
 # Region — container of one or more Blocks
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Region:
     """A region holds one or more Blocks.
 
@@ -153,7 +154,7 @@ class Region:
 # Function / IRModule
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Function:
     """A named function with a single body Region.
 

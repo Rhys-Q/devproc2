@@ -11,17 +11,28 @@ no string discriminator.  Python operator overloads let you write
   B * S,  ceildiv(S, 16),  pmin(n, 128)
 and get proper AST nodes back.
 
+Equality semantics:
+  - PrimVar uses identity equality (eq=False): two PrimVar("B") objects
+    are distinct symbols even if they share the same name.  Use `is` to
+    test whether two references point to the same symbol.
+  - All other PrimExpr nodes (IntImm, Add, etc.) use structural equality:
+    Add(B, S) == Add(B, S) is True when both sides reference the same B and S
+    objects (because PrimVar equality falls back to identity).
+
 Naming note: the symbolic variable here is `PrimVar` to avoid clashing
 with `devproc2.ir.nodes.Var` (the SSA binding variable).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import count as _count
 from typing import Optional, Union
 
 # Anything accepted where a PrimExpr is expected.
 # Plain ints are implicitly lifted to IntImm.
 PrimExprLike = Union["PrimExpr", int]
+
+_sym_id_counter = _count()
 
 
 def _to_prim(x: PrimExprLike) -> "PrimExpr":
@@ -79,8 +90,9 @@ class PrimExpr:
     def __ge__(self, other: PrimExprLike) -> "GE":
         return GE(self, _to_prim(other))
 
-    # == and != are kept as identity checks (Python default) so that
-    # PrimExpr nodes can be used in sets/dicts.  Use .eq() for symbolic EQ.
+    # == and != use structural equality for all PrimExpr nodes EXCEPT PrimVar.
+    # PrimVar uses identity equality (eq=False) — see module docstring.
+    # Use .eq() to build a symbolic EQ node (distinct from Python ==).
     def eq(self, other: PrimExprLike) -> "EQ":
         return EQ(self, _to_prim(other))
 
@@ -95,16 +107,23 @@ class IntImm(PrimExpr):
     value: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PrimVar(PrimExpr):
     """Symbolic integer variable, e.g. PrimVar("B", upper=8).
 
     Corresponds to tir.Var in TVM.  The `upper` field is devproc2-specific:
     it records the compile-time upper bound used by MemoryPlanningPass and
     runtime shape assertions.
+
+    `sym_id` is an auto-assigned unique integer for debugging and serialization.
+    `name` is print-only; identity is determined by object identity (eq=False).
     """
-    name: str
-    upper: Optional[int] = None
+    name:   str
+    upper:  Optional[int] = None
+    sym_id: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sym_id", next(_sym_id_counter))
 
 
 # ------------------------------------------------------------------ #

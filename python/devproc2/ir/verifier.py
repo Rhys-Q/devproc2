@@ -164,10 +164,8 @@ class Verifier:
         elif isinstance(op, CallDPSOp):
             for v in _value_refs(op.inputs):
                 chk(v)
-            if op.output is not None and op.output.name not in defined_names:
-                raise IRVerificationError(
-                    f"In @{fn_name}: CallDPS output '%{op.output.name}' used before definition"
-                )
+            if op.output is not None:
+                chk(op.output)
 
         elif isinstance(op, TupleOp):
             for v in _value_refs(op.elems):
