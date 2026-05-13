@@ -92,7 +92,9 @@ class IRRewriter:
                          result_struct_info=op.result_struct_info)
         if isinstance(op, CallDPSOp):
             return CallDPSOp(callee=op.callee, callee_kind=op.callee_kind,
-                            inputs=self.svs(op.inputs), output=op.output, effect=op.effect)
+                            inputs=self.svs(op.inputs),
+                            output=self.sv(op.output) if op.output is not None else None,
+                            effect=op.effect)
         if isinstance(op, TupleOp):
             return TupleOp(result_name=op.result_name, elems=self.svs(op.elems))
         if isinstance(op, TupleGetItemOp):

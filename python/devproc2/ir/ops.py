@@ -80,7 +80,7 @@ class CallDPSOp(Op):
     callee:      str
     callee_kind: CalleeKind
     inputs:      tuple[Value, ...]
-    output:      Optional[Var]
+    output:      Optional[Value]
     effect:      EffectInfo
 
 
