@@ -51,9 +51,9 @@ class LowerTensorCreateToAllocPass(IRRewriter):
     def rewrite_fn(self, fn: Function) -> Function:
         self._sub = {}
         fn_name = self._current_fn_name
-        plan: Optional[StoragePlan] = (
-            self._ctx.get(f"storage_plan:{fn_name}") or self._ctx.get("storage_plan")
-        )
+        plan: Optional[StoragePlan] = self._ctx.get(f"storage_plan:{fn_name}")
+        if plan is None:
+            plan = self._ctx.get("storage_plan")
         if plan is None:
             raise RuntimeError(
                 f"LowerTensorCreateToAllocPass: no storage_plan in PassContext "

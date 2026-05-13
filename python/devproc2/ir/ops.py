@@ -212,6 +212,8 @@ class AllocStorageOp(Op):
     device:      str
 
     def __post_init__(self) -> None:
+        if isinstance(self.size_bytes, int):
+            object.__setattr__(self, "size_bytes", IntImm(self.size_bytes))
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
 
 

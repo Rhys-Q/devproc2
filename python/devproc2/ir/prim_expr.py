@@ -220,3 +220,29 @@ def pmin(a: PrimExprLike, b: PrimExprLike) -> Min:
 
 def pmax(a: PrimExprLike, b: PrimExprLike) -> Max:
     return Max(_to_prim(a), _to_prim(b))
+
+
+def prim_expr_structural_eq(a: PrimExpr, b: PrimExpr) -> bool:
+    """Deep structural equality that compares PrimVars by (name, upper).
+
+    Unlike Python's default == for PrimExpr nodes, this function treats two
+    PrimVar objects with the same name and upper bound as equal, regardless
+    of object identity.  Use this when comparing shape expressions from code
+    paths that may have reconstructed PrimVar objects semantically equivalent
+    to the originals (e.g. after IR serialization or cross-pass reconstruction).
+
+    All other node types use their natural structural equality.
+    """
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, IntImm):
+        return a.value == b.value  # type: ignore[union-attr]
+    if isinstance(a, PrimVar):
+        return a.name == b.name and a.upper == b.upper  # type: ignore[union-attr]
+    if isinstance(a, (Add, Sub, Mul, FloorDiv, CeilDiv, Min, Max,
+                      EQ, LT, LE, GT, GE)):
+        return (prim_expr_structural_eq(a.lhs, b.lhs)  # type: ignore[union-attr]
+                and prim_expr_structural_eq(a.rhs, b.rhs))  # type: ignore[union-attr]
+    # Unknown node type: fall back to Python == (structural for frozen dataclasses,
+    # identity for PrimVar — but we already handled PrimVar above).
+    return a == b

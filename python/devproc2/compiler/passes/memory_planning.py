@@ -13,7 +13,6 @@ Internal pipeline (run per function):
 from __future__ import annotations
 
 import sys
-import ast as _ast
 from dataclasses import dataclass, field
 from functools import reduce as _reduce
 from math import prod
@@ -21,6 +20,19 @@ from typing import Optional
 
 from devproc2.compiler.pass_context import PassContext
 from devproc2.utils.dtype import dtype_itemsize
+from devproc2.ir.prim_expr import (
+    Add,
+    CeilDiv,
+    FloorDiv,
+    IntImm,
+    Max,
+    Min,
+    Mul,
+    PrimExpr,
+    PrimVar,
+    Sub,
+    prim_expr_structural_eq,
+)
 from devproc2.ir.nodes import (
     Block,
     Function,
@@ -34,6 +46,7 @@ from devproc2.ir.nodes import (
     WriteEffect,
 )
 from devproc2.ir.ops import (
+    AllocTensorOp,
     CallDPSOp,
     ForOp,
     IfOp,
@@ -41,19 +54,9 @@ from devproc2.ir.ops import (
     ReturnOp,
     TensorCreateKind,
     TensorCreateOp,
+    TupleGetItemOp,
+    TupleOp,
     YieldOp,
-)
-from devproc2.ir.prim_expr import (
-    Add,
-    CeilDiv,
-    FloorDiv,
-    IntImm,
-    Max,
-    Min,
-    Mul,
-    PrimExpr,
-    PrimVar,
-    Sub,
 )
 
 _MAX_INT = sys.maxsize
@@ -103,9 +106,10 @@ class StorageEntry:
                 return False
         elif self.size_bytes is None and ti.size_bytes is None:
             # Both dynamic: require structurally equal size expressions.
-            # PrimVar uses identity equality (eq=False), so two tensors built from
-            # the same symbolic dim objects in the same function will compare equal.
-            if self.size_expr != ti.size_expr:
+            # prim_expr_structural_eq compares PrimVars by (name, upper) rather
+            # than object identity, so this works even if a pass reconstructed
+            # PrimVar objects with the same semantic content.
+            if not prim_expr_structural_eq(self.size_expr, ti.size_expr):
                 return False
         else:
             # Mixed static/dynamic: cannot guarantee compatibility, skip.
@@ -204,22 +208,20 @@ def _collect_ops_linear(region: Region, out: list[Op]) -> None:
 
 
 def _collect_return_values(fn: Function, create_ops: list) -> set[int]:
-    """Return id() of every OpResult that directly or indirectly flows into a ReturnOp."""
-    name_to_rid: dict[str, int] = {cop.result_name: id(cop.results[0]) for cop in create_ops}
+    """Return id() of every TensorCreateOp result that flows into a ReturnOp.
+
+    Traces through TupleOp so that `return a, b` (which the DSL lowers to
+    TupleOp([a, b]) → ReturnOp(tuple_result)) correctly marks both a and b
+    as non-reusable.
+    """
     ids: set[int] = set()
 
     def _add_value(v: object) -> None:
         if isinstance(v, OpResult):
             ids.add(id(v))
-            # Trace through TupleOp elements
-            from devproc2.ir.ops import TupleOp  # local import to avoid cycle
             if isinstance(v.op, TupleOp):
                 for e in v.op.elems:
                     _add_value(e)
-        elif isinstance(v, Var):
-            # The DSL encodes tuple returns as Var("(a, b)").  Parse the name
-            # to extract individual variable references.
-            _extract_from_var_name(v.name, name_to_rid, ids)
 
     for op in fn.body.entry_block.ops:
         if isinstance(op, ReturnOp):
@@ -228,25 +230,14 @@ def _collect_return_values(fn: Function, create_ops: list) -> set[int]:
     return ids
 
 
-def _extract_from_var_name(name: str, name_to_rid: dict[str, int], out: set[int]) -> None:
-    """Try to parse a Var name and extract any simple identifier references."""
-    rid = name_to_rid.get(name)
-    if rid is not None:
-        out.add(rid)
-        return
-    try:
-        tree = _ast.parse(name, mode="eval")
-    except SyntaxError:
-        return
-    for node in _ast.walk(tree):
-        if isinstance(node, _ast.Name):
-            rid = name_to_rid.get(node.id)
-            if rid is not None:
-                out.add(rid)
-
-
 def _operand_results(op: Op) -> list[OpResult]:
-    """Collect all OpResult operands referenced by op (not its own results)."""
+    """Collect all OpResult operands referenced by op (not its own results).
+
+    Explicit cases are listed for all known Op types.  The generic fallback
+    at the end handles unknown types by inspecting common field names, but it
+    will silently miss any Value fields with non-standard names.  When adding
+    a new Op type that has Value-typed fields, add an explicit case here.
+    """
     refs: list[OpResult] = []
 
     def _add(v: Value) -> None:
@@ -264,6 +255,13 @@ def _operand_results(op: Op) -> list[OpResult]:
     elif isinstance(op, YieldOp):
         for v in op.values:
             _add(v)
+    elif isinstance(op, TupleOp):
+        for v in op.elems:
+            _add(v)
+    elif isinstance(op, TupleGetItemOp):
+        _add(op.tup)
+    elif isinstance(op, AllocTensorOp):
+        _add(op.storage)
     elif isinstance(op, IfOp):
         _add(op.cond)
     elif isinstance(op, ForOp):
@@ -273,11 +271,12 @@ def _operand_results(op: Op) -> list[OpResult]:
         for ia in op.iter_args:
             _add(ia.init)
     else:
-        # Generic: walk known tuple fields
+        # Generic fallback: inspect common field names.  Safe for TensorCreateOp,
+        # ShapeAssertOp, AllocStorageOp (no Value operands), CallOp (args field).
         for fname in ("args", "inputs", "values", "elems"):
             for v in getattr(op, fname, ()):
                 _add(v)
-        for fname in ("output", "tup"):
+        for fname in ("output", "tup", "storage"):
             v = getattr(op, fname, None)
             if v is not None:
                 _add(v)

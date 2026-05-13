@@ -687,3 +687,184 @@ def test_acceptance_lower_alloc_ir():
         sid = id(top.storage.op)
         storage_usage[sid] = storage_usage.get(sid, 0) + 1
     assert max(storage_usage.values()) >= 2
+
+
+# ---------------------------------------------------------------------------
+# prim_expr_structural_eq
+# ---------------------------------------------------------------------------
+
+def test_prim_expr_structural_eq_intImm():
+    from devproc2.ir.prim_expr import prim_expr_structural_eq, IntImm
+    assert prim_expr_structural_eq(IntImm(42), IntImm(42))
+    assert not prim_expr_structural_eq(IntImm(1), IntImm(2))
+
+
+def test_prim_expr_structural_eq_primvar_by_name_upper():
+    from devproc2.ir.prim_expr import prim_expr_structural_eq, PrimVar
+    # Different objects, same (name, upper) → structurally equal
+    a = PrimVar("B", upper=8)
+    b = PrimVar("B", upper=8)
+    assert a is not b                          # different objects
+    assert a != b                              # Python == uses identity
+    assert prim_expr_structural_eq(a, b)       # structural: equal
+
+    # Different upper → not equal
+    c = PrimVar("B", upper=16)
+    assert not prim_expr_structural_eq(a, c)
+
+    # Different name → not equal
+    d = PrimVar("S", upper=8)
+    assert not prim_expr_structural_eq(a, d)
+
+    # No upper vs upper → not equal
+    e = PrimVar("B", upper=None)
+    assert not prim_expr_structural_eq(a, e)
+
+
+def test_prim_expr_structural_eq_composite():
+    from devproc2.ir.prim_expr import prim_expr_structural_eq, PrimVar, Mul, IntImm
+    B1 = PrimVar("B", upper=8)
+    B2 = PrimVar("B", upper=8)
+    expr1 = Mul(B1, IntImm(2))
+    expr2 = Mul(B2, IntImm(2))
+    # B1 is not B2, but structural equality treats them the same
+    assert prim_expr_structural_eq(expr1, expr2)
+
+    # Different constant → not equal
+    expr3 = Mul(B1, IntImm(4))
+    assert not prim_expr_structural_eq(expr1, expr3)
+
+
+def test_prim_expr_structural_eq_type_mismatch():
+    from devproc2.ir.prim_expr import prim_expr_structural_eq, PrimVar, IntImm
+    assert not prim_expr_structural_eq(PrimVar("B"), IntImm(8))
+
+
+# ---------------------------------------------------------------------------
+# Dynamic reuse with reconstructed PrimVar (different objects, same semantics)
+# ---------------------------------------------------------------------------
+
+def test_dynamic_reuse_with_reconstructed_primvars():
+    """Two TensorCreateOps built with *different* PrimVar objects that have the
+    same (name, upper) must still share storage, thanks to prim_expr_structural_eq.
+    """
+    from devproc2.ir.nodes import Block, Region, Function
+    from devproc2.ir.prim_expr import IntImm, PrimVar
+    from devproc2.ir.ops import (
+        TensorCreateOp, TensorCreateKind, CallDPSOp, CalleeKind, ReturnOp,
+    )
+    from devproc2.ir.nodes import OpaqueEffect, Var, TensorStructInfo
+
+    # Two *different* PrimVar objects with the same name/upper
+    B1 = PrimVar("B", upper=None)
+    B2 = PrimVar("B", upper=None)
+    assert B1 is not B2
+
+    shape1 = (B1, IntImm(512))
+    shape2 = (B2, IntImm(512))
+
+    x = Var("x", struct_info=TensorStructInfo(shape1, "float16", "cuda"))
+
+    create_a = TensorCreateOp("a", TensorCreateKind.empty, shape1, "float16", "cuda")
+    dps_a = CallDPSOp("k.relu", CalleeKind.kernel, (x,), create_a.results[0], OpaqueEffect())
+    create_b = TensorCreateOp("b", TensorCreateKind.empty, shape2, "float16", "cuda")
+    dps_b = CallDPSOp("k.layernorm", CalleeKind.kernel, (create_a.results[0],), create_b.results[0], OpaqueEffect())
+    # Manufacture two more ops so a and b don't overlap
+    create_c = TensorCreateOp("c", TensorCreateKind.empty, shape1, "float16", "cuda")
+    dps_c = CallDPSOp("k.relu", CalleeKind.kernel, (create_b.results[0],), create_c.results[0], OpaqueEffect())
+    create_d = TensorCreateOp("d", TensorCreateKind.empty, shape2, "float16", "cuda")
+    dps_d = CallDPSOp("k.layernorm", CalleeKind.kernel, (create_c.results[0],), create_d.results[0], OpaqueEffect())
+    ret = ReturnOp((create_d.results[0],))
+
+    block = Block(args=(x,), ops=(
+        create_a, dps_a,
+        create_b, dps_b,
+        create_c, dps_c,
+        create_d, dps_d,
+        ret,
+    ))
+    fn = Function(Region((block,)))
+    module = IRModule({"f": fn})
+
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+
+    # a and c should share (non-overlapping intervals, same size_expr by structural eq)
+    assert plan.tensor_to_storage["a"] == plan.tensor_to_storage["c"], (
+        "a and c should share storage: same dynamic shape (structural eq), non-overlapping"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DSL: tuple return produces TupleOp (not Var("(a, b)"))
+# ---------------------------------------------------------------------------
+
+def test_dsl_tuple_return_uses_tupleop():
+    from devproc2.ir.ops import TupleOp, ReturnOp
+    B = dp.symbolic_dim("B", upper=8)
+
+    @dp.function
+    def f(x: dp.Tensor[(B, 512), "float16", "cuda"],
+          z: dp.Tensor[(B, 512), "float16", "cuda"]):
+        a = dp.ops.relu(x)
+        b = dp.ops.silu(z)
+        return a, b
+
+    fn = dp.get_module().functions["f"]
+    ret = next(op for op in fn.body.entry_block.ops if isinstance(op, ReturnOp))
+    # ReturnOp must carry the result of a TupleOp, not a bare Var
+    from devproc2.ir.nodes import OpResult
+    assert len(ret.values) == 1
+    assert isinstance(ret.values[0], OpResult)
+    assert isinstance(ret.values[0].op, TupleOp)
+    tuple_op = ret.values[0].op
+    assert len(tuple_op.elems) == 2
+
+
+def test_dsl_tuple_return_marks_both_tensors_non_reusable():
+    """After the DSL fix, both tensors in `return a, b` are detected as
+    returned (not reusable) by _collect_return_values via TupleOp traversal.
+    """
+    B = dp.symbolic_dim("B", upper=8)
+
+    @dp.function
+    def f(x: dp.Tensor[(B, 512), "float16", "cuda"],
+          z: dp.Tensor[(B, 512), "float16", "cuda"]):
+        a = dp.ops.relu(x)
+        b = dp.ops.silu(z)
+        return a, b
+
+    silu_spec = KernelSpec(op_name="silu", device="cuda", input_dtypes=("float16",),
+                           kernel_name="kernel.silu_fp16")
+    module = _lowered(dp.get_module(), _spec("relu"), silu_spec)
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+
+    # Both a and b are returned → each gets its own storage entry
+    assert len(plan.entries) == 2
+    a_sid = plan.tensor_to_storage["a"]
+    b_sid = plan.tensor_to_storage["b"]
+    assert a_sid != b_sid
+
+
+# ---------------------------------------------------------------------------
+# AllocStorageOp: int size_bytes is auto-coerced to IntImm
+# ---------------------------------------------------------------------------
+
+def test_alloc_storage_op_int_coercion():
+    from devproc2.ir.ops import AllocStorageOp
+    from devproc2.ir.prim_expr import IntImm
+    op = AllocStorageOp(result_name="s0", size_bytes=1024, alignment=256, device="cuda")
+    assert isinstance(op.size_bytes, IntImm)
+    assert op.size_bytes.value == 1024
+
+
+def test_alloc_storage_op_prim_expr_unchanged():
+    from devproc2.ir.ops import AllocStorageOp
+    from devproc2.ir.prim_expr import IntImm, Mul, PrimVar
+    B = PrimVar("B", upper=None)
+    expr = Mul(B, IntImm(2))
+    op = AllocStorageOp(result_name="s0", size_bytes=expr, alignment=256, device="cuda")
+    assert op.size_bytes is expr  # PrimExpr passed directly, unchanged
