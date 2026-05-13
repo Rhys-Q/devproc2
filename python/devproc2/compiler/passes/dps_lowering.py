@@ -70,7 +70,7 @@ class DPSLoweringPass(IRRewriter):
                         device=si.device,
                     )
                     # Redirect downstream uses of the old CallOp result.
-                    self._sub[id(op.results[0])] = create_op.results[0]
+                    self._sub[op.results[0]] = create_op.results[0]
                     dps_op = CallDPSOp(
                         callee=kernel.kernel_name,
                         callee_kind=CalleeKind.kernel,
@@ -84,7 +84,7 @@ class DPSLoweringPass(IRRewriter):
             # Default path: substitute operands, register result mapping.
             new_op = self._subst_op(op)
             for old_r, new_r in zip(op.results, new_op.results):
-                self._sub[id(old_r)] = new_r
+                self._sub[old_r] = new_r
             new_ops.append(new_op)
         return Block(block.args, tuple(new_ops))
 

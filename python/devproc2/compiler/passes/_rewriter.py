@@ -31,8 +31,9 @@ class IRRewriter:
     """
 
     def __init__(self) -> None:
-        # Maps id(old OpResult) → new OpResult for the current block walk.
-        self._sub: dict[int, OpResult] = {}
+        # Maps old OpResult → new OpResult for the current block walk.
+        # OpResult uses identity equality (eq=False), so direct object keys work.
+        self._sub: dict[Value, OpResult] = {}
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -55,7 +56,7 @@ class IRRewriter:
             new_op = self.rewrite_op(op)
             # Register old→new result substitution.
             for old_r, new_r in zip(op.results, new_op.results):
-                self._sub[id(old_r)] = new_r
+                self._sub[old_r] = new_r
             new_ops.append(new_op)
         return Block(block.args, tuple(new_ops))
 
@@ -70,7 +71,7 @@ class IRRewriter:
     def sv(self, v: Value) -> Value:
         """Substitute a single Value if it's a known OpResult."""
         if isinstance(v, OpResult):
-            return self._sub.get(id(v), v)
+            return self._sub.get(v, v)
         return v
 
     def svs(self, vals: tuple) -> tuple:
