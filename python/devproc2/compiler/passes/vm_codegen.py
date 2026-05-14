@@ -36,55 +36,7 @@ from devproc2.vm.executable import (
     Instruction,
     Opcode,
 )
-
-
-# ---------------------------------------------------------------------------
-# Device / dtype encoding helpers
-# ---------------------------------------------------------------------------
-
-_DEVICE_TYPE_MAP: dict[str, int] = {
-    "cpu":    1,  # kDLCPU
-    "cuda":   2,  # kDLCUDA
-    "metal":  8,  # kDLMetal
-    "vulkan": 7,  # kDLVulkan
-    "rocm":   10, # kDLROCM
-}
-
-_DTYPE_MAP: dict[str, tuple[int, int, int]] = {
-    # (code, bits, lanes)
-    "bool":     (6,  8,  1),   # kDLBool
-    "int8":     (0,  8,  1),   # kDLInt
-    "int16":    (0,  16, 1),
-    "int32":    (0,  32, 1),
-    "int64":    (0,  64, 1),
-    "uint8":    (1,  8,  1),   # kDLUInt
-    "uint16":   (1,  16, 1),
-    "uint32":   (1,  32, 1),
-    "uint64":   (1,  64, 1),
-    "float16":  (2,  16, 1),   # kDLFloat
-    "float32":  (2,  32, 1),
-    "float64":  (2,  64, 1),
-    "bfloat16": (4,  16, 1),   # kDLBfloat
-}
-
-
-def _parse_device(device_str: str) -> tuple[int, int]:
-    """Parse "cpu", "cuda", "cuda:0" → (device_type_int, device_id_int)."""
-    parts = device_str.split(":")
-    dev_name = parts[0].lower()
-    dev_type = _DEVICE_TYPE_MAP.get(dev_name)
-    if dev_type is None:
-        raise ValueError(f"Unknown device type: {dev_name!r}")
-    dev_id = int(parts[1]) if len(parts) > 1 else 0
-    return dev_type, dev_id
-
-
-def _parse_dtype(dtype_str: str) -> tuple[int, int, int]:
-    """Parse "float16" → (code, bits, lanes)."""
-    result = _DTYPE_MAP.get(dtype_str.lower())
-    if result is None:
-        raise ValueError(f"Unknown dtype: {dtype_str!r}")
-    return result
+from devproc2.utils.dtype import parse_dtype, parse_device
 
 
 def _ir_callee_kind(kind: IRCalleeKind) -> CalleeKind:
@@ -283,7 +235,7 @@ class VMCodegenPass:
             )
         size_reg   = ctx.reg_for_int(op.size_bytes.value)
         align_reg  = ctx.reg_for_int(op.alignment)
-        dev_type, dev_id = _parse_device(op.device)
+        dev_type, dev_id = parse_device(op.device)
         dtype_reg  = ctx.reg_for_int(dev_type)
         devid_reg  = ctx.reg_for_int(dev_id)
 
@@ -329,7 +281,7 @@ class VMCodegenPass:
         ))
 
         # dtype: (code, bits, lanes)
-        dtype_code, dtype_bits, dtype_lanes = _parse_dtype(op.dtype)
+        dtype_code, dtype_bits, dtype_lanes = parse_dtype(op.dtype)
         code_reg  = ctx.reg_for_int(dtype_code)
         bits_reg  = ctx.reg_for_int(dtype_bits)
         lanes_reg = ctx.reg_for_int(dtype_lanes)

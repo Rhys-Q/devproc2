@@ -146,72 +146,545 @@ VM 使用一个**扁平的全局寄存器文件**（`list[Any]` 或 `vector<VMVa
 
 ## 4. VMCodegenPass：从 IR 到 Bytecode
 
-`VMCodegenPass` 遍历 memory-explicit IR，为每个函数：
-1. 分配寄存器（SSA 值 → 寄存器编号）
-2. 收集常量（IntImm → `const_inits`）
-3. 逐 Op 生成指令
+本节是全文最核心的部分。我们先用一个**极小的例子**把所有概念讲清楚，再给出完整的规则表。
 
-### 4.1 寄存器分配
+---
 
-策略极简：**顺序分配，不复用**。
+### 4.0 用最小的例子开始
 
-- 函数参数占 `reg[0..n_params-1]`
-- 之后每个 OpResult 按出现顺序分配下一个可用寄存器
-- 常量用 `const_init` 机制，也分配一个寄存器
+假设有这样一个 memory-explicit IR：
 
-### 4.2 各 Op 的 codegen
+```
+@add_one(%x: Tensor[(4,), float32, cpu]) {
+  %s0 = alloc_storage(size=16, alignment=64, device=cpu)
+  %y   = alloc_tensor(%s0, offset=0, shape=[4], dtype=float32)
+  call_dps kernel.add_one_fp32(inputs=[%x], output=%y)
+  return %y
+}
+```
 
-| IR Op | 生成的 VM 指令 |
+这个函数做的事情很简单：
+1. 申请 16 字节的 CPU 内存（`alloc_storage`）
+2. 在这块内存上创建一个 shape=(4,)、float32 的 tensor（`alloc_tensor`）
+3. 调用 kernel 往 `%y` 里写入结果
+4. 返回 `%y`
+
+VMCodegenPass 要把这 4 行 IR 翻译成 VM 可以执行的字节码。整个翻译过程分三件事：
+
+1. **寄存器（Register）是什么，怎么分配**
+2. **常量（Constant）如何放进寄存器**
+3. **每条 IR Op 翻译成哪几条 VM 指令**
+
+---
+
+### 4.1 寄存器是什么
+
+VM 是一台"寄存器机"。你可以把寄存器理解成一排**带编号的格子**，每个格子能放一个值（整数、Tensor、Storage……任何东西）：
+
+```
+寄存器文件（针对函数 add_one 的一次调用）
+
+  r0  │ <x tensor>   ← 函数参数，外部传入
+  r1  │  ???         ← 待分配
+  r2  │  ???
+  r3  │  ???
+  ...
+```
+
+**寄存器编号就是一个整数下标**，没有"类型"，装什么都行。
+
+#### 寄存器的分配规则
+
+VMCodegenPass 使用"顺序分配、不复用"策略：
+
+- 参数从 `r0` 开始，依次占用 `r0, r1, ..., r(n_params-1)`
+- 之后每次需要一个新寄存器，就取当前的 `next_reg`，然后 `next_reg += 1`
+- **永远不回收，永远不复用**
+
+这样每个 IR 中的 SSA 值（`%x`、`%s0`、`%y`……）都对应唯一一个寄存器编号，1:1 映射，永不冲突。
+
+对应的 Python 代码（`_FnCtx` 类）：
+
+```python
+def alloc_reg(self) -> int:
+    r = self.next_reg      # 取当前编号
+    self.next_reg += 1     # 编号+1，下次再取就是下一个
+    return r
+
+def bind(self, value: Value, reg: int) -> None:
+    self._value_reg[id(value)] = reg   # 记住"这个IR值对应哪个寄存器"
+
+def reg_of(self, value: Value) -> int:
+    return self._value_reg[id(value)]  # 查询"这个IR值在哪个寄存器里"
+```
+
+对我们的例子，参数 `%x` 只有一个，所以：
+
+```
+参数分配完毕：
+  r0 → %x       (next_reg = 1)
+```
+
+---
+
+### 4.2 常量放进寄存器：const_init 机制
+
+现在遇到第一条 IR：
+
+```
+%s0 = alloc_storage(size=16, alignment=64, device=cpu)
+```
+
+`alloc_storage` 是一个函数调用，它需要 4 个参数：
+
+| 参数 | 值 | 来源 |
+|---|---|---|
+| `size_bytes` | `16` | IntImm 常量 |
+| `alignment` | `64` | IntImm 常量 |
+| `device_type` | `1` (kDLCPU) | 从字符串 "cpu" 查表得到 |
+| `device_id` | `0` | 默认值 |
+
+问题来了：VM 的 CALL 指令只接受**寄存器编号**作为参数，但 `16`、`64`、`1`、`0` 这些值是字面量，不在任何寄存器里。怎么办？
+
+#### 方案：const_init + 常量池
+
+做法分两步：
+
+**步骤 1：把常量值存进"常量池"（`Executable.constants`）**
+
+`Executable.constants` 就是一个列表，按顺序存放所有常量值：
+
+```python
+exe.constants = []
+```
+
+每次遇到一个新常量，就 append 进去（相同值只存一次，去重）：
+
+```python
+def _intern_const(self, val) -> int:
+    for i, c in enumerate(self._exec.constants):
+        if c == val and type(c) is type(val):
+            return i          # 已有，返回已有索引
+    self._exec.constants.append(val)
+    return len(self._exec.constants) - 1
+```
+
+处理完 `size=16, align=64, dev_type=1, dev_id=0` 之后，常量池变成：
+
+```
+exe.constants = [16, 64, 1, 0]
+                  ↑   ↑  ↑  ↑
+                 idx0 1  2  3
+```
+
+**步骤 2：为每个常量分配一个寄存器，记录"帧建立时把 constants[idx] 写入 reg[r]"**
+
+```python
+def _reg_for_const(self, val) -> int:
+    const_idx = self._intern_const(val)   # 找到/创建常量池索引
+    reg = self.alloc_reg()                # 分配一个新寄存器
+    self.const_inits.append(
+        ConstInit(reg_idx=reg, const_idx=const_idx)
+    )
+    return reg
+```
+
+这个 `ConstInit(reg_idx=r, const_idx=i)` 的意思是：
+> 每次调用这个函数建立新帧时，在执行任何指令之前，先把 `constants[i]` 的值预填充到寄存器 `r` 里。
+
+所以处理 `alloc_storage(size=16, ...)` 时，依次调用 `reg_for_int`：
+
+```
+ctx.reg_for_int(16) → r1,  const_inits += [ConstInit(reg=1, const_idx=0)]
+ctx.reg_for_int(64) → r2,  const_inits += [ConstInit(reg=2, const_idx=1)]
+ctx.reg_for_int(1)  → r3,  const_inits += [ConstInit(reg=3, const_idx=2)]
+ctx.reg_for_int(0)  → r4,  const_inits += [ConstInit(reg=4, const_idx=3)]
+```
+
+寄存器布局更新：
+
+```
+r0  → %x          (函数参数，调用时传入)
+r1  → 常量 16     (帧建立时由 const_init 预填)
+r2  → 常量 64
+r3  → 常量 1
+r4  → 常量 0
+r5  → 待分配（%s0 的结果寄存器）
+```
+
+然后分配 `%s0` 的结果寄存器，并生成指令：
+
+```python
+result_reg = ctx.alloc_reg()          # r5
+ctx.bind(op.results[0], result_reg)   # %s0 → r5
+ctx.emit(Instruction(
+    opcode=Opcode.CALL,
+    dst_reg=result_reg,               # 结果写进 r5
+    func_idx=builtin("vm.builtin.alloc_storage"),
+    arg_regs=[r1, r2, r3, r4],        # 参数：[size, align, dev_type, dev_id]
+))
+```
+
+生成的指令：
+
+```
+PC=0: CALL r5, @vm.builtin.alloc_storage, [r1, r2, r3, r4]
+```
+
+---
+
+### 4.3 逐 Op 翻译：完整 demo 走一遍
+
+继续翻译剩余的 IR。
+
+#### alloc_tensor
+
+```
+%y = alloc_tensor(%s0, offset=0, shape=[4], dtype=float32)
+```
+
+`alloc_tensor` 的签名是：
+```
+alloc_tensor(storage, offset, shape_tuple, dtype_code, dtype_bits, dtype_lanes)
+```
+
+需要依次处理：
+- `storage` → 已有寄存器 `r5`（`%s0`）
+- `offset=0` → 常量 0，查常量池：已有 idx=3，分配新寄存器 `r6`
+  - `const_inits += [ConstInit(reg=6, const_idx=3)]`
+- `shape=[4]` → 先要调用 `make_shape(4)` 生成 ShapeTuple：
+  - 常量 `4` → 新常量 idx=4，分配 `r7`
+  - `const_inits += [ConstInit(reg=7, const_idx=4)]`
+  - 分配 shape 结果寄存器 `r8`，生成：`CALL r8, @vm.builtin.make_shape, [r7]`
+- `dtype=float32` → DLPack 编码 `(code=2, bits=32, lanes=1)`：
+  - 常量 2 → 新常量 idx=5，分配 `r9`
+  - 常量 32 → 新常量 idx=6，分配 `r10`
+  - 常量 1 → 已有 idx=2，分配 `r11`（注意：常量池去重，但每次都分配新寄存器）
+
+最终分配 `%y` 的结果寄存器 `r12`，生成：
+
+```
+PC=1: CALL r8,  @vm.builtin.make_shape,   [r7]
+PC=2: CALL r12, @vm.builtin.alloc_tensor, [r5, r6, r8, r9, r10, r11]
+```
+
+此时寄存器布局：
+
+```
+r0   → %x          (参数)
+r1   → 16          (const_init: size)
+r2   → 64          (const_init: alignment)
+r3   → 1           (const_init: kDLCPU)
+r4   → 0           (const_init: device_id)
+r5   → %s0         (alloc_storage 结果)
+r6   → 0           (const_init: offset=0)
+r7   → 4           (const_init: shape dim)
+r8   → ShapeTuple  (make_shape 结果)
+r9   → 2           (const_init: dtype_code=kDLFloat)
+r10  → 32          (const_init: dtype_bits)
+r11  → 1           (const_init: dtype_lanes)
+r12  → %y          (alloc_tensor 结果)
+```
+
+常量池：
+
+```
+exe.constants = [16, 64, 1, 0, 4, 2, 32]
+                 0    1  2  3  4  5   6
+```
+
+#### call_dps
+
+```
+call_dps kernel.add_one_fp32(inputs=[%x], output=%y)
+```
+
+DPS 调用没有 SSA 结果（kernel 直接写进 output buffer），所以 `dst_reg = -1`：
+
+```
+PC=3: CALL -1, @kernel.add_one_fp32, [r0, r12]
+```
+
+#### return
+
+```
+return %y
+```
+
+```
+PC=4: RET r12
+```
+
+---
+
+### 4.4 最终 Executable
+
+整合以上所有信息，生成的 `Executable` 如下：
+
+```
+Executable {
+
+  constants = [16, 64, 1, 0, 4, 2, 32]
+                0   1  2  3  4  5   6
+
+  function_table = [
+    # 先出现的 builtin 按调用顺序填入
+    FunctionEntry("vm.builtin.alloc_storage", kind=builtin,  instr_offset=-1, ...)
+    FunctionEntry("vm.builtin.make_shape",    kind=builtin,  instr_offset=-1, ...)
+    FunctionEntry("vm.builtin.alloc_tensor",  kind=builtin,  instr_offset=-1, ...)
+    FunctionEntry("kernel.add_one_fp32",      kind=kernel,   instr_offset=-1, ...)
+    FunctionEntry(
+      name         = "add_one",
+      kind         = vm_func,
+      instr_offset = 0,         # 从全局指令数组第 0 条开始
+      instr_count  = 5,
+      num_regs     = 13,        # 需要 r0~r12，共 13 个寄存器
+      num_args     = 1,         # r0 接收 %x
+      const_inits  = [
+        ConstInit(reg=1,  const_idx=0),   # r1  ← constants[0] = 16
+        ConstInit(reg=2,  const_idx=1),   # r2  ← constants[1] = 64
+        ConstInit(reg=3,  const_idx=2),   # r3  ← constants[2] = 1
+        ConstInit(reg=4,  const_idx=3),   # r4  ← constants[3] = 0
+        ConstInit(reg=6,  const_idx=3),   # r6  ← constants[3] = 0  (offset=0 复用)
+        ConstInit(reg=7,  const_idx=4),   # r7  ← constants[4] = 4
+        ConstInit(reg=9,  const_idx=5),   # r9  ← constants[5] = 2
+        ConstInit(reg=10, const_idx=6),   # r10 ← constants[6] = 32
+        ConstInit(reg=11, const_idx=2),   # r11 ← constants[2] = 1  (lanes 复用)
+      ]
+    )
+  ]
+
+  instructions = [
+    PC=0: CALL r5,  @[0]vm.builtin.alloc_storage, arg=[r1, r2, r3, r4]
+    PC=1: CALL r8,  @[1]vm.builtin.make_shape,    arg=[r7]
+    PC=2: CALL r12, @[2]vm.builtin.alloc_tensor,  arg=[r5, r6, r8, r9, r10, r11]
+    PC=3: CALL -1,  @[3]kernel.add_one_fp32,      arg=[r0, r12]
+    PC=4: RET r12
+  ]
+}
+```
+
+**关键点总结：**
+
+| 概念 | 含义 |
 |---|---|
-| `AllocStorageOp` | `CALL dst, @vm.builtin.alloc_storage, [r_size, r_align, r_devtype, r_devid]` |
-| `AllocTensorOp` | `CALL r_shape, @vm.builtin.make_shape, [r_d0, r_d1, ...]` 然后 `CALL dst, @vm.builtin.alloc_tensor, [r_storage, r_offset, r_shape, r_code, r_bits, r_lanes]` |
-| `CallDPSOp` | `CALL -1, @callee, [r_in0, ..., r_out]`（dst_reg=-1，DPS 无 SSA 结果） |
-| `TupleOp` | `CALL dst, @vm.builtin.make_tuple, [r_e0, r_e1, ...]` |
-| `TupleGetItemOp` | `CALL dst, @vm.builtin.tuple_get_item, [r_tuple, r_idx]` |
-| `ShapeAssertOp` | `CALL -1, @vm.builtin.shape_assert, [r_tensor, r_dim, r_upper]` |
-| `ReturnOp(vals)` | `RET r_val`（或 `RET -1` if void） |
-| `IfOp` | `IF + GOTO + identity copies`（见下节） |
-| `ForOp` | 条件循环展开（见下节） |
-| `YieldOp` | 不生成指令（由 parent IfOp/ForOp 处理） |
+| `num_regs = 13` | 这次函数调用需要开辟 13 个格子（r0~r12） |
+| `num_args = 1` | 调用方把参数写进 r0，其余寄存器由 VM 自行初始化 |
+| `const_inits` | 帧建立后、第一条指令执行前，把常量批量写入对应寄存器 |
+| `instr_offset = 0` | 这个函数的指令从全局指令数组下标 0 开始 |
+| `dst_reg = -1` | CALL 没有返回值（DPS kernel / void builtin） |
 
-### 4.3 IfOp 的 backpatching
+---
 
-IfOp 生成的指令布局：
+### 4.5 帧建立过程（const_init 何时执行）
+
+每次调用一个 `vm_func` 时，VM 按以下顺序初始化新帧：
 
 ```
-[if_pc]   IF  cond_reg, true_offset=1, false_offset=?  ← 待填
-[if_pc+1] ... then-branch 指令 ...
-[then_end] CALL r_result, @vm.builtin.identity, [r_yield_val]  ← 仅 SSA result 时
-[goto_pc]  GOTO offset=?                                         ← 待填
-[else_pc]  ... else-branch 指令 ...
-[else_end] CALL r_result, @vm.builtin.identity, [r_yield_val]
-[after]    ...
+1. 在全局寄存器文件末尾扩展 num_regs 个格子（全部初始化为 None）
+2. 把调用方传来的 args 依次写入 r0, r1, ..., r(num_args-1)
+3. 遍历 const_inits，把 constants[const_idx] 写入 r[reg_idx]
+4. 开始执行第一条指令（PC = instr_offset）
 ```
 
-回填规则：
-- `IF.false_offset = else_pc - if_pc`（false 时跳到 else 起点）
-- `GOTO.offset = after - goto_pc`（跳过 else 到后续指令）
-
-effect-only IfOp（无 SSA result）：不生成 identity CALL，GOTO 可省略。
-
-### 4.4 ForOp 的 loop codegen
+对 `add_one` 的一次调用，帧建立后寄存器文件状态（假设 `reg_base = 0`）：
 
 ```
-CALL r_i,   @vm.builtin.identity, [r_start]   ← 初始化循环变量
-CALL r_acc, @vm.builtin.identity, [r_acc_init] ← 初始化 iter_arg（如有）
+r0  = <x tensor>   ← 调用方传入
+r1  = 16           ← const_init
+r2  = 64           ← const_init
+r3  = 1            ← const_init
+r4  = 0            ← const_init
+r5  = None         ← 等 PC=0 执行后写入
+r6  = 0            ← const_init
+r7  = 4            ← const_init
+r8  = None         ← 等 PC=1 执行后写入
+r9  = 2            ← const_init
+r10 = 32           ← const_init
+r11 = 1            ← const_init
+r12 = None         ← 等 PC=2 执行后写入
+```
+
+---
+
+### 4.6 各 Op 的翻译规则（完整表）
+
+| IR Op | 生成的 VM 指令 | 说明 |
+|---|---|---|
+| `AllocStorageOp` | `CALL r_dst, @vm.builtin.alloc_storage, [r_size, r_align, r_devtype, r_devid]` | 4 个参数均来自 const_init |
+| `AllocTensorOp` | `CALL r_shape, @vm.builtin.make_shape, [r_d0, ...]`<br>`CALL r_dst, @vm.builtin.alloc_tensor, [r_storage, r_offset, r_shape, r_code, r_bits, r_lanes]` | 两条指令，先建 ShapeTuple 再建 Tensor |
+| `CallDPSOp` | `CALL -1, @callee, [r_in0, ..., r_out]` | `dst_reg=-1`：kernel 写 output buffer，无 SSA 结果 |
+| `TupleOp` | `CALL r_dst, @vm.builtin.make_tuple, [r_e0, r_e1, ...]` | |
+| `TupleGetItemOp` | `CALL r_dst, @vm.builtin.tuple_get_item, [r_tuple, r_idx]` | `r_idx` 来自 const_init |
+| `ShapeAssertOp` | `CALL -1, @vm.builtin.shape_assert, [r_tensor, r_dim, r_upper]` | 运行时 shape 检查，违反时 throw |
+| `ReturnOp` | `RET r_val`（void 返回用 `RET -1`） | |
+| `IfOp` | `IF + GOTO + identity copies`（见 §4.7） | |
+| `ForOp` | `identity init + lt_i64 + IF + body + add_i64 + GOTO`（见 §4.8） | |
+| `YieldOp` | 不生成指令 | 由父 IfOp/ForOp 读取 `yield.values` 后生成 identity CALL |
+
+---
+
+### 4.7 IfOp 的 backpatching（跳转目标回填）
+
+IfOp 是控制流，翻译时需要知道"跳到哪里"，但在生成 IF 指令时，then-branch 和 else-branch 的代码还没生成，长度未知。解决方法是**先占位，后回填**（backpatching）。
+
+以下面这个 IR 为例：
+
+```
+%z = if %cond {
+    yield %a
+} else {
+    yield %b
+}
+```
+
+**生成过程分 5 步：**
+
+**Step 1：预分配结果寄存器**
+
+IfOp 有 SSA result `%z`，在生成任何指令之前先分配：
+
+```
+ctx.alloc_reg() → r_z
+ctx.bind(%z, r_z)
+```
+
+这样 then-branch 和 else-branch 都知道应该把 yield 的值写进 `r_z`。
+
+**Step 2：emit IF 占位指令**
+
+```python
+if_pc = ctx.emit_placeholder(Opcode.IF)  # if_pc = 当前指令数组长度
+ctx.instrs[if_pc].cond_reg = r_cond
+ctx.instrs[if_pc].true_offset = 1        # true 时 PC += 1（= 跳到 IF 的下一条）
+# false_offset 暂时不知道，留空
+```
+
+此时指令数组：
+
+```
+[if_pc]   IF  cond=r_cond, true=+1, false=???
+```
+
+**Step 3：生成 then-branch**
+
+遍历 then-block 的所有 op。遇到 `YieldOp` 时，把 yield 值用 identity 复制到 `r_z`：
+
+```
+CALL r_z, @vm.builtin.identity, [r_a]
+```
+
+then-branch 结束后，emit GOTO 占位（用于跳过 else-branch）：
+
+```python
+goto_pc = ctx.emit_placeholder(Opcode.GOTO)
+```
+
+此时：
+
+```
+[if_pc]      IF   cond=r_cond, true=+1, false=???
+[if_pc+1]    CALL r_z, @identity, [r_a]     ← then-branch
+[goto_pc]    GOTO offset=???                ← 待填
+```
+
+**Step 4：回填 IF.false_offset，生成 else-branch**
+
+```python
+else_pc = ctx.pc()    # 当前长度 = else-branch 的起始 PC
+ctx.instrs[if_pc].false_offset = else_pc - if_pc
+```
+
+然后生成 else-branch，同样在 `YieldOp` 处写 `r_z`：
+
+```
+CALL r_z, @vm.builtin.identity, [r_b]
+```
+
+**Step 5：回填 GOTO.offset**
+
+```python
+after_pc = ctx.pc()   # else-branch 结束后的 PC
+ctx.instrs[goto_pc].offset = after_pc - goto_pc
+```
+
+最终指令序列：
+
+```
+[0]  IF    cond=r_cond, true_offset=+1, false_offset=+3
+[1]  CALL  r_z, @identity, [r_a]     ← then: yield %a
+[2]  GOTO  offset=+2                 ← 跳过 else
+[3]  CALL  r_z, @identity, [r_b]     ← else: yield %b
+[4]  ...（后续指令）
+```
+
+执行语义：
+- `cond=True`：PC += 1 → 执行 [1]（identity copy a→z），然后 [2]（GOTO +2 → PC=4），跳过 else
+- `cond=False`：PC += 3 → 执行 [3]（identity copy b→z），然后继续 [4]
+
+> **为什么用相对偏移而不是绝对地址？**
+> 相对偏移让 bytecode 位置无关。当多个函数共享同一个全局指令数组时，拼接后不需要重新计算地址。
+
+---
+
+### 4.8 ForOp 的 loop codegen
+
+以下面的 IR 为例（把 0~N-1 累加）：
+
+```
+%result = for %i in range(0, %N, 1), iter_args=[acc=0] {
+    %new_acc = add(%acc, 1)
+    yield %new_acc
+}
+```
+
+**生成过程：**
+
+```
+Step 1: 初始化循环变量和 iter_arg
+
+CALL r_i,   @identity, [r_start]   # r_i   = 0   （循环变量初值）
+CALL r_acc, @identity, [r_zero]    # r_acc = 0   （iter_arg 初值）
+
+Step 2: 循环头（loop header）——条件检查
+
 [loop_header_pc]
-CALL r_cond, @vm.builtin.lt_i64, [r_i, r_end]  ← 条件检查
-IF   r_cond, true_offset=1, false_offset=?      ← 待填
-... body 指令 ...
-CALL r_acc, @vm.builtin.identity, [r_yield_val] ← 更新 iter_arg
-CALL r_i,   @vm.builtin.add_i64, [r_i, r_step] ← 更新循环变量
+CALL r_cond, @lt_i64, [r_i, r_N]   # r_cond = (i < N)
+IF   r_cond, true_offset=+1, false_offset=???   ← 待填
+
+Step 3: 循环体
+
+... 循环体指令 ...
+CALL r_acc, @identity, [r_new_acc]  # 更新 iter_arg（来自 YieldOp）
+CALL r_i,   @add_i64, [r_i, r_step] # i = i + 1（step=1）
+
+Step 4: 跳回循环头
+
 [goto_pc]
-GOTO (loop_header_pc - goto_pc)                 ← 负偏移，回跳到条件检查
+GOTO (loop_header_pc - goto_pc)     # 负偏移，回跳
+
+Step 5: 循环结束
+
 [after_loop_pc]
-CALL r_result, @vm.builtin.identity, [r_acc]    ← 导出 ForOp SSA result（如有）
+# 回填 IF.false_offset = after_loop_pc - if_pc
+CALL r_result, @identity, [r_acc]   # 导出 ForOp SSA result
 ```
 
-回填：`IF.false_offset = after_loop_pc - if_pc`。
+最终指令结构（以 `loop_header_pc=2` 为例）：
+
+```
+PC=0: CALL r_i,    @identity, [r_start]
+PC=1: CALL r_acc,  @identity, [r_zero]
+PC=2: CALL r_cond, @lt_i64,   [r_i, r_N]     ← loop_header_pc
+PC=3: IF   r_cond, true=+1, false=+5          ← false 时跳到 PC=8
+PC=4: ... 循环体指令（计算 %new_acc）...
+PC=5: CALL r_acc, @identity, [r_new_acc]      ← 更新 iter_arg
+PC=6: CALL r_i,   @add_i64,  [r_i, r_step]   ← i++
+PC=7: GOTO -5                                  ← 跳回 PC=7-5=2
+PC=8: CALL r_result, @identity, [r_acc]        ← ForOp SSA result
+```
+
+每次循环迭代的 PC 轨迹：`2 → 3(true) → 4 → 5 → 6 → 7 → 2 → 3 → ...`，直到条件为 false 时跳到 `PC=8`。
 
 ---
 
