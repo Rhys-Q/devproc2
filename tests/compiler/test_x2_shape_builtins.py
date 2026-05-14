@@ -428,7 +428,9 @@ def test_full_dsl_dynamic_shape_pipeline():
     interp = VMInterpreter(exe)
     interp.register_kernel("kernel.relu_fp16", lambda args: None)
     tensor = _make_tensor((2, 512, 4096))
-    # Return value is None (relu output is written DPS-style; no explicit return SSA)
+    result = interp.invoke("main", [tensor])
+    # relu is DPS (output written in-place); main returns the output tensor
+    assert result is not None
 
 
 def test_full_dsl_dynamic_shape_assert_fails():
