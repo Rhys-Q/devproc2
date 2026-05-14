@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "device_api.h"
+#include "stream.h"
 #include "vm_value.h"
 
 namespace devproc2 {
@@ -161,10 +162,17 @@ public:
     // Execute func_name with args; return the result VMValue.
     VMValue Invoke(const std::string& func_name, std::vector<VMValue> args);
 
+    // Return the default stream for the given device (lazily created).
+    // Returns nullptr for CPU devices.
+    void* GetDefaultStream(const Device& dev);
+
 private:
     std::shared_ptr<Executable> exec_;
     std::vector<VMFrame>        frames_;
     std::vector<VMValue>        regs_;
+
+    // Per-device default streams; created on first use.
+    std::unordered_map<Device, Stream, DeviceHash, DeviceEqual> default_streams_;
 
     void    PushFrame(int32_t func_idx, std::vector<VMValue>& call_args,
                       int32_t caller_dst_reg, int32_t caller_reg_base);

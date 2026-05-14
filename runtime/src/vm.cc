@@ -1,11 +1,31 @@
 #include <devproc2/runtime/vm.h>
 #include <devproc2/runtime/packed_func.h>
+#include <devproc2/runtime/stream.h>
 #include <stdexcept>
 
 namespace devproc2 {
 
 VMState::VMState(std::shared_ptr<Executable> exec)
     : exec_(std::move(exec)) {}
+
+void* VMState::GetDefaultStream(const Device& dev) {
+    if (dev.device_type == kDLCPU) return nullptr;
+
+    auto it = default_streams_.find(dev);
+    if (it != default_streams_.end()) {
+        return it->second->handle;
+    }
+
+    DeviceAPI* api = DeviceAPIRegistry::Get(dev.device_type);
+    void* handle = api->CreateStream(dev);
+
+    auto* obj = new StreamObj();
+    obj->device = dev;
+    obj->handle = handle;
+    Stream s(obj);
+    default_streams_[dev] = s;
+    return handle;
+}
 
 VMValue VMState::Invoke(const std::string& func_name, std::vector<VMValue> args) {
     int32_t func_idx = exec_->GetFuncIndex(func_name);

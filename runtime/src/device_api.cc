@@ -9,6 +9,12 @@
 
 namespace devproc2 {
 
+#ifdef DEVPROC2_WITH_CUDA
+// Defined in cuda_device_api.cc; forward-declared here (not in the public header)
+// so only this TU needs to know about it.
+void RegisterCUDADeviceAPI();
+#endif
+
 // ── DeviceAPIRegistry ─────────────────────────────────────────────────────────
 
 std::unordered_map<int, DeviceAPI*>& DeviceAPIRegistry::Registry() {
@@ -72,6 +78,11 @@ CPUDeviceAPI g_cpu_device_api;
 struct CPUDeviceAPIRegistrar {
     CPUDeviceAPIRegistrar() {
         DeviceAPIRegistry::Register(kDLCPU, &g_cpu_device_api);
+#ifdef DEVPROC2_WITH_CUDA
+        // Register CUDA backend; call is in device_api.cc (always linked)
+        // so the linker includes cuda_device_api.cc's TU.
+        RegisterCUDADeviceAPI();
+#endif
     }
 } g_cpu_registrar;
 }  // namespace
