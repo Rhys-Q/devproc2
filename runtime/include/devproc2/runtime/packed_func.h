@@ -1,6 +1,9 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 #include "object.h"
 #include "object_ref.h"
@@ -38,5 +41,37 @@ public:
 
     void Call(PackedArgs args) { (*this)->Call(args); }
 };
+
+// ── PackedFuncRegistry ────────────────────────────────────────────────────────
+
+class PackedFuncRegistry {
+public:
+    static PackedFuncRegistry& Global();
+
+    void Register(const std::string& name, PackedFunc func);
+    PackedFunc Get(const std::string& name) const;
+    bool Has(const std::string& name) const;
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_map<std::string, PackedFunc> registry_;
+};
+
+// Helper for static-initializer registration
+struct PackedFuncRegistrar {
+    explicit PackedFuncRegistrar(const char* name) : name_(name) {}
+
+    PackedFuncRegistrar& set_body(std::function<void(PackedArgs)> f) {
+        auto* obj = new PackedFuncObj();
+        obj->body = std::move(f);
+        PackedFuncRegistry::Global().Register(name_, PackedFunc(obj));
+        return *this;
+    }
+
+    std::string name_;
+};
+
+#define DEVPROC2_REGISTER_PACKED_FUNC(name)                                    \
+    static ::devproc2::PackedFuncRegistrar _pfreg_##__LINE__(name)
 
 }  // namespace devproc2

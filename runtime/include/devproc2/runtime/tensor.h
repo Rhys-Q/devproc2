@@ -49,6 +49,12 @@ public:
     static Tensor Empty(const std::vector<int64_t>& shape,
                         DLDataType dtype, DLDevice device);
 
+    // Used by vm.builtin.alloc_tensor: create a tensor view over an existing storage.
+    static Tensor FromStorage(ObjectRef storage,
+                              int64_t byte_offset,
+                              const std::vector<int64_t>& shape,
+                              DLDataType dtype);
+
     static Tensor FromDLPack(DLManagedTensor* managed);
 
     static Tensor FromExternalBuffer(

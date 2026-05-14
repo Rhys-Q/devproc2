@@ -46,6 +46,27 @@ Tensor Tensor::Empty(const std::vector<int64_t>& shape,
     return Tensor(tobj);
 }
 
+Tensor Tensor::FromStorage(ObjectRef storage,
+                           int64_t byte_offset,
+                           const std::vector<int64_t>& shape,
+                           DLDataType dtype) {
+    auto* sobj = storage.as<StorageObj>();
+    if (!sobj) throw std::runtime_error("Tensor::FromStorage: invalid storage");
+
+    auto* tobj = new TensorObj();
+    tobj->storage               = storage;
+    tobj->shape_storage_        = shape;
+    tobj->dl_tensor.data        =
+        static_cast<char*>(sobj->data) + byte_offset;
+    tobj->dl_tensor.device      = sobj->device;
+    tobj->dl_tensor.ndim        = static_cast<int>(shape.size());
+    tobj->dl_tensor.dtype       = dtype;
+    tobj->dl_tensor.shape       = tobj->shape_storage_.data();
+    tobj->dl_tensor.strides     = nullptr;
+    tobj->dl_tensor.byte_offset = 0;
+    return Tensor(tobj);
+}
+
 Tensor Tensor::FromDLPack(DLManagedTensor* managed) {
     auto* obj = new TensorObj();
     obj->dl_tensor = managed->dl_tensor;
