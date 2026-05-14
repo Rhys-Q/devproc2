@@ -1,9 +1,238 @@
 #include <devproc2/runtime/vm.h>
 #include <devproc2/runtime/packed_func.h>
 #include <devproc2/runtime/stream.h>
+#include <cstring>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 namespace devproc2 {
+
+// ── Binary deserialization helpers ────────────────────────────────────────────
+
+namespace {
+
+struct ByteReader {
+    const uint8_t* data;
+    size_t         size;
+    size_t         pos = 0;
+
+    template <typename T>
+    T read() {
+        if (pos + sizeof(T) > size)
+            throw std::runtime_error("Deserialize: unexpected end of data");
+        T val{};
+        std::memcpy(&val, data + pos, sizeof(T));
+        pos += sizeof(T);
+        return val;
+    }
+
+    std::string read_string() {
+        uint32_t len = read<uint32_t>();
+        if (pos + len > size)
+            throw std::runtime_error("Deserialize: unexpected end of string");
+        std::string s(reinterpret_cast<const char*>(data + pos), len);
+        pos += len;
+        return s;
+    }
+
+    void skip(size_t n) {
+        if (pos + n > size)
+            throw std::runtime_error("Deserialize: unexpected end of data (skip)");
+        pos += n;
+    }
+};
+
+static constexpr uint8_t _MAGIC[4] = {'D', 'V', '2', 'E'};
+static constexpr uint32_t _VERSION  = 1;
+static constexpr uint8_t _TAG_NULL  = 0;
+static constexpr uint8_t _TAG_INT   = 1;
+static constexpr uint8_t _TAG_FLOAT = 2;
+static constexpr uint8_t _TAG_BOOL  = 3;
+static constexpr uint8_t _TAG_STR   = 4;
+
+// Minimal JSON helpers: extract a top-level string field or string-array field.
+// Only works on JSON produced by Python json.dump(indent=2) with known structure.
+
+static std::string json_extract_string(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\": \"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return {};
+    pos += search.size();
+    size_t end = json.find('"', pos);
+    if (end == std::string::npos) return {};
+    return json.substr(pos, end - pos);
+}
+
+static std::vector<std::string> json_extract_string_array(
+        const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\": [";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return {};
+    pos += search.size();
+
+    std::vector<std::string> result;
+    while (true) {
+        size_t q     = json.find('"', pos);
+        size_t close = json.find(']', pos);
+        if (close == std::string::npos || (q == std::string::npos) || close < q)
+            break;
+        pos = q + 1;
+        size_t end = json.find('"', pos);
+        if (end == std::string::npos) break;
+        result.push_back(json.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    return result;
+}
+
+static std::string read_file_text(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open())
+        throw std::runtime_error("Cannot open file: " + path);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::vector<uint8_t> read_file_binary(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open())
+        throw std::runtime_error("Cannot open file: " + path);
+    auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<uint8_t> buf(size);
+    f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(size));
+    return buf;
+}
+
+}  // namespace
+
+// ── Executable::Deserialize ───────────────────────────────────────────────────
+
+std::shared_ptr<Executable> Executable::Deserialize(const uint8_t* data, size_t size) {
+    ByteReader r{data, size};
+
+    // Magic
+    if (size < 4 || std::memcmp(data, _MAGIC, 4) != 0)
+        throw std::runtime_error("Deserialize: invalid magic bytes");
+    r.pos = 4;
+
+    uint32_t version    = r.read<uint32_t>();
+    uint32_t num_funcs  = r.read<uint32_t>();
+    uint32_t num_instrs = r.read<uint32_t>();
+    uint32_t num_consts = r.read<uint32_t>();
+
+    if (version != _VERSION)
+        throw std::runtime_error("Deserialize: bytecode version mismatch: expected "
+                                 + std::to_string(_VERSION) + ", got "
+                                 + std::to_string(version));
+
+    auto exe = std::make_shared<Executable>();
+
+    // Function table
+    exe->function_table.resize(num_funcs);
+    for (uint32_t i = 0; i < num_funcs; ++i) {
+        FunctionEntry& fe = exe->function_table[i];
+        fe.name         = r.read_string();
+        fe.kind         = static_cast<VMCalleeKind>(r.read<uint8_t>());
+        fe.instr_offset = r.read<int32_t>();
+        fe.instr_count  = r.read<int32_t>();
+        fe.num_regs     = r.read<int32_t>();
+        fe.num_args     = r.read<int32_t>();
+        uint32_t n_ci   = static_cast<uint32_t>(r.read<int32_t>());
+        fe.const_inits.resize(n_ci);
+        for (uint32_t j = 0; j < n_ci; ++j) {
+            fe.const_inits[j].reg_idx   = r.read<int32_t>();
+            fe.const_inits[j].const_idx = r.read<int32_t>();
+        }
+    }
+
+    // Instructions
+    exe->instructions.resize(num_instrs);
+    for (uint32_t i = 0; i < num_instrs; ++i) {
+        Instruction& ins = exe->instructions[i];
+        ins.opcode       = static_cast<Opcode>(r.read<uint8_t>());
+        ins.dst_reg      = r.read<int32_t>();
+        ins.func_idx     = r.read<int32_t>();
+        ins.src_reg      = r.read<int32_t>();
+        ins.cond_reg     = r.read<int32_t>();
+        ins.true_offset  = r.read<int32_t>();
+        ins.false_offset = r.read<int32_t>();
+        ins.offset       = r.read<int32_t>();
+        uint32_t nargs   = r.read<uint32_t>();
+        ins.arg_regs.resize(nargs);
+        for (uint32_t j = 0; j < nargs; ++j)
+            ins.arg_regs[j] = r.read<int32_t>();
+    }
+
+    // Constants: each is 1 tag byte + 8 value bytes
+    exe->constants.resize(num_consts);
+    for (uint32_t i = 0; i < num_consts; ++i) {
+        uint8_t tag = r.read<uint8_t>();
+        if (tag == _TAG_NULL) {
+            r.skip(8);
+            exe->constants[i] = VMValue{};
+        } else if (tag == _TAG_INT) {
+            int64_t v = r.read<int64_t>();
+            exe->constants[i] = VMValue::Int(v);
+        } else if (tag == _TAG_FLOAT) {
+            double v = r.read<double>();
+            exe->constants[i] = VMValue::Float(v);
+        } else if (tag == _TAG_BOOL) {
+            int64_t v = r.read<int64_t>();
+            exe->constants[i] = VMValue::Bool(static_cast<bool>(v));
+        } else if (tag == _TAG_STR) {
+            // String constant: uint32 length + bytes.
+            // VMValue has no string type; store as null (string is used for
+            // assert_le_i64 message and the C++ builtin reads it from a
+            // different mechanism — see builtins.cc).
+            uint32_t slen = r.read<uint32_t>();
+            r.skip(slen);
+            exe->constants[i] = VMValue{};
+        } else {
+            throw std::runtime_error("Deserialize: unknown constant tag "
+                                     + std::to_string(tag));
+        }
+    }
+
+    return exe;
+}
+
+// ── Executable::Load ──────────────────────────────────────────────────────────
+
+std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
+    // 1. Deserialize executable.vm
+    std::string vm_path = artifact_dir + "/executable.vm";
+    auto vm_bytes = read_file_binary(vm_path);
+    auto exe = Executable::Deserialize(vm_bytes.data(), vm_bytes.size());
+
+    // 2. Parse abi.json for version check and required packed funcs
+    std::string abi_path = artifact_dir + "/abi.json";
+    std::string abi_json = read_file_text(abi_path);
+
+    std::string abi_version = json_extract_string(abi_json, "devproc_abi_version");
+    if (!abi_version.empty()) {
+        // Extract major component: "0.1" → "0"
+        std::string expected_major = "0";
+        std::string actual_major   = abi_version.substr(0, abi_version.find('.'));
+        if (actual_major != expected_major) {
+            throw std::runtime_error(
+                "ABI version mismatch: expected major " + expected_major
+                + ", got " + actual_major + " (full version: " + abi_version + ")");
+        }
+    }
+
+    auto required = json_extract_string_array(abi_json, "required_packed_funcs");
+    for (const auto& name : required) {
+        if (!PackedFuncRegistry::Global().Has(name)) {
+            throw std::runtime_error(
+                "PackedFunc '" + name + "' is required but not registered.");
+        }
+    }
+
+    return exe;
+}
 
 VMState::VMState(std::shared_ptr<Executable> exec)
     : exec_(std::move(exec)) {}

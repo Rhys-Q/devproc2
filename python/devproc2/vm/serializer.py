@@ -1,4 +1,4 @@
-"""Executable ↔ binary serialization (stub for M8; full format in M9)."""
+"""Executable ↔ binary serialization."""
 from __future__ import annotations
 
 import struct
@@ -18,6 +18,7 @@ _TAG_NULL  = 0
 _TAG_INT   = 1
 _TAG_FLOAT = 2
 _TAG_BOOL  = 3
+_TAG_STR   = 4
 
 
 def serialize(exe: Executable) -> bytes:
@@ -57,6 +58,9 @@ def serialize(exe: Executable) -> bytes:
             buf += struct.pack("<Bq", _TAG_INT, c)
         elif isinstance(c, float):
             buf += struct.pack("<Bd", _TAG_FLOAT, c)
+        elif isinstance(c, str):
+            s_b = c.encode()
+            buf += struct.pack("<BI", _TAG_STR, len(s_b)) + s_b
         else:
             raise TypeError(f"Cannot serialize constant: {c!r}")
 
@@ -117,6 +121,10 @@ def deserialize(data: bytes) -> Executable:
             (v,) = read("<d"); constants.append(v)
         elif tag == _TAG_BOOL:
             (v,) = read("<q"); constants.append(bool(v))
+        elif tag == _TAG_STR:
+            (slen,) = read("<I")
+            s = data[pos:pos+slen].decode(); pos += slen
+            constants.append(s)
         else:
             raise ValueError(f"Unknown constant tag: {tag}")
 
