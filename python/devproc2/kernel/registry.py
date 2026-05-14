@@ -54,11 +54,13 @@ class KernelSpec:
     sm_arches:    tuple[int, ...] = ()   # () = any SM
     priority:     int = 0
     match:        Optional[Callable[["CallOp"], bool]] = None
+    grid_fn:      Optional[Callable[..., tuple[int, int, int]]] = None
 
     def __post_init__(self) -> None:
         # Coerce sequence fields to tuple so callers may pass lists.
         object.__setattr__(self, "input_dtypes", tuple(self.input_dtypes))
         object.__setattr__(self, "sm_arches", tuple(self.sm_arches))
+        # grid_fn is a callable; leave it as-is
 
 
 def build_input_dtypes(args: tuple) -> tuple[str, ...]:

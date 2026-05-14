@@ -30,6 +30,7 @@ if(DEVPROC2_WITH_CUDA)
         src/cuda/cuda_device_api.cc
         src/cuda/cuda_module.cc
         src/cuda/cuda_kernel.cc
+        src/cuda/cuda_kernel_registry.cc
         src/cuda/cuda_memory_pool.cc
     )
     target_link_libraries(devproc2_runtime

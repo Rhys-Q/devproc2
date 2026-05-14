@@ -29,12 +29,15 @@ from devproc2.ir.ops import (
     IterArg,
     Range,
     ReturnOp,
+    TensorCreateKind,
+    TensorCreateOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
 )
-from devproc2.ir.prim_expr import PrimVar
+from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
 from devproc2.frontend.scope import ScopeStack
+from devproc2.kernel.registry import KernelRegistry, KernelSpec
 
 
 class DSLError(Exception):
@@ -71,15 +74,21 @@ class Tensor:
 # ---------------------------------------------------------------------------
 
 _module: IRModule = IRModule()
+_kernel_registry: KernelRegistry = KernelRegistry()
 
 
 def get_module() -> IRModule:
     return _module
 
 
+def get_kernel_registry() -> KernelRegistry:
+    return _kernel_registry
+
+
 def reset_module() -> None:
-    global _module
+    global _module, _kernel_registry
     _module = IRModule()
+    _kernel_registry = KernelRegistry()
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +111,40 @@ range = _RangeStub()
 ops = _OpsStub()
 
 
-def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque"):
+def empty(shape, dtype: str = "float32", device: str = "cpu"):
+    """Runtime stub — real tensor creation happens via DSL AST compilation."""
     pass
+
+
+def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque"):
+    """Runtime stub — real op emission happens via DSL AST compilation."""
+    pass
+
+
+def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
+           dtype: str = "float16", grid=None, sm_arches=()):
+    """Decorator to register a kernel implementation.
+
+    Example::
+
+        @dp.kernel(op="relu", backend="triton", device="cuda", dtype="float16",
+                   grid=lambda *inputs: (1, 1, 1))
+        def relu_kernel(x, out):
+            ...  # Triton kernel body
+    """
+    def decorator(fn):
+        spec = KernelSpec(
+            op_name=op,
+            device=device,
+            input_dtypes=(dtype,),
+            kernel_name=f"kernel.{fn.__name__}",
+            sm_arches=sm_arches,
+            grid_fn=grid,
+        )
+        _kernel_registry.register(spec)
+        fn._kernel_spec = spec
+        return fn
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +157,7 @@ def function(fn):
     src = textwrap.dedent(src)
     tree = ast.parse(src)
     fn_def = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
-    builder = DSLBuilder(annotations=annotations)
+    builder = DSLBuilder(annotations=annotations, globals_dict=fn.__globals__)
     ir_name, ir_func = builder.build(fn_def)
     _module.functions[ir_name] = ir_func
     return fn
@@ -127,10 +168,12 @@ def function(fn):
 # ---------------------------------------------------------------------------
 
 class DSLBuilder:
-    def __init__(self, annotations: Optional[dict] = None) -> None:
+    def __init__(self, annotations: Optional[dict] = None,
+                 globals_dict: Optional[dict] = None) -> None:
         self.scope = ScopeStack()
         self._counter = 0
         self._annotations = annotations or {}
+        self._globals = globals_dict or {}
 
     # ------------------------------------------------------------------
     # Public entry
@@ -177,6 +220,12 @@ class DSLBuilder:
             val_expr = stmt.value
 
             if isinstance(val_expr, ast.Call):
+                callee_str = ast.unparse(val_expr.func)
+                if "empty" in callee_str:
+                    result_name = self._pick_name(name)
+                    create_op = self._build_empty(val_expr, result_name)
+                    self.scope.define(name, create_op.results[0])
+                    return [create_op]
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 result_name = self._pick_name(name)
@@ -356,10 +405,11 @@ class DSLBuilder:
             inp_node = kwargs["inputs"]
             if isinstance(inp_node, ast.List):
                 inputs = tuple(self._build_value(e) for e in inp_node.elts)
-        output: Optional[Var] = None
+        output: Optional[Value] = None
         if "output" in kwargs:
-            out_val = self._build_value(kwargs["output"])
-            if isinstance(out_val, Var):
+            out_node = kwargs["output"]
+            if not (isinstance(out_node, ast.Constant) and out_node.value is None):
+                out_val = self._build_value(kwargs["output"])
                 output = out_val
         return CallDPSOp(
             callee=callee,
@@ -368,6 +418,43 @@ class DSLBuilder:
             output=output,
             effect=OpaqueEffect(),
         )
+
+    # ------------------------------------------------------------------
+    # dp.empty()
+    # ------------------------------------------------------------------
+
+    def _build_empty(self, node: ast.Call, result_name: str) -> TensorCreateOp:
+        if not node.args:
+            raise DSLError("dp.empty requires shape as first argument")
+        shape_node = node.args[0]
+        if isinstance(shape_node, ast.Tuple):
+            shape = tuple(self._build_prim_expr(e) for e in shape_node.elts)
+        else:
+            shape = (self._build_prim_expr(shape_node),)
+        kwargs = {kw.arg: kw.value for kw in node.keywords}
+        dtype = kwargs["dtype"].value if "dtype" in kwargs and isinstance(kwargs["dtype"], ast.Constant) else "float32"
+        device = kwargs["device"].value if "device" in kwargs and isinstance(kwargs["device"], ast.Constant) else "cpu"
+        return TensorCreateOp(
+            result_name=result_name,
+            kind=TensorCreateKind.empty,
+            shape=shape,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _build_prim_expr(self, node: ast.expr) -> PrimExpr:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return IntImm(node.value)
+        if isinstance(node, ast.Name):
+            v = self.scope.lookup(node.id)
+            if isinstance(v, PrimVar):
+                return v
+            # Resolve named integer constants from the caller's module globals
+            gval = self._globals.get(node.id)
+            if isinstance(gval, int):
+                return IntImm(gval)
+            return PrimVar(node.id)
+        raise DSLError(f"Unsupported shape expression: {ast.unparse(node)}")
 
     # ------------------------------------------------------------------
     # Value materialization

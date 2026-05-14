@@ -163,7 +163,17 @@ class VMCodegenPass:
       → LowerTensorCreateToAllocPass
 
     All AllocStorageOp.size_bytes must be IntImm (static shapes only in M8).
+
+    Parameters
+    ----------
+    kernel_specs : dict[str, KernelSpec], optional
+        Map from kernel callee name (e.g. "kernel.relu_fp16") to its
+        KernelSpec. When provided, grid dims from spec.grid_fn are emitted
+        as constant args appended to the kernel CALL instruction.
     """
+
+    def __init__(self, kernel_specs=None) -> None:
+        self._kernel_specs: dict = kernel_specs or {}
 
     def run(self, module: IRModule) -> Executable:
         exec_ = Executable()
@@ -304,6 +314,13 @@ class VMCodegenPass:
         arg_regs = [ctx.reg_of(v) for v in op.inputs]
         if op.output is not None:
             arg_regs.append(ctx.reg_of(op.output))
+        # For kernel callees: emit static grid dims (gx, gy, gz) as extra args.
+        if op.callee_kind == IRCalleeKind.kernel:
+            spec = self._kernel_specs.get(op.callee)
+            if spec is not None and spec.grid_fn is not None:
+                grid = spec.grid_fn()  # static grid at codegen time
+                for g in grid:
+                    arg_regs.append(ctx.reg_for_int(int(g)))
         func_idx = ctx.intern_func(op.callee, _ir_callee_kind(op.callee_kind))
         ctx.emit(Instruction(
             opcode=Opcode.CALL,
