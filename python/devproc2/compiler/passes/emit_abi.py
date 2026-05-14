@@ -1,7 +1,6 @@
 """EmitABIPass — generate ABI/manifest/metadata JSON files for a compiled artifact."""
 from __future__ import annotations
 
-import dataclasses
 import datetime
 import json
 import os
@@ -13,7 +12,9 @@ from devproc2.ir.nodes import (
     IRModule,
     TensorStructInfo,
 )
-from devproc2.ir.prim_expr import PrimVar
+from devproc2.ir.prim_expr import (
+    Add, CeilDiv, FloorDiv, IntImm, Max, Min, Mul, PrimVar, Sub,
+)
 from devproc2.vm.executable import CalleeKind, Executable
 
 _ABI_VERSION = "0.1"
@@ -22,7 +23,6 @@ _ARTIFACT_VERSION = "0.1.0"
 
 def _shape_dim_to_json(dim) -> Any:
     """Convert a PrimExpr shape dimension to a JSON-compatible value (int or str)."""
-    from devproc2.ir.prim_expr import IntImm
     if isinstance(dim, IntImm):
         return dim.value
     if isinstance(dim, PrimVar):
@@ -30,19 +30,7 @@ def _shape_dim_to_json(dim) -> Any:
     return str(dim)
 
 
-def _collect_prim_vars(struct_info) -> dict[str, Optional[int]]:
-    """Walk a StructInfo tree and collect all PrimVar name → upper mappings."""
-    result: dict[str, Optional[int]] = {}
-    if isinstance(struct_info, TensorStructInfo):
-        for dim in struct_info.shape:
-            _collect_prim_vars_from_expr(dim, result)
-    return result
-
-
 def _collect_prim_vars_from_expr(expr, out: dict[str, Optional[int]]) -> None:
-    from devproc2.ir.prim_expr import (
-        Add, CeilDiv, FloorDiv, IntImm, Max, Min, Mul, Sub,
-    )
     if isinstance(expr, IntImm):
         return
     if isinstance(expr, PrimVar):
@@ -175,7 +163,6 @@ class EmitABIPass:
 
     def _constraints_from_struct_info(self, si: TensorStructInfo) -> dict[str, Any]:
         prim_vars: dict[str, Optional[int]] = {}
-        _collect_prim_vars(si)
         for dim in si.shape:
             _collect_prim_vars_from_expr(dim, prim_vars)
         result = {}

@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "devproc2/runtime/packed_func.h"
@@ -89,7 +90,8 @@ static void write_binary(const std::string& path, const std::vector<uint8_t>& da
 // Create a temp artifact dir with valid executable.vm and given abi.json content
 static std::string make_artifact_dir(const std::string& suffix,
                                       const std::string& abi_content) {
-    std::string dir = "/tmp/devproc2_m9_test_" + suffix;
+    std::string dir = "/tmp/devproc2_m9_test_" + suffix
+                      + "_" + std::to_string(getpid());
     std::filesystem::create_directories(dir);
     write_binary(dir + "/executable.vm", make_minimal_vm_bytes());
     write_file(dir + "/abi.json", abi_content);
@@ -146,7 +148,7 @@ void test_deserialize_bad_magic() {
 // ── test_load_missing_executable_vm ──────────────────────────────────────────
 
 void test_load_missing_executable_vm() {
-    std::string dir = "/tmp/devproc2_m9_test_no_vm";
+    std::string dir = "/tmp/devproc2_m9_test_no_vm_" + std::to_string(getpid());
     std::filesystem::create_directories(dir);
     write_file(dir + "/abi.json",
                "{\"devproc_abi_version\": \"0.1\", \"required_packed_funcs\": []}");
@@ -157,9 +159,6 @@ void test_load_missing_executable_vm() {
 }  // namespace
 
 int main() {
-    int prev_fail = g_fail;
-    (void)prev_fail;
-
     RUN(test_deserialize_minimal);
     RUN(test_deserialize_bad_magic);
     RUN(test_load_valid_no_packed_funcs);

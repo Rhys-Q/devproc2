@@ -17,7 +17,7 @@ target_include_directories(devproc2_runtime
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(devproc2_runtime PUBLIC dlpack)
+target_link_libraries(devproc2_runtime PUBLIC dlpack nlohmann_json)
 
 target_compile_options(devproc2_runtime PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>

@@ -1,6 +1,7 @@
 #include <devproc2/runtime/vm.h>
 #include <devproc2/runtime/packed_func.h>
 #include <devproc2/runtime/stream.h>
+#include <nlohmann/json.hpp>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -50,41 +51,6 @@ static constexpr uint8_t _TAG_INT   = 1;
 static constexpr uint8_t _TAG_FLOAT = 2;
 static constexpr uint8_t _TAG_BOOL  = 3;
 static constexpr uint8_t _TAG_STR   = 4;
-
-// Minimal JSON helpers: extract a top-level string field or string-array field.
-// Only works on JSON produced by Python json.dump(indent=2) with known structure.
-
-static std::string json_extract_string(const std::string& json, const std::string& key) {
-    std::string search = "\"" + key + "\": \"";
-    size_t pos = json.find(search);
-    if (pos == std::string::npos) return {};
-    pos += search.size();
-    size_t end = json.find('"', pos);
-    if (end == std::string::npos) return {};
-    return json.substr(pos, end - pos);
-}
-
-static std::vector<std::string> json_extract_string_array(
-        const std::string& json, const std::string& key) {
-    std::string search = "\"" + key + "\": [";
-    size_t pos = json.find(search);
-    if (pos == std::string::npos) return {};
-    pos += search.size();
-
-    std::vector<std::string> result;
-    while (true) {
-        size_t q     = json.find('"', pos);
-        size_t close = json.find(']', pos);
-        if (close == std::string::npos || (q == std::string::npos) || close < q)
-            break;
-        pos = q + 1;
-        size_t end = json.find('"', pos);
-        if (end == std::string::npos) break;
-        result.push_back(json.substr(pos, end - pos));
-        pos = end + 1;
-    }
-    return result;
-}
 
 static std::string read_file_text(const std::string& path) {
     std::ifstream f(path);
@@ -207,13 +173,13 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
     auto vm_bytes = read_file_binary(vm_path);
     auto exe = Executable::Deserialize(vm_bytes.data(), vm_bytes.size());
 
-    // 2. Parse abi.json for version check and required packed funcs
+    // 2. Parse abi.json
     std::string abi_path = artifact_dir + "/abi.json";
-    std::string abi_json = read_file_text(abi_path);
+    auto abi = nlohmann::json::parse(read_file_text(abi_path));
 
-    std::string abi_version = json_extract_string(abi_json, "devproc_abi_version");
+    // 3. ABI version check (major component must match)
+    std::string abi_version = abi.value("devproc_abi_version", std::string{});
     if (!abi_version.empty()) {
-        // Extract major component: "0.1" → "0"
         std::string expected_major = "0";
         std::string actual_major   = abi_version.substr(0, abi_version.find('.'));
         if (actual_major != expected_major) {
@@ -223,11 +189,13 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
         }
     }
 
-    auto required = json_extract_string_array(abi_json, "required_packed_funcs");
-    for (const auto& name : required) {
-        if (!PackedFuncRegistry::Global().Has(name)) {
+    // 4. PackedFunc dependency check
+    for (const auto& name : abi.value("required_packed_funcs",
+                                       nlohmann::json::array())) {
+        std::string fn = name.get<std::string>();
+        if (!PackedFuncRegistry::Global().Has(fn)) {
             throw std::runtime_error(
-                "PackedFunc '" + name + "' is required but not registered.");
+                "PackedFunc '" + fn + "' is required but not registered.");
         }
     }
 
