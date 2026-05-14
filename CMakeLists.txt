@@ -22,4 +22,14 @@ add_library(dlpack INTERFACE)
 target_include_directories(dlpack INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/dlpack/include)
 
+# ── nlohmann/json (git submodule, header-only) ────────────────────────────────
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/json/single_include/nlohmann/json.hpp")
+  message(FATAL_ERROR
+    "nlohmann/json submodule not found. Run:\n"
+    "  git submodule update --init --recursive")
+endif()
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/json/single_include)
+
 add_subdirectory(runtime)

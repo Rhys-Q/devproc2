@@ -76,6 +76,13 @@ public:
         }
         throw std::runtime_error("Function '" + name + "' not found in Executable");
     }
+
+    // Deserialize from raw binary bytes (produced by Python serializer.serialize()).
+    static std::shared_ptr<Executable> Deserialize(const uint8_t* data, size_t size);
+
+    // Load artifact from directory: deserializes executable.vm, validates abi.json,
+    // and checks that all required packed funcs are registered.
+    static std::shared_ptr<Executable> Load(const std::string& artifact_dir);
 };
 
 // ── Builtin registry ──────────────────────────────────────────────────────────
