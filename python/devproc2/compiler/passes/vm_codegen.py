@@ -28,6 +28,7 @@ from devproc2.ir.ops import (
     YieldOp,
 )
 from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
+from devproc2.compiler.passes.shape_expr_lowering import ShapeExprLoweringPass, _PrimExprLowerer
 from devproc2.vm.executable import (
     CalleeKind,
     ConstInit,
@@ -65,6 +66,8 @@ class _FnCtx:
         self.next_reg: int = 0
         # const_inits: filled into FunctionEntry
         self.const_inits: list[ConstInit] = []
+        # Set by ShapeExprLoweringPass.setup_fn at function-entry codegen time
+        self.prim_lowerer: Optional[_PrimExprLowerer] = None
 
     # ---- register allocation -----------------------------------------------
 
@@ -178,6 +181,9 @@ class VMCodegenPass:
             ctx.bind(param, i)
             ctx.next_reg = i + 1
 
+        # Setup PrimVar extraction + assert_le_i64 prologue for dynamic shapes.
+        ctx.prim_lowerer = ShapeExprLoweringPass.setup_fn(fn, ctx)
+
         instr_base = len(exec_.instructions)
         self._codegen_block(fn.body.entry_block, ctx)
 
@@ -228,12 +234,10 @@ class VMCodegenPass:
     # ---- AllocStorageOp ----------------------------------------------------
 
     def _lower_alloc_storage(self, op: AllocStorageOp, ctx: _FnCtx) -> None:
-        if not isinstance(op.size_bytes, IntImm):
-            raise NotImplementedError(
-                f"Dynamic shape in AllocStorageOp '{op.result_name}' is not supported "
-                "in M8 (requires X2)."
-            )
-        size_reg   = ctx.reg_for_int(op.size_bytes.value)
+        if isinstance(op.size_bytes, IntImm):
+            size_reg = ctx.reg_for_int(op.size_bytes.value)
+        else:
+            size_reg = ctx.prim_lowerer.materialize(op.size_bytes)
         align_reg  = ctx.reg_for_int(op.alignment)
         dev_type, dev_id = parse_device(op.device)
         dtype_reg  = ctx.reg_for_int(dev_type)
@@ -262,15 +266,13 @@ class VMCodegenPass:
             elif isinstance(dim, PrimVar):
                 reg = ctx._value_reg.get(id(dim))
                 if reg is None:
-                    raise NotImplementedError(
+                    raise RuntimeError(
                         f"PrimVar shape dim '{dim.name}' not in register; "
-                        "dynamic shapes require X2."
+                        "ensure ShapeExprLoweringPass.setup_fn ran first."
                     )
                 shape_regs.append(reg)
             else:
-                raise NotImplementedError(
-                    f"Non-IntImm/PrimVar shape dim in AllocTensorOp: {type(dim).__name__}"
-                )
+                shape_regs.append(ctx.prim_lowerer.materialize(dim))
 
         shape_reg = ctx.alloc_reg()
         ctx.emit(Instruction(
