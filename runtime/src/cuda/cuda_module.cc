@@ -48,14 +48,11 @@ public:
     }
 
     CUfunction GetFunction(const std::string& name) {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = func_cache_.find(name);
-            if (it != func_cache_.end()) return it->second;
-        }
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = func_cache_.find(name);
+        if (it != func_cache_.end()) return it->second;
         CUfunction fn;
         CU_CHECK(cuModuleGetFunction(&fn, module_, name.c_str()));
-        std::lock_guard<std::mutex> lock(mu_);
         func_cache_[name] = fn;
         return fn;
     }

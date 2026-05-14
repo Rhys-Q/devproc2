@@ -41,7 +41,7 @@ if(DEVPROC2_WITH_CUDA)
 endif()
 
 option(DEVPROC2_BUILD_TESTS "Build C++ unit tests" OFF)
+enable_testing()
 if(DEVPROC2_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(tests)
 endif()

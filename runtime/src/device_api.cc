@@ -9,6 +9,12 @@
 
 namespace devproc2 {
 
+#ifdef DEVPROC2_WITH_CUDA
+// Defined in cuda_device_api.cc; forward-declared here (not in the public header)
+// so only this TU needs to know about it.
+void RegisterCUDADeviceAPI();
+#endif
+
 // ── DeviceAPIRegistry ─────────────────────────────────────────────────────────
 
 std::unordered_map<int, DeviceAPI*>& DeviceAPIRegistry::Registry() {

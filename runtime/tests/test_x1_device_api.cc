@@ -274,7 +274,6 @@ void test_no_cuda_in_vm_cc() {
     // If we can't find the file, skip rather than false-fail
     if (content.empty()) {
         std::cout << "  (skipped: could not locate vm.cc from test binary path)\n";
-        ++g_pass;
         return;
     }
     auto contains = [&](const char* needle) {
@@ -283,6 +282,56 @@ void test_no_cuda_in_vm_cc() {
     CHECK(!contains("cudaMalloc"));
     CHECK(!contains("cudaFree"));
     CHECK(!contains("cudaMemcpy"));
+}
+
+// ── test_copy_with_stream ─────────────────────────────────────────────────────
+// Exercises the non-null stream path: H2D on a real stream, StreamSync to wait.
+void test_copy_with_stream() {
+    DeviceAPI* api = DeviceAPIRegistry::Get(kDLCUDA);
+
+    void* stream = api->CreateStream(cuda_dev());
+    CHECK(stream != nullptr);
+
+    constexpr int N = 8;
+    float host_in[N], host_out[N];
+    for (int i = 0; i < N; ++i) host_in[i] = static_cast<float>(i + 10);
+    std::memset(host_out, 0, sizeof(host_out));
+
+    void* gpu_ptr = api->Alloc(cuda_dev(), N * sizeof(float), 256);
+
+    int64_t shape[1] = {N};
+    DLTensor h_src{}, d_dst{}, d_src{}, h_dst{};
+    h_src.data = host_in;  h_src.device = cpu_dev();
+    h_src.ndim = 1;        h_src.dtype  = float32();
+    h_src.shape = shape;   h_src.strides = nullptr;  h_src.byte_offset = 0;
+
+    d_dst = h_src;  d_dst.data = gpu_ptr;  d_dst.device = cuda_dev();
+    d_src = d_dst;
+    h_dst = h_src;  h_dst.data = host_out;
+
+    api->CopyDataFromTo(&h_src, &d_dst, stream);  // H2D on stream
+    api->CopyDataFromTo(&d_src, &h_dst, stream);  // D2H on same stream
+    api->StreamSync(cuda_dev(), stream);           // wait for both
+
+    for (int i = 0; i < N; ++i) {
+        CHECK(host_out[i] == host_in[i]);
+    }
+
+    api->Free(cuda_dev(), gpu_ptr);
+    api->FreeStream(cuda_dev(), stream);
+}
+
+// ── test_alloc_alignment_error ────────────────────────────────────────────────
+// Requesting alignment > 256 must throw, not silently produce misaligned memory.
+void test_alloc_alignment_error() {
+    DeviceAPI* api = DeviceAPIRegistry::Get(kDLCUDA);
+    bool threw = false;
+    try {
+        api->Alloc(cuda_dev(), 1024, 512);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
 }
 
 }  // namespace
@@ -302,6 +351,8 @@ int main() {
     RUN(test_stream_obj_raii);
     RUN(test_vm_default_stream);
     RUN(test_no_cuda_in_vm_cc);
+    RUN(test_copy_with_stream);
+    RUN(test_alloc_alignment_error);
 
     std::cout << "\n=== Results: " << g_pass << " passed, "
               << g_fail << " failed ===\n";

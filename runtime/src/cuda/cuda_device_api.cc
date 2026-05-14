@@ -19,12 +19,14 @@ namespace devproc2 {
     } while (0)
 
 static cudaMemcpyKind GetCopyKind(const DLTensor* from, const DLTensor* to) {
-    bool from_cuda = (from->device.device_type == kDLCUDA);
-    bool to_cuda   = (to->device.device_type   == kDLCUDA);
-    if (!from_cuda && !to_cuda) return cudaMemcpyHostToHost;
-    if (!from_cuda &&  to_cuda) return cudaMemcpyHostToDevice;
-    if ( from_cuda && !to_cuda) return cudaMemcpyDeviceToHost;
-    return cudaMemcpyDeviceToDevice;
+    const int ft = from->device.device_type;
+    const int tt = to->device.device_type;
+    if (ft == kDLCPU  && tt == kDLCPU)  return cudaMemcpyHostToHost;
+    if (ft == kDLCPU  && tt == kDLCUDA) return cudaMemcpyHostToDevice;
+    if (ft == kDLCUDA && tt == kDLCPU)  return cudaMemcpyDeviceToHost;
+    if (ft == kDLCUDA && tt == kDLCUDA) return cudaMemcpyDeviceToDevice;
+    // kDLCUDAHost, kDLCUDAManaged, or other types: let CUDA determine direction.
+    return cudaMemcpyDefault;
 }
 
 static size_t BytesOf(const DLTensor* t) {
@@ -35,7 +37,13 @@ static size_t BytesOf(const DLTensor* t) {
 
 class CUDADeviceAPI : public DeviceAPI {
 public:
-    void* Alloc(Device dev, size_t nbytes, size_t /*alignment*/) override {
+    void* Alloc(Device dev, size_t nbytes, size_t alignment) override {
+        // cudaMalloc guarantees 256-byte alignment; larger values are unsupported.
+        if (alignment > 256) {
+            throw std::runtime_error(
+                "CUDADeviceAPI::Alloc: alignment " + std::to_string(alignment) +
+                " exceeds cudaMalloc guarantee of 256 bytes");
+        }
         CUDA_CHECK(cudaSetDevice(dev.device_id));
         void* ptr = nullptr;
         CUDA_CHECK(cudaMalloc(&ptr, nbytes));
