@@ -4,6 +4,7 @@
 #include <devproc2/runtime/tensor.h>
 #include <devproc2/runtime/shape_tuple.h>
 #include <devproc2/runtime/tuple.h>
+#include <devproc2/runtime/string.h>
 #include <stdexcept>
 #include <string>
 
@@ -125,6 +126,111 @@ DEVPROC2_REGISTER_BUILTIN("vm.builtin.shape_assert")
                 "RuntimeShapeError: dim " + std::to_string(dim) +
                 " = " + std::to_string(actual) +
                 " exceeds upper bound " + std::to_string(upper));
+        }
+        return VMValue{};
+    });
+
+// ── vm.builtin.shape_of ───────────────────────────────────────────────────────
+// args: [tensor: Tensor] → ShapeTuple
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.shape_of")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto* tobj = args[0].AsObjectAs<TensorObj>();
+        DEVPROC2_DCHECK(tobj);
+        int ndim = tobj->dl_tensor.ndim;
+        std::vector<int64_t> dims(tobj->dl_tensor.shape,
+                                  tobj->dl_tensor.shape + ndim);
+        return VMValue::ObjRef(ShapeTuple::Make(std::move(dims)));
+    });
+
+// ── vm.builtin.get_shape_dim ──────────────────────────────────────────────────
+// args: [shape: ShapeTuple, idx: Int] → Int
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.get_shape_dim")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto* shobj = args[0].AsObjectAs<ShapeTupleObj>();
+        DEVPROC2_DCHECK(shobj);
+        auto idx = static_cast<int>(args[1].AsInt());
+        DEVPROC2_DCHECK(idx >= 0 && idx < static_cast<int>(shobj->dims.size()));
+        return VMValue::Int(shobj->dims[static_cast<size_t>(idx)]);
+    });
+
+// ── Integer arithmetic builtins ───────────────────────────────────────────────
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.sub_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        return VMValue::Int(args[0].AsInt() - args[1].AsInt());
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.mul_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        return VMValue::Int(args[0].AsInt() * args[1].AsInt());
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.floordiv_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto a = args[0].AsInt();
+        auto b = args[1].AsInt();
+        DEVPROC2_DCHECK(b != 0);
+        return VMValue::Int(a / b);
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.ceildiv_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto a = args[0].AsInt();
+        auto b = args[1].AsInt();
+        DEVPROC2_DCHECK(b > 0);
+        return VMValue::Int((a + b - 1) / b);
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.min_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto a = args[0].AsInt(), b = args[1].AsInt();
+        return VMValue::Int(a < b ? a : b);
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.max_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto a = args[0].AsInt(), b = args[1].AsInt();
+        return VMValue::Int(a > b ? a : b);
+    });
+
+// ── Integer comparison builtins ───────────────────────────────────────────────
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.eq_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        return VMValue::Bool(args[0].AsInt() == args[1].AsInt());
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.le_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        return VMValue::Bool(args[0].AsInt() <= args[1].AsInt());
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.gt_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        return VMValue::Bool(args[0].AsInt() > args[1].AsInt());
+    });
+
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.ge_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        return VMValue::Bool(args[0].AsInt() >= args[1].AsInt());
+    });
+
+// ── vm.builtin.assert_le_i64 ──────────────────────────────────────────────────
+// args: [val: Int, bound: Int, msg: String] → Null
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.assert_le_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto val   = args[0].AsInt();
+        auto bound = args[1].AsInt();
+        if (val > bound) {
+            std::string msg = "upper bound exceeded";
+            if (args.size() >= 3) {
+                auto* sobj = args[2].AsObjectAs<StringObj>();
+                if (sobj) msg = sobj->data;
+            }
+            throw std::runtime_error(
+                "RuntimeShapeError: " + msg +
+                " (value=" + std::to_string(val) +
+                ", bound=" + std::to_string(bound) + ")");
         }
         return VMValue{};
     });

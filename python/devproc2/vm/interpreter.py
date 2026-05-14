@@ -91,6 +91,65 @@ def _builtin_shape_assert(args: list) -> None:
     return None
 
 
+def _builtin_shape_of(args: list) -> tuple:
+    return args[0].shape
+
+
+def _builtin_get_shape_dim(args: list) -> int:
+    return int(args[0][int(args[1])])
+
+
+def _builtin_sub_i64(args: list) -> int:
+    return int(args[0]) - int(args[1])
+
+
+def _builtin_mul_i64(args: list) -> int:
+    return int(args[0]) * int(args[1])
+
+
+def _builtin_floordiv_i64(args: list) -> int:
+    return int(args[0]) // int(args[1])
+
+
+def _builtin_ceildiv_i64(args: list) -> int:
+    a, b = int(args[0]), int(args[1])
+    return (a + b - 1) // b
+
+
+def _builtin_min_i64(args: list) -> int:
+    return min(int(args[0]), int(args[1]))
+
+
+def _builtin_max_i64(args: list) -> int:
+    return max(int(args[0]), int(args[1]))
+
+
+def _builtin_eq_i64(args: list) -> bool:
+    return bool(int(args[0]) == int(args[1]))
+
+
+def _builtin_le_i64(args: list) -> bool:
+    return bool(int(args[0]) <= int(args[1]))
+
+
+def _builtin_gt_i64(args: list) -> bool:
+    return bool(int(args[0]) > int(args[1]))
+
+
+def _builtin_ge_i64(args: list) -> bool:
+    return bool(int(args[0]) >= int(args[1]))
+
+
+def _builtin_assert_le_i64(args: list) -> None:
+    val, bound = int(args[0]), int(args[1])
+    if val > bound:
+        msg = str(args[2]) if len(args) >= 3 else "upper bound exceeded"
+        raise RuntimeError(
+            f"RuntimeShapeError: {msg} (value={val}, bound={bound})"
+        )
+    return None
+
+
 _DEFAULT_BUILTINS: dict[str, Callable[[list], Any]] = {
     "vm.builtin.alloc_storage":  _builtin_alloc_storage,
     "vm.builtin.alloc_tensor":   _builtin_alloc_tensor,
@@ -101,6 +160,19 @@ _DEFAULT_BUILTINS: dict[str, Callable[[list], Any]] = {
     "vm.builtin.lt_i64":         _builtin_lt_i64,
     "vm.builtin.add_i64":        _builtin_add_i64,
     "vm.builtin.shape_assert":   _builtin_shape_assert,
+    "vm.builtin.shape_of":       _builtin_shape_of,
+    "vm.builtin.get_shape_dim":  _builtin_get_shape_dim,
+    "vm.builtin.sub_i64":        _builtin_sub_i64,
+    "vm.builtin.mul_i64":        _builtin_mul_i64,
+    "vm.builtin.floordiv_i64":   _builtin_floordiv_i64,
+    "vm.builtin.ceildiv_i64":    _builtin_ceildiv_i64,
+    "vm.builtin.min_i64":        _builtin_min_i64,
+    "vm.builtin.max_i64":        _builtin_max_i64,
+    "vm.builtin.eq_i64":         _builtin_eq_i64,
+    "vm.builtin.le_i64":         _builtin_le_i64,
+    "vm.builtin.gt_i64":         _builtin_gt_i64,
+    "vm.builtin.ge_i64":         _builtin_ge_i64,
+    "vm.builtin.assert_le_i64":  _builtin_assert_le_i64,
 }
 
 
