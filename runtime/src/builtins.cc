@@ -6,26 +6,14 @@
 #include <devproc2/runtime/tuple.h>
 #include <stdexcept>
 #include <string>
-#include <atomic>
 
 namespace devproc2 {
 
-namespace {
-
-// Guard against double-registration
-std::atomic<bool> g_builtins_registered{false};
-
-}  // namespace
-
-void RegisterVMBuiltins() {
-    if (g_builtins_registered.exchange(true)) return;  // idempotent
-
-    auto& reg = BuiltinRegistry::Global();
-
-    // ── vm.builtin.alloc_storage ───────────────────────────────────────────
-    // args: [size_bytes: Int, alignment: Int, device_type: Int, device_id: Int]
-    // → Storage
-    reg.Register("vm.builtin.alloc_storage", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.alloc_storage ──────────────────────────────────────────────────
+// args: [size_bytes: Int, alignment: Int, device_type: Int, device_id: Int]
+// → Storage
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.alloc_storage")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         auto nbytes    = static_cast<size_t>(args[0].AsInt());
         auto alignment = static_cast<size_t>(args[1].AsInt());
         auto dev_type  = static_cast<int>(args[2].AsInt());
@@ -49,11 +37,12 @@ void RegisterVMBuiltins() {
         return VMValue::ObjRef(Storage(obj));
     });
 
-    // ── vm.builtin.alloc_tensor ────────────────────────────────────────────
-    // args: [storage: Storage, offset: Int, shape: ShapeTuple,
-    //        dtype_code: Int, dtype_bits: Int, dtype_lanes: Int]
-    // → Tensor
-    reg.Register("vm.builtin.alloc_tensor", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.alloc_tensor ───────────────────────────────────────────────────
+// args: [storage: Storage, offset: Int, shape: ShapeTuple,
+//        dtype_code: Int, dtype_bits: Int, dtype_lanes: Int]
+// → Tensor
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.alloc_tensor")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         auto storage     = args[0].AsObjectRef();
         auto offset      = args[1].AsInt();
         auto shape_tuple = args[2].AsObjectRef();
@@ -69,27 +58,30 @@ void RegisterVMBuiltins() {
             Tensor::FromStorage(storage, offset, shobj->dims, dtype));
     });
 
-    // ── vm.builtin.make_shape ─────────────────────────────────────────────
-    // args: [d0: Int, d1: Int, ...] → ShapeTuple
-    reg.Register("vm.builtin.make_shape", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.make_shape ─────────────────────────────────────────────────────
+// args: [d0: Int, d1: Int, ...] → ShapeTuple
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.make_shape")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         std::vector<int64_t> dims;
         dims.reserve(args.size());
         for (auto& a : args) dims.push_back(a.AsInt());
         return VMValue::ObjRef(ShapeTuple::Make(std::move(dims)));
     });
 
-    // ── vm.builtin.make_tuple ─────────────────────────────────────────────
-    // args: [f0, f1, ...] → Tuple
-    reg.Register("vm.builtin.make_tuple", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.make_tuple ─────────────────────────────────────────────────────
+// args: [f0, f1, ...] → Tuple
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.make_tuple")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         std::vector<ObjectRef> fields;
         fields.reserve(args.size());
         for (auto& a : args) fields.push_back(a.AsObjectRef());
         return VMValue::ObjRef(Tuple::Make(std::move(fields)));
     });
 
-    // ── vm.builtin.tuple_get_item ─────────────────────────────────────────
-    // args: [tuple: Tuple, idx: Int] → ObjectRef
-    reg.Register("vm.builtin.tuple_get_item", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.tuple_get_item ─────────────────────────────────────────────────
+// args: [tuple: Tuple, idx: Int] → ObjectRef
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.tuple_get_item")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         auto* tobj = args[0].AsObjectAs<TupleObj>();
         DEVPROC2_DCHECK(tobj);
         auto idx = static_cast<int>(args[1].AsInt());
@@ -97,27 +89,31 @@ void RegisterVMBuiltins() {
         return VMValue::ObjRef((*tobj)[idx]);
     });
 
-    // ── vm.builtin.identity ───────────────────────────────────────────────
-    // args: [x] → x
-    reg.Register("vm.builtin.identity", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.identity ───────────────────────────────────────────────────────
+// args: [x] → x
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.identity")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         return args[0];
     });
 
-    // ── vm.builtin.lt_i64 ────────────────────────────────────────────────
-    // args: [a: Int, b: Int] → Bool
-    reg.Register("vm.builtin.lt_i64", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.lt_i64 ────────────────────────────────────────────────────────
+// args: [a: Int, b: Int] → Bool
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.lt_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         return VMValue::Bool(args[0].AsInt() < args[1].AsInt());
     });
 
-    // ── vm.builtin.add_i64 ────────────────────────────────────────────────
-    // args: [a: Int, b: Int] → Int
-    reg.Register("vm.builtin.add_i64", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.add_i64 ────────────────────────────────────────────────────────
+// args: [a: Int, b: Int] → Int
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.add_i64")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         return VMValue::Int(args[0].AsInt() + args[1].AsInt());
     });
 
-    // ── vm.builtin.shape_assert ───────────────────────────────────────────
-    // args: [tensor: Tensor, dim_idx: Int, upper: Int]
-    reg.Register("vm.builtin.shape_assert", [](std::vector<VMValue>& args) -> VMValue {
+// ── vm.builtin.shape_assert ───────────────────────────────────────────────────
+// args: [tensor: Tensor, dim_idx: Int, upper: Int]
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.shape_assert")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
         auto* tobj = args[0].AsObjectAs<TensorObj>();
         DEVPROC2_DCHECK(tobj);
         auto dim   = static_cast<int>(args[1].AsInt());
@@ -132,6 +128,5 @@ void RegisterVMBuiltins() {
         }
         return VMValue{};
     });
-}
 
 }  // namespace devproc2

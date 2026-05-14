@@ -81,6 +81,24 @@ public:
 
 using BuiltinFn = std::function<VMValue(std::vector<VMValue>&)>;
 
+class BuiltinRegistry;
+
+// Represents a single registered builtin; supports chained .set_body().
+class BuiltinEntry {
+public:
+    BuiltinEntry& set_body(BuiltinFn fn) {
+        fn_ = std::move(fn);
+        return *this;
+    }
+    const BuiltinFn& body() const { return fn_; }
+
+private:
+    friend class BuiltinRegistry;
+    explicit BuiltinEntry(std::string name) : name_(std::move(name)) {}
+    std::string name_;
+    BuiltinFn   fn_;
+};
+
 class BuiltinRegistry {
 public:
     static BuiltinRegistry& Global() {
@@ -88,26 +106,41 @@ public:
         return instance;
     }
 
-    void Register(const std::string& name, BuiltinFn fn) {
-        std::lock_guard<std::mutex> lock(mu_);
-        fns_[name] = std::move(fn);
+    // Insert-or-get entry by name; returns a stable reference.
+    static BuiltinEntry& Register(const std::string& name) {
+        auto& self = Global();
+        std::lock_guard<std::mutex> lock(self.mu_);
+        auto& slot = self.entries_[name];
+        if (!slot) slot.reset(new BuiltinEntry(name));
+        return *slot;
     }
 
     BuiltinFn Get(const std::string& name) const {
         std::lock_guard<std::mutex> lock(mu_);
-        auto it = fns_.find(name);
-        return (it != fns_.end()) ? it->second : BuiltinFn{};
+        auto it = entries_.find(name);
+        return (it != entries_.end()) ? it->second->body() : BuiltinFn{};
     }
 
     bool Has(const std::string& name) const {
         std::lock_guard<std::mutex> lock(mu_);
-        return fns_.count(name) > 0;
+        return entries_.count(name) > 0;
     }
 
 private:
     mutable std::mutex mu_;
-    std::unordered_map<std::string, BuiltinFn> fns_;
+    std::unordered_map<std::string, std::unique_ptr<BuiltinEntry>> entries_;
 };
+
+// Self-registration macro (static-initializer pattern, like TVM_REGISTER_GLOBAL).
+// Usage:
+//   DEVPROC2_REGISTER_BUILTIN("vm.builtin.foo")
+//       .set_body([](std::vector<VMValue>& args) -> VMValue { ... });
+#define DEVPROC2_CONCAT_(x, y) x##y
+#define DEVPROC2_CONCAT(x, y)  DEVPROC2_CONCAT_(x, y)
+#define DEVPROC2_REGISTER_BUILTIN(name)                                 \
+    [[maybe_unused]] static ::devproc2::BuiltinEntry&                   \
+        DEVPROC2_CONCAT(__devproc2_builtin_, __COUNTER__) =             \
+            ::devproc2::BuiltinRegistry::Register(name)
 
 // ── VMFrame ───────────────────────────────────────────────────────────────────
 
@@ -140,7 +173,5 @@ private:
                              std::vector<VMValue>& args);
 };
 
-// Registers all vm.builtin.* functions (idempotent after first call).
-void RegisterVMBuiltins();
 
 }  // namespace devproc2

@@ -8,7 +8,6 @@ VMState::VMState(std::shared_ptr<Executable> exec)
     : exec_(std::move(exec)) {}
 
 VMValue VMState::Invoke(const std::string& func_name, std::vector<VMValue> args) {
-    RegisterVMBuiltins();
     int32_t func_idx = exec_->GetFuncIndex(func_name);
     regs_.clear();
     frames_.clear();
