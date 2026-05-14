@@ -46,4 +46,9 @@ private:
     static std::unordered_map<int, DeviceAPI*>& Registry();
 };
 
+#ifdef DEVPROC2_WITH_CUDA
+// Defined in cuda_device_api.cc; call once to register CUDADeviceAPI.
+void RegisterCUDADeviceAPI();
+#endif
+
 }  // namespace devproc2
