@@ -51,22 +51,20 @@ from examples.kv_cache_mvp.ref_impl import (
 # DSL model definition
 # ---------------------------------------------------------------------------
 
-def build_model():
-    """Define the decode_step function using dp DSL."""
-    @dp.function
-    def decode_step(token_id: dp.Tensor[(1,), "int32", "cpu"]):
-        # Step 1: embed (PackedFunc)
-        embedded = dp.empty((EMBED_DIM,), dtype="float32", device="cpu")
-        dp.call_dps_packed("runtime.embed", inputs=[token_id], output=embedded)
+@dp.function
+def decode_step(token_id: dp.Tensor[(1,), "int32", "cpu"]):
+    # Step 1: embed (PackedFunc)
+    embedded = dp.empty((EMBED_DIM,), dtype="float32", device="cpu")
+    dp.call_dps_packed("runtime.embed", inputs=[token_id], output=embedded)
 
-        # Step 2: relu (kernel)
-        relu_out = dp.ops.relu(embedded)
+    # Step 2: relu (kernel)
+    relu_out = dp.ops.relu(embedded)
 
-        # Step 3: linear projection (PackedFunc)
-        output = dp.empty((OUTPUT_DIM,), dtype="float32", device="cpu")
-        dp.call_dps_packed("runtime.linear", inputs=[relu_out], output=output)
+    # Step 3: linear projection (PackedFunc)
+    output = dp.empty((OUTPUT_DIM,), dtype="float32", device="cpu")
+    dp.call_dps_packed("runtime.linear", inputs=[relu_out], output=output)
 
-        return output
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +73,7 @@ def build_model():
 
 def compile_model():
     """Run full compiler pipeline; return (exe, ctx, inferred_module)."""
-    module = dp.get_module()
+    module = decode_step.lower_module()
 
     # Register a mock relu kernel so DPS lowering can select it
     relu_spec = KernelSpec(
@@ -150,7 +148,6 @@ def register_mock_kernel(vm: VMInterpreter) -> None:
 def run_demo(token_id: int = 5) -> float:
     """Run full demo pipeline for a given token_id; return max abs error."""
     dp.reset_module()
-    build_model()
     exe, ctx, inferred_module = compile_model()
 
     vm = VMInterpreter(exe)
@@ -173,7 +170,6 @@ def run_demo(token_id: int = 5) -> float:
 def emit_artifact(output_dir: str) -> None:
     """Compile and emit artifact to output_dir (for CLI testing)."""
     dp.reset_module()
-    build_model()
     exe, ctx, inferred_module = compile_model()
     EmitExecutablePass().run(exe, output_dir)
     EmitABIPass().run(inferred_module, exe, ctx, output_dir,

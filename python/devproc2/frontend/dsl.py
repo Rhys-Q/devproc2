@@ -73,11 +73,24 @@ class Tensor:
 # Module-level registry
 # ---------------------------------------------------------------------------
 
-_module: IRModule = IRModule()
+_module: Optional[IRModule] = None  # last built module (set by get_module)
+_decorated_fns: list = []           # functions decorated with @dp.function
 _kernel_registry: KernelRegistry = KernelRegistry()
 
 
-def get_module() -> IRModule:
+def get_module() -> Optional[IRModule]:
+    """Auto-build an IRModule from all @dp.function-decorated functions.
+
+    For new code, prefer calling ``fn.lower_module()`` directly on a decorated
+    function — it makes the data flow explicit and avoids global state.
+    """
+    global _module
+    if _module is None and _decorated_fns:
+        mod = IRModule()
+        for fn in _decorated_fns:
+            name, ir_func = fn._dp_ir
+            mod.functions[name] = ir_func
+        _module = mod
     return _module
 
 
@@ -86,8 +99,10 @@ def get_kernel_registry() -> KernelRegistry:
 
 
 def reset_module() -> None:
-    global _module, _kernel_registry
-    _module = IRModule()
+    """Clear all decorated functions, built module, and kernel registry."""
+    global _module, _decorated_fns, _kernel_registry
+    _module = None
+    _decorated_fns = []
     _kernel_registry = KernelRegistry()
 
 
@@ -211,6 +226,22 @@ def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
 # ---------------------------------------------------------------------------
 
 def function(fn):
+    """Decorator: parse the function's AST and store IR on ``fn._dp_ir``.
+
+    Does NOT mutate any global state.  Call ``fn.lower_module()`` to get an
+    IRModule containing just this function.
+
+    For backward compatibility, ``dp.get_module()`` will auto-build from all
+    decorated functions.
+
+    Usage::
+
+        @dp.function
+        def my_func(x: dp.Tensor[(4,), "float32", "cpu"]):
+            return dp.ops.relu(x)
+
+        module = my_func.lower_module()
+    """
     annotations = {k: v for k, v in fn.__annotations__.items() if k != "return"}
     src = inspect.getsource(fn)
     src = textwrap.dedent(src)
@@ -218,7 +249,15 @@ def function(fn):
     fn_def = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
     builder = DSLBuilder(annotations=annotations, globals_dict=fn.__globals__)
     ir_name, ir_func = builder.build(fn_def)
-    _module.functions[ir_name] = ir_func
+    fn._dp_ir = (ir_name, ir_func)
+
+    def lower_module():
+        mod = IRModule()
+        mod.functions[ir_name] = ir_func
+        return mod
+
+    fn.lower_module = lower_module
+    _decorated_fns.append(fn)
     return fn
 
 
