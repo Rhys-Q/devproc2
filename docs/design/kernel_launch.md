@@ -34,19 +34,25 @@ call_dps @kernel.relu_fp16(inputs=[%x], output=%y, effect=write(%y))
 用户代码
    │
    │  @dp.kernel(op="relu", ...)
+   │  @triton.jit
    │  def relu_kernel(x, out): ...   ← Triton Python kernel
    │
    ▼
 [注册阶段] KernelRegistry.register(KernelSpec)
-   │         ↑ kernel 名、device、dtype、grid_fn
+   │         ↑ op_name, device, input_dtypes, kernel_name, backend,
+   │           grid_fn, num_warps, num_stages, block_size, smem_bytes, ...
    │
    ▼
 [编译阶段] DPSLoweringPass
    │         ↑ CallOp @relu → TensorCreateOp + CallDPSOp @kernel.relu_kernel
    │
    ▼
+[编译阶段] VMCodegenPass
+   │         ↑ 从 op.inputs 提取静态 shape → 传给 grid_fn(shapes) → grid dim 常量
+   │
+   ▼
 [编译阶段] TritonAOTCompilePass        [可选，需要 triton 已安装]
-   │         ↑ relu_kernel.__triton_fn → cubin bytes
+   │         ↑ relu_kernel → triton.compile(..., num_warps, num_stages, ...) → cubin
    │
    ▼
 [打包阶段] EmitKernelsPass
@@ -62,7 +68,7 @@ call_dps @kernel.relu_fp16(inputs=[%x], output=%y, effect=write(%y))
    │         ↑ CUDAKernelLauncher_Launch(kernel, args, stream)
    │
    ▼
-[GPU]  cuLaunchKernel(CUfunction, grid, block, args, stream)
+[GPU]  cuLaunchKernel(CUfunction, grid, block, args, smem, stream)
 ```
 
 ---
@@ -72,41 +78,81 @@ call_dps @kernel.relu_fp16(inputs=[%x], output=%y, effect=write(%y))
 ### 3.1 用法
 
 ```python
+import triton
+import triton.language as tl
 import devproc2.frontend.dsl as dp
 
+# 单输入 kernel（dtype 简写）
 @dp.kernel(
-    op="relu",             # 对应 dp.ops.relu 的算子名
-    backend="triton",      # 实现后端
+    op="relu",              # 对应 dp.ops.relu 的算子名
+    backend="triton",       # 编译后端：triton | cuda_c | python | llvm
     device="cuda",
-    dtype="float16",
-    grid=lambda: (128, 1, 1),  # 静态 grid：(grid_x, grid_y, grid_z)
-    sm_arches=(80, 90),    # 支持的 SM 架构（空 = 任意）
+    dtype="float16",        # 单输入简写 → input_dtypes = ("float16",)
+    grid=lambda shapes: (shapes[0][0] // 256 + 1, 1, 1),  # 静态 shape → grid
+    sm_arches=(80, 90),     # 支持的 SM 架构（空 = 任意）
+    num_warps=4,            # warps per block
+    num_stages=3,           # Triton pipeline depth
+    block_size=256,         # BLOCK_SIZE constexpr
+    smem_bytes=0,           # cuLaunchKernel dynamic shared memory
+    launch_kwargs={},       # 额外透传给 triton.compile 的参数
 )
+@triton.jit                 # ← 必须有！TritonAOTCompilePass 需要
 def relu_kernel(x, out):
     """Triton kernel：element-wise relu。"""
-    import triton
-    import triton.language as tl
-
     pid = tl.program_id(0)
     BLOCK = 256
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     x_vals = tl.load(x + offs)
     out_vals = tl.maximum(x_vals, 0.0)
     tl.store(out + offs, out_vals)
+
+
+# 多输入 kernel（dtypes 列表）
+@dp.kernel(
+    op="matmul",
+    backend="triton",
+    device="cuda",
+    dtypes=["float16", "float16"],  # ← 两个输入，两个 dtype
+    grid=lambda shapes: (
+        shapes[0][0] // 16,   # M // 16
+        shapes[1][1] // 16,   # N // 16
+        1,
+    ),
+)
+@triton.jit
+def matmul_kernel(a, b, out):
+    ...
 ```
 
 ### 3.2 装饰器做了什么
 
 ```python
-def kernel(*, op, backend, device, dtype, grid=None, sm_arches=()):
+def kernel(*, op, backend="triton", device="cuda",
+           dtype="", dtypes=None, grid=None, sm_arches=(),
+           num_warps=4, num_stages=3, block_size=256,
+           smem_bytes=0, launch_kwargs=None):
+    # 解析 input_dtypes：dtypes 列表优先于 dtype 简写
+    if dtypes is not None:
+        resolved_dtypes = tuple(dtypes)
+    elif dtype:
+        resolved_dtypes = (dtype,)
+    else:
+        raise ValueError("either 'dtype' or 'dtypes' must be provided")
+
     def decorator(fn):
         spec = KernelSpec(
             op_name=op,
             device=device,
-            input_dtypes=(dtype,),
+            input_dtypes=resolved_dtypes,
             kernel_name=f"kernel.{fn.__name__}",  # "kernel.relu_kernel"
+            backend=backend,
             sm_arches=sm_arches,
-            grid_fn=grid,       # ← 记住 grid 表达式
+            grid_fn=grid,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            block_size=block_size,
+            smem_bytes=smem_bytes,
+            launch_kwargs=launch_kwargs or {},
         )
         _kernel_registry.register(spec)   # ← 注册到模块级 registry
         fn._kernel_spec = spec            # ← 挂在函数对象上
@@ -122,7 +168,8 @@ from devproc2.kernel.registry import KernelMatchKey
 reg = dp.get_kernel_registry()
 spec = reg.lookup(KernelMatchKey("relu", "cuda", ("float16",)))
 print(spec.kernel_name)   # "kernel.relu_kernel"
-print(spec.grid_fn())     # (128, 1, 1)
+print(spec.backend)       # "triton"
+print(spec.num_warps)     # 4
 ```
 
 ---
@@ -132,14 +179,31 @@ print(spec.grid_fn())     # (128, 1, 1)
 ```python
 @dataclass(frozen=True)
 class KernelSpec:
+    # ── 查表 key ──
     op_name:      str                  # 匹配 CallOp 的算子名（去掉 "@"）
     device:       str                  # "cuda" / "cpu"
-    input_dtypes: tuple[str, ...]      # 输入张量的 dtype 列表
-    kernel_name:  str                  # CallDPSOp 中用的名字
+    input_dtypes: tuple[str, ...]      # 输入张量的 dtype 列表（每输入一个）
+
+    # ── 实现标识 ──
+    kernel_name:  str                  # CallDPSOp 中用的名字，如 "kernel.relu_fp16"
+    backend:      str = "triton"       # 编译后端：triton | cuda_c | python | llvm
+
+    # ── 调度过滤 ──
     sm_arches:    tuple[int, ...] = () # () = 不限 SM；(80,90) = Ampere/Hopper
     priority:     int = 0              # 多 kernel 候选时优先级高的胜出
     match:        Optional[Callable]   # 自定义 predicate（可选）
-    grid_fn:      Optional[Callable]   # 返回 (grid_x, grid_y, grid_z) 的函数
+
+    # ── launch 配置 ──
+    grid_fn:      Optional[Callable]   # 返回 (grid_x, grid_y, grid_z)
+                                       #   静态 shape → grid_fn(shapes: list[tuple])
+                                       #   动态 shape → grid_fn() 无参回退
+    num_warps:    int = 4              # warps per thread block
+    num_stages:   int = 3              # Triton software pipeline depth
+    block_size:   int = 256            # BLOCK_SIZE constexpr
+    smem_bytes:   int = 0              # cuLaunchKernel dynamic shared memory
+
+    # ── 编译器透传 ──
+    launch_kwargs: dict = {}           # 额外参数透传给 triton.compile()
 ```
 
 ### 4.1 两级 dispatch
@@ -155,6 +219,18 @@ Level 2（线性扫描候选）：
   ① SM 架构过滤：sm_arches 非空且 sm_arch 不在里面 → 跳过
   ② 自定义 predicate：spec.match(call_op) 返回 False → 跳过
   返回第一个通过的 spec
+```
+
+### 4.2 多实现共存示例
+
+同一个 `dp.ops.relu(x)` 可以根据 device/dtype/SM 选出不同实现：
+
+```
+op_name="relu"
+  ├── device=cuda, dtype=float16, sm_arches=(80,90) → kernel.relu_fp16  (Triton, Ampere+)
+  ├── device=cuda, dtype=float32                     → kernel.relu_fp32  (Triton, 通用)
+  ├── device=cuda, dtype=float16, sm_arches=(90,)    → kernel.relu_fp8   (Hopper 专用)
+  └── device=cpu,  dtype=float32                     → kernel.relu_cpu   (Python mock)
 ```
 
 ---
@@ -181,7 +257,30 @@ CALL dst=-1, @kernel.relu_kernel, [r_x, r_out, r_128, r_1, r_1]
 
 C++ 侧（`CUDAKernelLauncher_Launch`）通过探测最后 3 个 arg 是否都是 Int 来提取 grid dims，其余 args 是 tensor 指针。
 
-### 5.2 codegen 中的实现
+### 5.2 grid_fn 的两种调用模式
+
+**模式 A：静态 shape（推荐）** — 所有 input 的 shape 都是编译时已知的 `IntImm`：
+
+```python
+# 用户写的 grid_fn
+grid=lambda shapes: (shapes[0][0] // 256 + 1, 1, 1)
+
+# codegen 时：从 op.inputs 的 struct_info.shape 提取静态维度
+# x 的 shape = (8192,) → shapes = [(8192,)]
+# grid_fn([(8192,)]) → (33, 1, 1)
+```
+
+**模式 B：无参回退** — 有动态 `PrimVar` 或 grid_fn 不接受参数：
+
+```python
+# 用户写的 grid_fn（向后兼容）
+grid=lambda: (128, 1, 1)
+
+# codegen 时：直接无参调用
+# grid_fn() → (128, 1, 1)
+```
+
+### 5.3 codegen 中的实现
 
 ```python
 # vm_codegen.py
@@ -190,17 +289,55 @@ def _lower_calldps(self, op: CallDPSOp, ctx: _FnCtx) -> None:
     if op.output is not None:
         arg_regs.append(ctx.reg_of(op.output))
 
-    # 对 kernel callee：追加静态 grid dims
+    # 对 kernel callee：计算 grid dims
     if op.callee_kind == IRCalleeKind.kernel:
         spec = self._kernel_specs.get(op.callee)
         if spec is not None and spec.grid_fn is not None:
-            grid = spec.grid_fn()     # 编译时计算，例如 (128, 1, 1)
+            grid = self._compute_grid(spec.grid_fn, op.inputs)
             for g in grid:
                 arg_regs.append(ctx.reg_for_int(int(g)))
 
     ctx.emit(Instruction(opcode=CALL, dst_reg=-1,
                          func_idx=..., arg_regs=arg_regs))
+
+@staticmethod
+def _compute_grid(grid_fn, inputs):
+    """从 input struct_info 提取静态 shape，传给 grid_fn。"""
+    shapes = []
+    all_static = True
+    for v in inputs:
+        si = getattr(v, "struct_info", None)
+        if si is not None and hasattr(si, "shape"):
+            dims = []
+            for d in si.shape:
+                if isinstance(d, IntImm):
+                    dims.append(d.value)
+                else:
+                    all_static = False
+                    break
+            shapes.append(tuple(dims))
+        else:
+            all_static = False
+            break
+
+    if all_static:
+        try:
+            return tuple(grid_fn(shapes))   # 静态 shape → 传入 shapes
+        except TypeError:
+            pass                             # grid_fn 不接受参数 → 回退
+    return tuple(grid_fn())                  # 动态 shape → 无参调用
 ```
+
+### 5.4 静态 vs 动态 grid 的边界
+
+| 场景 | grid_fn 调用方式 | 示例 |
+|---|---|---|
+| `x: Tensor[(8192,), f16]` | `grid_fn([(8192,)])` | `(33, 1, 1)` |
+| `a: Tensor[(64,128), f16], b: Tensor[(128,32), f16]` | `grid_fn([(64,128), (128,32)])` | `(4, 2, 1)` |
+| `x: Tensor[(N,), f16]` (N 是 PrimVar) | `grid_fn()` 无参回退 | `(128, 1, 1)` |
+| grid_fn 不接受参数 | `grid_fn()` 无参回退 | `(128, 1, 1)` |
+
+> **注意**：真正的动态 grid（运行时根据实际 shape 计算）需要 runtime shape 支持，属于后续工作。当前 MVP 阶段，静态 shape 场景已完全覆盖。
 
 ---
 
@@ -222,10 +359,15 @@ devproc2 使用**提前编译（AOT）**：在构建 Artifact 时就把 `.ptx`/`
 ```python
 from devproc2.compiler.passes.triton_aot_compile import TritonAOTCompilePass
 
+# 从 KernelSpec 读取编译参数
+spec = relu_kernel._kernel_spec
 cubin = TritonAOTCompilePass().run(
-    kernel_fn=relu_kernel,    # @triton.jit 装饰的函数
+    kernel_fn=relu_kernel,          # @triton.jit 装饰的函数
     output_dir="/tmp/my_model",
-    sm_arch=80,               # A100 = sm_80
+    sm_arch=80,                     # A100 = sm_80
+    num_warps=spec.num_warps,       # 从 KernelSpec 透传
+    num_stages=spec.num_stages,
+    launch_kwargs=spec.launch_kwargs,
 )
 # 同时在 /tmp/my_model/kernels/relu_kernel.cubin 写入文件
 # 返回 cubin bytes
@@ -234,21 +376,30 @@ cubin = TritonAOTCompilePass().run(
 ### 6.3 内部流程
 
 ```python
-def run(self, kernel_fn, output_dir, sm_arch=90, signature=None):
+def run(self, kernel_fn, output_dir, sm_arch=90, signature=None,
+        num_warps=4, num_stages=3, launch_kwargs=None):
     import triton
     import triton.compiler as tc
 
     # 1. 构建编译目标
     source = tc.ASTSource(fn=kernel_fn, signature=signature or {})
-    target = tc.GPUTarget("cuda", sm_arch, 32)
 
-    # 2. 触发 Triton 编译
-    compiled = triton.compile(source, target=target)
+    # 2. 组装编译选项（num_warps, num_stages, 以及透传的 launch_kwargs）
+    compile_kwargs = {"num_warps": num_warps, "num_stages": num_stages}
+    if launch_kwargs:
+        compile_kwargs.update(launch_kwargs)
 
-    # 3. 提取 cubin bytes
+    # 3. 触发 Triton 编译
+    compiled = triton.compile(
+        source,
+        target=tc.GPUTarget("cuda", sm_arch, 32),
+        options=compile_kwargs,
+    )
+
+    # 4. 提取 cubin bytes
     cubin_bytes = compiled.asm["cubin"]
 
-    # 4. 写入 artifact/kernels/<name>.cubin
+    # 5. 写入 artifact/kernels/<name>.cubin
     os.makedirs(os.path.join(output_dir, "kernels"), exist_ok=True)
     with open(f"{output_dir}/kernels/{kernel_fn.__name__}.cubin", "wb") as f:
         f.write(cubin_bytes)
@@ -292,17 +443,20 @@ EmitKernelsPass().run(
 
 ### 8.1 CUDAKernelRegistry
 
-类似 PackedFuncRegistry，但存的是 `KernelObj`（含 cubin 数据 + 函数名 + block dims）：
+类似 PackedFuncRegistry，但存的是 `KernelObj`（含 cubin 数据 + 函数名 + block dims + metadata）：
 
 ```cpp
 class CUDAKernelRegistry {
-    // 注册：名字 + cubin bytes + CUDA 函数名 + block_dims
-    void Register(const std::string& name,
-                  const std::vector<uint8_t>& cubin_data,
-                  const std::string& func_name,
-                  std::array<int32_t,3> block_dims = {128,1,1});
+    void Register(
+        const std::string&          name,
+        const std::vector<uint8_t>& cubin_data,
+        const std::string&          func_name,
+        std::array<int32_t,3>       block_dims = {128, 1, 1},
+        int32_t                     smem_bytes = 0,
+        int32_t                     num_warps  = 4,
+        int32_t                     num_stages = 3
+    );
 
-    // 查找：返回 KernelObj* 或 nullptr
     KernelObj* Get(const std::string& name) const;
 };
 ```
@@ -311,10 +465,14 @@ class CUDAKernelRegistry {
 
 ```cpp
 class KernelObj : public Object {
-    std::string name;                  // "kernel.relu_kernel"
-    std::string func_name;            // cubin 内的 CUDA 函数名
-    std::vector<uint8_t> cubin_data;  // cubin 二进制内容
-    std::array<int32_t,3> block_dims; // {128, 1, 1}
+    std::string                name;        // "kernel.relu_kernel"
+    std::string                func_name;   // cubin 内的 CUDA 函数名
+    std::vector<uint8_t>       cubin_data;  // cubin 二进制内容
+    std::vector<uint8_t>       ptx_data;    // PTX 文本（备用）
+    std::array<int32_t, 3>     block_dims;  // {128, 1, 1}
+    int32_t                    smem_bytes;  // cuLaunchKernel sharedMemBytes
+    int32_t                    num_warps;   // warps per block
+    int32_t                    num_stages;  // pipeline depth
 };
 ```
 
@@ -329,7 +487,8 @@ auto exec = Executable::Load("/tmp/my_model");
 // 3. 读 metadata/kernel_table.json → 每个 kernel 的元数据
 // 4. for each kernel_entry:
 //      data = read_file("kernels/<name>.cubin")
-//      CUDAKernelRegistry::Global().Register(name, data, func_name, block_dims)
+//      CUDAKernelRegistry::Global().Register(
+//          name, data, func_name, block_dims, smem_bytes, num_warps, num_stages)
 ```
 
 ### 8.3 VM 执行时的 kernel dispatch
@@ -384,12 +543,12 @@ void CUDAKernelLauncher_Launch(
     CUfunction fn = get_or_load_function(kernel);
     //   内部：cuModuleLoadData(cubin_data) + cuModuleGetFunction(func_name)
 
-    // 4. 启动！
+    // 4. 启动！（smem_bytes 来自 KernelObj，不再是硬编码 0）
     cuLaunchKernel(
         fn,
         grid_x, grid_y, grid_z,     // grid
         block_x, block_y, block_z,  // block（来自 kernel->block_dims）
-        0,                          // sharedMemBytes
+        kernel->smem_bytes,         // sharedMemBytes（来自 KernelSpec.smem_bytes）
         static_cast<CUstream>(stream),
         raw_args.data(),            // kernel 参数指针数组
         nullptr
@@ -426,6 +585,8 @@ g_module_cache["kernel.relu_kernel"] 不存在
 ### 10.1 定义 kernel 和模型
 
 ```python
+import triton
+import triton.language as tl
 import devproc2.frontend.dsl as dp
 
 # ① 定义 Triton kernel，注册为 relu op 的 cuda float16 实现
@@ -434,10 +595,13 @@ import devproc2.frontend.dsl as dp
     backend="triton",
     device="cuda",
     dtype="float16",
-    grid=lambda: (32, 1, 1),    # 32 个 block，每 block 256 线程 → 8192 元素
+    # 静态 shape：8192 元素 / 256 block = 32 个 block
+    grid=lambda shapes: (shapes[0][0] // 256 + 1, 1, 1),
+    num_warps=4,
+    num_stages=3,
 )
+@triton.jit
 def relu_fp16(x, out):
-    import triton.language as tl
     pid = tl.program_id(0)
     BLOCK = 256
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -445,7 +609,7 @@ def relu_fp16(x, out):
     v = tl.load(x + offs, mask=mask)
     tl.store(out + offs, tl.maximum(v, 0.0), mask=mask)
 
-# ② 定义模型函数
+# ② 定义模型函数（静态 shape 8192）
 @dp.function
 def apply_relu(x: dp.Tensor[(8192,), "float16", "cuda"]):
     return dp.ops.relu(x)
@@ -454,15 +618,21 @@ def apply_relu(x: dp.Tensor[(8192,), "float16", "cuda"]):
 ### 10.2 AOT 编译 + 打包
 
 ```python
-import os, tempfile
+import os
 from devproc2.compiler.passes.triton_aot_compile import TritonAOTCompilePass
 from devproc2.compiler.passes.emit_kernels import EmitKernelsPass
 
 output_dir = "/tmp/relu_demo"
 os.makedirs(output_dir, exist_ok=True)
 
-# 编译 Triton kernel → cubin
-cubin = TritonAOTCompilePass().run(relu_fp16, output_dir, sm_arch=80)
+# 从 KernelSpec 读取编译参数
+spec = relu_fp16._kernel_spec
+cubin = TritonAOTCompilePass().run(
+    relu_fp16, output_dir, sm_arch=80,
+    num_warps=spec.num_warps,
+    num_stages=spec.num_stages,
+    launch_kwargs=spec.launch_kwargs,
+)
 print(f"cubin 大小：{len(cubin)} bytes")
 # cubin 大小：12288 bytes
 
@@ -495,6 +665,7 @@ kernel_specs = {"kernel.relu_fp16": kernel_reg.lookup(
     KernelMatchKey("relu", "cuda", ("float16",))
 )}
 exe = VMCodegenPass(kernel_specs=kernel_specs).run(module)
+# grid_fn 收到 shapes=[(8192,)] → grid = (33, 1, 1)
 ```
 
 ### 10.4 运行时（需要 GPU）
@@ -526,7 +697,7 @@ vm = VMInterpreter(exe)
 
 def relu_mock(args):
     """numpy relu mock，模拟 GPU kernel 行为。"""
-    import struct, numpy as np
+    import numpy as np
     in_t, out_t = args[0], args[1]
     data = np.frombuffer(in_t.storage.data, dtype=np.float16)
     result = np.maximum(data, 0)
@@ -543,6 +714,13 @@ vm.register_kernel("kernel.relu_fp16", relu_mock)
 | 设计决策 | 原因 |
 |---|---|
 | grid dims 追加为最后 3 个 Int arg | 复用 CALL 指令，不新增 opcode |
+| grid_fn 支持 `shapes` 参数 | 静态 shape 场景下可根据输入维度计算 grid，无需写死 |
+| grid_fn 无参回退 | 向后兼容；动态 shape 场景的降级方案 |
+| `dtype` 简写 + `dtypes` 列表 | 单输入 kernel 简洁，多输入 kernel 精确 |
+| `backend` 字段显式声明 | 区分 triton/cuda_c/python/llvm 编译路径，避免 heuristic 猜测 |
+| `num_warps`/`num_stages`/`block_size` 存入 KernelSpec | 编译参数与 kernel 绑定，AOT 时透传给 triton.compile |
+| `smem_bytes` 存入 KernelObj | cuLaunchKernel 的 sharedMemBytes 不再硬编码 0 |
+| `launch_kwargs` 字典透传 | 支持 Triton 特有参数（maxnreg 等），不污染 KernelSpec 顶层 |
 | cubin 缓存在进程级 static map | kernel 通常固定，避免每次 `cuModuleLoadData` 的开销 |
 | `CUDAKernelRegistry` 与 `PackedFuncRegistry` 分离 | kernel 携带二进制数据，不适合 `std::function` 包装 |
 | AOT 编译（非 JIT） | 部署环境不需要 Triton/NVCC，启动延迟固定 |
@@ -556,14 +734,18 @@ vm.register_kernel("kernel.relu_fp16", relu_mock)
 ```
 @dp.kernel
    ├── 注册 KernelSpec → _kernel_registry
+   │     ├── op_name, device, input_dtypes → 查表 key
+   │     ├── backend → 选择编译路径
+   │     ├── grid_fn → VMCodegenPass 计算 grid dim
+   │     ├── num_warps/num_stages/launch_kwargs → TritonAOTCompilePass
+   │     └── smem_bytes → KernelObj → cuLaunchKernel
    ├── KernelSpec 被 DPSLoweringPass 查询 → CallDPSOp
-   ├── KernelSpec.grid_fn 被 VMCodegenPass 调用 → grid dim 常量
    └── KernelSpec 指向 Triton kernel fn → TritonAOTCompilePass 编译
 
 cubin
-   ├── TritonAOTCompilePass 生成
+   ├── TritonAOTCompilePass 生成（含 num_warps/num_stages/launch_kwargs）
    ├── EmitKernelsPass 写入 artifact
-   └── CUDAKernelRegistry 加载后存入 KernelObj
+   └── CUDAKernelRegistry 加载后存入 KernelObj（含 smem_bytes）
 
 CUDAKernelRegistry
    ├── Executable::Load() 填充
@@ -572,5 +754,5 @@ CUDAKernelRegistry
 CUDAKernelLauncher_Launch
    ├── cuModuleLoadData (带缓存)
    ├── cuModuleGetFunction
-   └── cuLaunchKernel
+   └── cuLaunchKernel(fn, grid, block, smem_bytes=..., stream, params)
 ```

@@ -122,24 +122,83 @@ def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque")
 
 
 def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
-           dtype: str = "float16", grid=None, sm_arches=()):
+           dtype: str = "", dtypes: list = None, grid=None, sm_arches=(),
+           num_warps: int = 4, num_stages: int = 3, block_size: int = 256,
+           smem_bytes: int = 0, launch_kwargs: dict = None):
     """Decorator to register a kernel implementation.
+
+    Parameters
+    ----------
+    op : str
+        High-level operator name (e.g. "relu", "matmul").  Matched against
+        ``dp.ops.relu(x)`` → ``CallOp(@relu)`` during DPS lowering.
+    backend : str
+        Compiler backend: "triton" | "cuda_c" | "python" | "llvm".
+        Determines how the kernel function is AOT-compiled.
+    device : str
+        Target device: "cuda", "cpu", etc.
+    dtype : str
+        Convenience shorthand for single-input homogeneous kernels (e.g. relu).
+        When set, ``input_dtypes`` = ``(dtype,)``.  Mutually exclusive with
+        ``dtypes``.
+    dtypes : list[str]
+        Explicit per-input dtype list for multi-input kernels (e.g. matmul
+        needs ``["float16", "float16"]``).  Takes precedence over ``dtype``.
+    grid : callable
+        Returns ``(grid_x, grid_y, grid_z)``.  Called at codegen time.
+        When all input shapes are static (known at compile time), receives
+        ``shapes: list[tuple[int,...]]`` — one tuple per input tensor.
+        Falls back to no-arg call for dynamic shapes or backward compat.
+        Example: ``grid=lambda shapes: (shapes[0][0] // 256 + 1, 1, 1)``
+    sm_arches : tuple[int]
+        Supported SM compute capabilities, e.g. ``(80, 90)``.  Empty = any SM.
+    num_warps : int
+        Warps per thread block (block_threads / 32).
+    num_stages : int
+        Triton software pipeline depth.
+    block_size : int
+        Tiling size (BLOCK_SIZE constexpr).
+    smem_bytes : int
+        Dynamic shared memory bytes for cuLaunchKernel.
+    launch_kwargs : dict
+        Extra kwargs forwarded to the backend compiler (e.g. triton.compile).
 
     Example::
 
         @dp.kernel(op="relu", backend="triton", device="cuda", dtype="float16",
-                   grid=lambda *inputs: (1, 1, 1))
+                   grid=lambda: (128, 1, 1))
         def relu_kernel(x, out):
             ...  # Triton kernel body
+
+        @dp.kernel(op="matmul", backend="triton", device="cuda",
+                   dtypes=["float16", "float16"], grid=lambda: (32, 32, 1))
+        def matmul_kernel(a, b, out):
+            ...
     """
+    # Resolve input_dtypes: explicit dtypes list takes precedence over dtype shorthand
+    if dtypes is not None:
+        resolved_dtypes = tuple(dtypes)
+    elif dtype:
+        resolved_dtypes = (dtype,)
+    else:
+        raise ValueError(
+            f"@dp.kernel(op={op!r}): either 'dtype' or 'dtypes' must be provided"
+        )
+
     def decorator(fn):
         spec = KernelSpec(
             op_name=op,
             device=device,
-            input_dtypes=(dtype,),
+            input_dtypes=resolved_dtypes,
             kernel_name=f"kernel.{fn.__name__}",
+            backend=backend,
             sm_arches=sm_arches,
             grid_fn=grid,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            block_size=block_size,
+            smem_bytes=smem_bytes,
+            launch_kwargs=launch_kwargs or {},
         )
         _kernel_registry.register(spec)
         fn._kernel_spec = spec

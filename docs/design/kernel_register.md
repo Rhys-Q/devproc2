@@ -89,14 +89,33 @@ registry = {
 
 ## 4. KernelSpec
 
-@dataclass
+@dataclass(frozen=True)
 class KernelSpec:
-    op_name: str
-    input_dtypes: tuple[str,...]
-    match: callable | None
-    priority: int
-    launch_rule
-    func
+    # ── 查表 key ──
+    op_name:      str
+    device:       str
+    input_dtypes: tuple[str, ...]
+
+    # ── 实现标识 ──
+    kernel_name:  str                  # CallDPSOp 中用的名字，如 "kernel.relu_fp16"
+    backend:      str = "triton"       # 编译后端：triton | cuda_c | python | llvm
+
+    # ── 调度过滤 ──
+    sm_arches:    tuple[int, ...] = () # () = 不限 SM
+    priority:     int = 0
+    match:        callable | None = None
+
+    # ── launch 配置 ──
+    grid_fn:      callable | None = None  # 返回 (grid_x, grid_y, grid_z)
+                                           #   静态 shape → grid_fn(shapes: list[tuple])
+                                           #   动态 shape → grid_fn() 无参回退
+    num_warps:    int = 4
+    num_stages:   int = 3
+    block_size:   int = 256
+    smem_bytes:   int = 0
+
+    # ── 编译器透传 ──
+    launch_kwargs: dict = {}
 
 ---
 

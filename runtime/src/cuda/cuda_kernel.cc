@@ -134,7 +134,7 @@ void CUDAKernelLauncher_Launch(
         fn,
         grid_x, grid_y, grid_z,
         block_x, block_y, block_z,
-        0,           // sharedMemBytes
+        static_cast<unsigned int>(kernel->smem_bytes),  // sharedMemBytes
         cu_stream,
         params.empty() ? nullptr : params.data(),
         nullptr      // extra

@@ -13,7 +13,10 @@ class TritonAOTCompilePass:
 
     Usage::
 
-        cubin = TritonAOTCompilePass().run(kernel_fn, output_dir, sm_arch=90)
+        cubin = TritonAOTCompilePass().run(
+            kernel_fn, output_dir, sm_arch=90,
+            num_warps=4, num_stages=3,
+        )
 
     Parameters
     ----------
@@ -25,6 +28,12 @@ class TritonAOTCompilePass:
         Target SM compute capability (e.g. 80 for Ampere, 90 for Hopper).
     signature : dict, optional
         Triton type signature overrides. If None, inferred from kernel_fn.
+    num_warps : int
+        Warps per thread block (block_threads / 32).  Passed to triton.compile.
+    num_stages : int
+        Software pipeline depth.  Passed to triton.compile.
+    launch_kwargs : dict, optional
+        Extra kwargs forwarded to triton.compile().
 
     Returns
     -------
@@ -45,6 +54,9 @@ class TritonAOTCompilePass:
         output_dir: str,
         sm_arch: int = 90,
         signature: Optional[dict] = None,
+        num_warps: int = 4,
+        num_stages: int = 3,
+        launch_kwargs: Optional[dict] = None,
     ) -> bytes:
         try:
             import triton
@@ -62,7 +74,14 @@ class TritonAOTCompilePass:
             fn=kernel_fn,
             signature=signature or {},
         )
-        compiled = triton.compile(target, target=tc.GPUTarget("cuda", sm_arch, 32))
+        compile_kwargs = {"num_warps": num_warps, "num_stages": num_stages}
+        if launch_kwargs:
+            compile_kwargs.update(launch_kwargs)
+        compiled = triton.compile(
+            target,
+            target=tc.GPUTarget("cuda", sm_arch, 32),
+            options=compile_kwargs,
+        )
 
         # Extract cubin bytes
         if hasattr(compiled, "asm") and "cubin" in compiled.asm:

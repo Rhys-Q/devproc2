@@ -318,7 +318,7 @@ class VMCodegenPass:
         if op.callee_kind == IRCalleeKind.kernel:
             spec = self._kernel_specs.get(op.callee)
             if spec is not None and spec.grid_fn is not None:
-                grid = spec.grid_fn()  # static grid at codegen time
+                grid = self._compute_grid(spec.grid_fn, op.inputs)
                 for g in grid:
                     arg_regs.append(ctx.reg_for_int(int(g)))
         func_idx = ctx.intern_func(op.callee, _ir_callee_kind(op.callee_kind))
@@ -328,6 +328,39 @@ class VMCodegenPass:
             func_idx=func_idx,
             arg_regs=arg_regs,
         ))
+
+    @staticmethod
+    def _compute_grid(grid_fn, inputs: tuple) -> tuple[int, int, int]:
+        """Compute static grid dims from input shapes when possible.
+
+        Extracts concrete shapes from each input's struct_info.  If all dims
+        are IntImm (static), passes ``[(d0,d1,...), ...]`` to grid_fn.
+        Falls back to no-arg call for backward compatibility or when shapes
+        contain dynamic PrimVars.
+        """
+        shapes = []
+        all_static = True
+        for v in inputs:
+            si = getattr(v, "struct_info", None)
+            if si is not None and hasattr(si, "shape"):
+                dims = []
+                for d in si.shape:
+                    if isinstance(d, IntImm):
+                        dims.append(d.value)
+                    else:
+                        all_static = False
+                        break
+                shapes.append(tuple(dims))
+            else:
+                all_static = False
+                break
+
+        if all_static:
+            try:
+                return tuple(grid_fn(shapes))
+            except TypeError:
+                pass  # fall through to no-arg call
+        return tuple(grid_fn())
 
     # ---- ShapeAssertOp -----------------------------------------------------
 

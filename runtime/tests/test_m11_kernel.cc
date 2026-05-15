@@ -50,8 +50,12 @@ void test_registry_register_and_get() {
     std::vector<uint8_t> fake_cubin = {0x00, 0x01, 0x02, 0x03};
     std::string func_name = "relu_fp16";
     std::array<int32_t, 3> block_dims = {128, 1, 1};
+    int32_t smem = 4096;
+    int32_t warps = 8;
+    int32_t stages = 4;
 
-    CUDAKernelRegistry::Global().Register(name, fake_cubin, func_name, block_dims);
+    CUDAKernelRegistry::Global().Register(
+        name, fake_cubin, func_name, block_dims, smem, warps, stages);
 
     CHECK(CUDAKernelRegistry::Global().Has(name));
 
@@ -61,6 +65,9 @@ void test_registry_register_and_get() {
     CHECK(k->func_name == func_name);
     CHECK(k->cubin_data == fake_cubin);
     CHECK(k->block_dims == block_dims);
+    CHECK(k->smem_bytes == smem);
+    CHECK(k->num_warps == warps);
+    CHECK(k->num_stages == stages);
 }
 
 // ── Test 2: missing key returns nullptr ──────────────────────────────────────
