@@ -89,7 +89,7 @@ class TestDSLEmitsCorrectIR:
             buf = dp.empty((4,), dtype="float32", device="cpu")
             return buf
 
-        fn = dp.get_module().functions["f"]
+        fn = f.lower_module().functions["f"]
         ops = fn.body.blocks[0].ops
         tc_ops = [o for o in ops if isinstance(o, TensorCreateOp)]
         assert len(tc_ops) == 1
@@ -108,7 +108,7 @@ class TestDSLEmitsCorrectIR:
             )
             return tokens
 
-        fn = dp.get_module().functions["f"]
+        fn = f.lower_module().functions["f"]
         ops = fn.body.blocks[0].ops
         dps_ops = [o for o in ops if isinstance(o, CallDPSOp)]
         assert len(dps_ops) == 1
@@ -126,7 +126,7 @@ class TestDSLEmitsCorrectIR:
             )
             return tokens
 
-        fn = dp.get_module().functions["f"]
+        fn = f.lower_module().functions["f"]
         ops = fn.body.blocks[0].ops
         tc_ops = [o for o in ops if isinstance(o, TensorCreateOp)]
         dps_ops = [o for o in ops if isinstance(o, CallDPSOp)]
@@ -145,7 +145,7 @@ class TestDSLEmitsCorrectIR:
             )
             return k_cache
 
-        fn = dp.get_module().functions["f"]
+        fn = f.lower_module().functions["f"]
         ops = fn.body.blocks[0].ops
         dps_ops = [o for o in ops if isinstance(o, CallDPSOp)]
         assert len(dps_ops) == 1
@@ -302,7 +302,7 @@ class TestDSLAcceptance:
             )
             return tokens
 
-        module = dp.get_module()
+        module = tokenize.lower_module()
         fn = module.functions["tokenize"]
         ops = fn.body.blocks[0].ops
         tc_ops = [o for o in ops if isinstance(o, TensorCreateOp)]
@@ -325,7 +325,7 @@ class TestDSLAcceptance:
             )
             return tokens
 
-        module = dp.get_module()
+        module = tokenize.lower_module()
         ctx = PassContext()
         module = InferStructInfoPass().run(module)
         module = DPSLoweringPass(KernelRegistry()).run(module)
@@ -364,7 +364,7 @@ class TestDSLAcceptance:
             )
             return k_cache
 
-        module = dp.get_module()
+        module = f.lower_module()
         ctx = PassContext()
         module = InferStructInfoPass().run(module)
         module = DPSLoweringPass(KernelRegistry()).run(module)

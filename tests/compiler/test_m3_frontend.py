@@ -40,7 +40,7 @@ def test_frontend_decode_step():
             y = dp.ops.layernorm(y)
         return y
 
-    module = dp.get_module()
+    module = decode_step.lower_module()
     assert "decode_step" in module.functions
     verify(module)
 
@@ -78,7 +78,7 @@ def test_frontend_decode_step_printed_ir():
             y = dp.ops.layernorm(y)
         return y
 
-    text = print_module(dp.get_module())
+    text = print_module(decode_step.lower_module())
     assert "if " in text
     assert "@relu" in text
     assert "@silu" in text
@@ -102,7 +102,7 @@ def test_frontend_ssa_if():
             y = dp.ops.silu(x)
         return y
 
-    module = dp.get_module()
+    module = branch.lower_module()
     verify(module)
     fn = module.functions["branch"]
     if_op = next(op for op in fn.body.entry_block.ops if isinstance(op, IfOp))
@@ -122,7 +122,7 @@ def test_frontend_effect_only_if():
             dp.ops.noop(k_cache)
         return k_cache
 
-    module = dp.get_module()
+    module = update.lower_module()
     verify(module)
     fn = module.functions["update"]
     if_op = next(op for op in fn.body.entry_block.ops if isinstance(op, IfOp))
@@ -144,7 +144,7 @@ def test_frontend_loop_carried_for():
             acc = dp.ops.add(acc, x)
         return acc
 
-    module = dp.get_module()
+    module = loop_accum.lower_module()
     verify(module)
     fn = module.functions["loop_accum"]
     for_op = next(op for op in fn.body.entry_block.ops if isinstance(op, ForOp))
@@ -165,7 +165,7 @@ def test_frontend_effect_only_for():
             dp.ops.update_kvcache(k_cache, v_cache, i)
         return k_cache
 
-    module = dp.get_module()
+    module = write_loop.lower_module()
     verify(module)
     fn = module.functions["write_loop"]
     for_op = next(op for op in fn.body.entry_block.ops if isinstance(op, ForOp))
@@ -188,7 +188,7 @@ def test_normalize_pass_runs_on_module():
             y = dp.ops.silu(x)
         return y
 
-    module = dp.get_module()
+    module = f.lower_module()
     normalized = ControlFlowNormalizePass().run(module)
     verify(normalized)
     assert "f" in normalized.functions
@@ -208,7 +208,7 @@ def test_cf_verify_pass_accepts_valid_module():
                 dp.ops.noop(k_cache)
         return k_cache
 
-    module = dp.get_module()
+    module = g.lower_module()
     verify(module)
     ControlFlowVerifyPass().run(module)
 
@@ -265,7 +265,7 @@ def test_normalize_pass_nested_if_result_substitution():
             y = dp.ops.gelu(x)
         return y
 
-    module = dp.get_module()
+    module = f.lower_module()
     normalized = ControlFlowNormalizePass().run(module)
     verify(normalized)
     assert "f" in normalized.functions

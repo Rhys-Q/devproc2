@@ -100,7 +100,7 @@ def test_memory_planning_returns_same_module():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     original_text = print_module(module)
 
     ctx = PassContext()
@@ -117,7 +117,7 @@ def test_memory_planning_writes_storage_plan():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
 
@@ -135,7 +135,7 @@ def test_memory_planning_single_tensor_one_entry():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
 
@@ -158,7 +158,7 @@ def test_size_uses_upper_bound():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
 
@@ -180,7 +180,7 @@ def test_size_missing_upper_dynamic_alloc():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
 
@@ -223,7 +223,7 @@ def test_dynamic_shape_tensors_can_share_storage():
         d = dp.ops.layernorm(c)  # returned
         return d
 
-    module = _lowered(dp.get_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -258,7 +258,7 @@ def test_reuse_sequential_same_device_and_size():
 
     # Both relu and silu produce same-shape tensors; both are returned
     # → each gets its own storage (not reusable)
-    module = _lowered(dp.get_module(),
+    module = _lowered(f.lower_module(),
                       _spec("relu"),
                       KernelSpec(op_name="silu", device="cuda",
                                  input_dtypes=("float16",),
@@ -280,7 +280,7 @@ def test_reuse_intermediate_tensors():
         b = dp.ops.layernorm(a)  # b is returned
         return b
 
-    module = _lowered(dp.get_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -309,7 +309,7 @@ def test_reuse_three_sequential_intermediates():
     silu_spec = KernelSpec(op_name="silu", device="cuda",
                            input_dtypes=("float16",),
                            kernel_name="kernel.silu_fp16")
-    module = _lowered(dp.get_module(), _spec("relu"), _spec("layernorm"), silu_spec)
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"), silu_spec)
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -340,7 +340,7 @@ def test_at_least_two_tensors_share_storage():
         d = dp.ops.layernorm(c)  # returned
         return d
 
-    module = _lowered(dp.get_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -366,7 +366,7 @@ def test_opaque_effect_extends_live_ranges():
         a = dp.ops.relu(x)
         return a
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     # Manually inject a no-output CallDPS with OpaqueEffect after relu
     fn = module.functions["f"]
     from devproc2.ir.nodes import Block, Region, Function
@@ -403,7 +403,7 @@ def test_write_effect_extends_var_live_range():
         a = dp.ops.relu(x)
         return a
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     # Insert a CallDPS with WriteEffect on the tensor 'a'
     fn = module.functions["f"]
     entry = fn.body.entry_block
@@ -448,7 +448,7 @@ def test_lower_produces_alloc_storage_and_alloc_tensor():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     lowered = LowerTensorCreateToAllocPass(ctx).run(module)
@@ -468,7 +468,7 @@ def test_lower_alloc_storage_hoisted_first():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     lowered = LowerTensorCreateToAllocPass(ctx).run(module)
@@ -486,7 +486,7 @@ def test_lower_alloc_tensor_references_storage():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     lowered = LowerTensorCreateToAllocPass(ctx).run(module)
@@ -506,7 +506,7 @@ def test_lower_alloc_tensor_preserves_shape_and_dtype():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     lowered = LowerTensorCreateToAllocPass(ctx).run(module)
@@ -529,7 +529,7 @@ def test_lower_printed_ir_contains_alloc_keywords():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     lowered = LowerTensorCreateToAllocPass(ctx).run(module)
@@ -548,7 +548,7 @@ def test_lower_verifier_passes():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     lowered = LowerTensorCreateToAllocPass(ctx).run(module)
@@ -563,7 +563,7 @@ def test_lower_without_plan_raises():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered(dp.get_module(), _spec("relu"))
+    module = _lowered(f.lower_module(), _spec("relu"))
     ctx = PassContext()  # empty — no plan stored
     with pytest.raises(RuntimeError, match="storage_plan"):
         LowerTensorCreateToAllocPass(ctx).run(module)
@@ -586,7 +586,10 @@ def test_per_function_plan_keys():
         y = dp.ops.layernorm(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = IRModule()
+    module.functions["f"] = f.lower_module().functions["f"]
+    module.functions["g"] = g.lower_module().functions["g"]
+    module = InferStructInfoPass().run(module)
     module = DPSLoweringPass(_reg(_spec("relu"), _spec("layernorm"))).run(module)
 
     ctx = PassContext()
@@ -618,7 +621,7 @@ def test_acceptance_storage_plan_json_shape():
         d = dp.ops.layernorm(c)  # returned
         return d
 
-    module = _lowered(dp.get_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(main.lower_module(), _spec("relu"), _spec("layernorm"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -653,7 +656,7 @@ def test_acceptance_lower_alloc_ir():
         d = dp.ops.layernorm(c)  # returned
         return d
 
-    module = _lowered(dp.get_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(main.lower_module(), _spec("relu"), _spec("layernorm"))
 
     # MemoryPlanningPass: IRModule unchanged
     ctx = PassContext()
@@ -811,7 +814,7 @@ def test_dsl_tuple_return_uses_tupleop():
         b = dp.ops.silu(z)
         return a, b
 
-    fn = dp.get_module().functions["f"]
+    fn = f.lower_module().functions["f"]
     ret = next(op for op in fn.body.entry_block.ops if isinstance(op, ReturnOp))
     # ReturnOp must carry the result of a TupleOp, not a bare Var
     from devproc2.ir.nodes import OpResult
@@ -837,7 +840,7 @@ def test_dsl_tuple_return_marks_both_tensors_non_reusable():
 
     silu_spec = KernelSpec(op_name="silu", device="cuda", input_dtypes=("float16",),
                            kernel_name="kernel.silu_fp16")
-    module = _lowered(dp.get_module(), _spec("relu"), silu_spec)
+    module = _lowered(f.lower_module(), _spec("relu"), silu_spec)
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")

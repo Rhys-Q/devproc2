@@ -73,25 +73,8 @@ class Tensor:
 # Module-level registry
 # ---------------------------------------------------------------------------
 
-_module: Optional[IRModule] = None  # last built module (set by get_module)
 _decorated_fns: list = []           # functions decorated with @dp.function
 _kernel_registry: KernelRegistry = KernelRegistry()
-
-
-def get_module() -> Optional[IRModule]:
-    """Auto-build an IRModule from all @dp.function-decorated functions.
-
-    For new code, prefer calling ``fn.lower_module()`` directly on a decorated
-    function — it makes the data flow explicit and avoids global state.
-    """
-    global _module
-    if _module is None and _decorated_fns:
-        mod = IRModule()
-        for fn in _decorated_fns:
-            name, ir_func = fn._dp_ir
-            mod.functions[name] = ir_func
-        _module = mod
-    return _module
 
 
 def get_kernel_registry() -> KernelRegistry:
@@ -99,9 +82,8 @@ def get_kernel_registry() -> KernelRegistry:
 
 
 def reset_module() -> None:
-    """Clear all decorated functions, built module, and kernel registry."""
-    global _module, _decorated_fns, _kernel_registry
-    _module = None
+    """Clear all decorated functions and kernel registry."""
+    global _decorated_fns, _kernel_registry
     _decorated_fns = []
     _kernel_registry = KernelRegistry()
 
@@ -230,9 +212,6 @@ def function(fn):
 
     Does NOT mutate any global state.  Call ``fn.lower_module()`` to get an
     IRModule containing just this function.
-
-    For backward compatibility, ``dp.get_module()`` will auto-build from all
-    decorated functions.
 
     Usage::
 

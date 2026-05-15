@@ -669,7 +669,7 @@ def test_full_pipeline_dsl_relu():
         y = dp.ops.relu(x)
         return y
 
-    module = dp.get_module()
+    module = relu_fn.lower_module()
     exe = _run_pipeline(module, _spec("relu"))
     vm = VMInterpreter(exe)
     result = vm.invoke("relu_fn", [None])
@@ -686,7 +686,7 @@ def test_full_pipeline_multi_op():
         z = dp.ops.relu(y)
         return z
 
-    module = dp.get_module()
+    module = chain_fn.lower_module()
     exe = _run_pipeline(module, _spec("relu"))
     vm = VMInterpreter(exe)
     result = vm.invoke("chain_fn", [None])
