@@ -221,7 +221,7 @@ class DSLBuilder:
 
             if isinstance(val_expr, ast.Call):
                 callee_str = ast.unparse(val_expr.func)
-                if "empty" in callee_str:
+                if callee_str in ("dp.empty", "empty"):
                     result_name = self._pick_name(name)
                     create_op = self._build_empty(val_expr, result_name)
                     self.scope.define(name, create_op.results[0])

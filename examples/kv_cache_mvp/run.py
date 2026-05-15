@@ -22,7 +22,6 @@ from __future__ import annotations
 import os
 import struct
 import sys
-import tempfile
 
 # Allow running from repo root or from examples/kv_cache_mvp/
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
