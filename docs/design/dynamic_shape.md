@@ -120,8 +120,16 @@ class KernelSpec:
     device:       str
     input_dtypes: tuple[str, ...]
     kernel_name:  str
+    backend:      str = "triton"
     sm_arches:    tuple[int, ...] = ()     # 空 = 任意 SM
     priority:     int = 0
+    match:        Optional[Callable] = None
+    grid_fn:      Optional[Callable] = None  # 返回 (grid_x, grid_y, grid_z)
+    num_warps:    int = 4
+    num_stages:   int = 3
+    block_size:   int = 256
+    smem_bytes:   int = 0
+    launch_kwargs: dict = field(default_factory=dict)
     match:        Optional[Callable[[CallOp], bool]] = None  # 二阶谓词
 ```
 

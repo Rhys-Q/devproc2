@@ -84,7 +84,7 @@ def test_function_typed_params_struct_info():
         y = dp.ops.layernorm(x)
         return y
 
-    fn = dp.get_module().functions["main"]
+    fn = main.lower_module().functions["main"]
     x_param = fn.params[0]
     assert isinstance(x_param.struct_info, TensorStructInfo)
     assert x_param.struct_info.shape[0] is B
@@ -97,7 +97,7 @@ def test_function_unannotated_params_unchanged():
         z = dp.ops.relu(x)
         return z
 
-    fn = dp.get_module().functions["f"]
+    fn = f.lower_module().functions["f"]
     assert fn.params[0].struct_info is None
     assert fn.params[1].struct_info is None
 
@@ -111,7 +111,7 @@ def test_function_typed_params_verifier_passes():
         y = dp.ops.layernorm(x)
         return y
 
-    verify(dp.get_module())
+    verify(main.lower_module())
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ def test_infer_struct_info_propagates_through_call():
         y = dp.ops.layernorm(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(main.lower_module())
     fn = module.functions["main"]
     call_op = fn.body.entry_block.ops[0]
     assert isinstance(call_op, CallOp)
@@ -141,7 +141,7 @@ def test_infer_struct_info_no_annotation_unchanged():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     fn = module.functions["f"]
     call_op = fn.body.entry_block.ops[0]
     assert call_op.results[0].struct_info is None
@@ -155,7 +155,7 @@ def test_infer_struct_info_verifier_still_passes():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     verify(module)
 
 
@@ -172,7 +172,7 @@ def test_shape_assertion_insert_ops_prepended():
         y = dp.ops.layernorm(x)
         return y
 
-    module = ShapeAssertionInsertPass().run(dp.get_module())
+    module = ShapeAssertionInsertPass().run(main.lower_module())
     fn = module.functions["main"]
     ops = fn.body.entry_block.ops
 
@@ -197,7 +197,7 @@ def test_shape_assertion_insert_no_upper_no_assert():
         y = dp.ops.relu(x)
         return y
 
-    module = ShapeAssertionInsertPass().run(dp.get_module())
+    module = ShapeAssertionInsertPass().run(f.lower_module())
     fn = module.functions["f"]
     assert not any(isinstance(op, ShapeAssertOp) for op in fn.body.entry_block.ops)
 
@@ -211,7 +211,7 @@ def test_shape_assertion_insert_printed_ir():
         y = dp.ops.layernorm(x)
         return y
 
-    text = print_module(ShapeAssertionInsertPass().run(dp.get_module()))
+    text = print_module(ShapeAssertionInsertPass().run(main.lower_module()))
     assert "assert %x.shape[0] <= 8" in text
     assert "assert %x.shape[1] <= 2048" in text
 
@@ -225,7 +225,7 @@ def test_shape_assertion_insert_verifier_passes():
         y = dp.ops.layernorm(x)
         return y
 
-    verify(ShapeAssertionInsertPass().run(dp.get_module()))
+    verify(ShapeAssertionInsertPass().run(main.lower_module()))
 
 
 def test_shape_assertion_insert_no_annotated_param_unchanged():
@@ -234,8 +234,8 @@ def test_shape_assertion_insert_no_annotated_param_unchanged():
         z = dp.ops.relu(x)
         return z
 
-    before_ops = tuple(dp.get_module().functions["f"].body.entry_block.ops)
-    module = ShapeAssertionInsertPass().run(dp.get_module())
+    before_ops = tuple(f.lower_module().functions["f"].body.entry_block.ops)
+    module = ShapeAssertionInsertPass().run(f.lower_module())
     after_ops = tuple(module.functions["f"].body.entry_block.ops)
     assert before_ops == after_ops
 
@@ -253,7 +253,7 @@ def _make_asserted_module():
         y = dp.ops.layernorm(x)
         return y
 
-    return ShapeAssertionInsertPass().run(dp.get_module())
+    return ShapeAssertionInsertPass().run(main.lower_module())
 
 
 def test_shape_constraint_verify_valid_binding():
@@ -310,7 +310,7 @@ def test_full_m4_pipeline():
         y = dp.ops.layernorm(x)
         return y
 
-    module = dp.get_module()
+    module = main.lower_module()
     module = InferStructInfoPass().run(module)
     module = ShapeAssertionInsertPass().run(module)
 
@@ -347,4 +347,4 @@ def test_m3_regression_no_annotations():
             y = dp.ops.layernorm(y)
         return y
 
-    verify(dp.get_module())
+    verify(decode_step.lower_module())

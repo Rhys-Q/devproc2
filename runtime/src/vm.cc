@@ -1,6 +1,14 @@
 #include <devproc2/runtime/vm.h>
 #include <devproc2/runtime/packed_func.h>
 #include <devproc2/runtime/stream.h>
+#ifdef DEVPROC2_WITH_CUDA
+#include <devproc2/runtime/cuda_kernel_registry.h>
+// Forward declaration for CUDAKernelLauncher_Launch (defined in cuda_kernel.cc)
+namespace devproc2 {
+    class KernelObj;
+    void CUDAKernelLauncher_Launch(const KernelObj*, std::vector<VMValue>&, void*);
+}
+#endif
 #include <nlohmann/json.hpp>
 #include <cstring>
 #include <fstream>
@@ -352,9 +360,20 @@ VMValue VMState::DispatchExternal(const FunctionEntry& callee,
         return args.empty() ? VMValue{} : args[0];
     }
     case VMCalleeKind::kKernel: {
-        // M11: KernelRegistry lookup + launch
-        // M8 stub: no-op
+#ifdef DEVPROC2_WITH_CUDA
+        auto* k = CUDAKernelRegistry::Global().Get(callee.name);
+        if (!k) {
+            throw std::runtime_error(
+                "Kernel '" + callee.name + "' not registered in CUDAKernelRegistry");
+        }
+        Device cuda_dev{kDLCUDA, 0};
+        void* stream = GetDefaultStream(cuda_dev);
+        CUDAKernelLauncher_Launch(k, args, stream);
         return VMValue{};
+#else
+        throw std::runtime_error(
+            "kKernel dispatch requires DEVPROC2_WITH_CUDA (kernel: " + callee.name + ")");
+#endif
     }
     default:
         throw std::runtime_error(

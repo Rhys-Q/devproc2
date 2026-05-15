@@ -29,12 +29,15 @@ from devproc2.ir.ops import (
     IterArg,
     Range,
     ReturnOp,
+    TensorCreateKind,
+    TensorCreateOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
 )
-from devproc2.ir.prim_expr import PrimVar
+from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
 from devproc2.frontend.scope import ScopeStack
+from devproc2.kernel.registry import KernelRegistry, KernelSpec
 
 
 class DSLError(Exception):
@@ -70,16 +73,19 @@ class Tensor:
 # Module-level registry
 # ---------------------------------------------------------------------------
 
-_module: IRModule = IRModule()
+_decorated_fns: list = []           # functions decorated with @dp.function
+_kernel_registry: KernelRegistry = KernelRegistry()
 
 
-def get_module() -> IRModule:
-    return _module
+def get_kernel_registry() -> KernelRegistry:
+    return _kernel_registry
 
 
 def reset_module() -> None:
-    global _module
-    _module = IRModule()
+    """Clear all decorated functions and kernel registry."""
+    global _decorated_fns, _kernel_registry
+    _decorated_fns = []
+    _kernel_registry = KernelRegistry()
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +108,99 @@ range = _RangeStub()
 ops = _OpsStub()
 
 
-def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque"):
+def empty(shape, dtype: str = "float32", device: str = "cpu"):
+    """Runtime stub — real tensor creation happens via DSL AST compilation."""
     pass
+
+
+def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque"):
+    """Runtime stub — real op emission happens via DSL AST compilation."""
+    pass
+
+
+def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
+           dtype: str = "", dtypes: list = None, grid=None, sm_arches=(),
+           num_warps: int = 4, num_stages: int = 3, block_size: int = 256,
+           smem_bytes: int = 0, launch_kwargs: dict = None):
+    """Decorator to register a kernel implementation.
+
+    Parameters
+    ----------
+    op : str
+        High-level operator name (e.g. "relu", "matmul").  Matched against
+        ``dp.ops.relu(x)`` → ``CallOp(@relu)`` during DPS lowering.
+    backend : str
+        Compiler backend: "triton" | "cuda_c" | "python" | "llvm".
+        Determines how the kernel function is AOT-compiled.
+    device : str
+        Target device: "cuda", "cpu", etc.
+    dtype : str
+        Convenience shorthand for single-input homogeneous kernels (e.g. relu).
+        When set, ``input_dtypes`` = ``(dtype,)``.  Mutually exclusive with
+        ``dtypes``.
+    dtypes : list[str]
+        Explicit per-input dtype list for multi-input kernels (e.g. matmul
+        needs ``["float16", "float16"]``).  Takes precedence over ``dtype``.
+    grid : callable
+        Returns ``(grid_x, grid_y, grid_z)``.  Called at codegen time.
+        When all input shapes are static (known at compile time), receives
+        ``shapes: list[tuple[int,...]]`` — one tuple per input tensor.
+        Falls back to no-arg call for dynamic shapes or backward compat.
+        Example: ``grid=lambda shapes: (shapes[0][0] // 256 + 1, 1, 1)``
+    sm_arches : tuple[int]
+        Supported SM compute capabilities, e.g. ``(80, 90)``.  Empty = any SM.
+    num_warps : int
+        Warps per thread block (block_threads / 32).
+    num_stages : int
+        Triton software pipeline depth.
+    block_size : int
+        Tiling size (BLOCK_SIZE constexpr).
+    smem_bytes : int
+        Dynamic shared memory bytes for cuLaunchKernel.
+    launch_kwargs : dict
+        Extra kwargs forwarded to the backend compiler (e.g. triton.compile).
+
+    Example::
+
+        @dp.kernel(op="relu", backend="triton", device="cuda", dtype="float16",
+                   grid=lambda: (128, 1, 1))
+        def relu_kernel(x, out):
+            ...  # Triton kernel body
+
+        @dp.kernel(op="matmul", backend="triton", device="cuda",
+                   dtypes=["float16", "float16"], grid=lambda: (32, 32, 1))
+        def matmul_kernel(a, b, out):
+            ...
+    """
+    # Resolve input_dtypes: explicit dtypes list takes precedence over dtype shorthand
+    if dtypes is not None:
+        resolved_dtypes = tuple(dtypes)
+    elif dtype:
+        resolved_dtypes = (dtype,)
+    else:
+        raise ValueError(
+            f"@dp.kernel(op={op!r}): either 'dtype' or 'dtypes' must be provided"
+        )
+
+    def decorator(fn):
+        spec = KernelSpec(
+            op_name=op,
+            device=device,
+            input_dtypes=resolved_dtypes,
+            kernel_name=f"kernel.{fn.__name__}",
+            backend=backend,
+            sm_arches=sm_arches,
+            grid_fn=grid,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            block_size=block_size,
+            smem_bytes=smem_bytes,
+            launch_kwargs=launch_kwargs or {},
+        )
+        _kernel_registry.register(spec)
+        fn._kernel_spec = spec
+        return fn
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -111,14 +208,35 @@ def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque")
 # ---------------------------------------------------------------------------
 
 def function(fn):
+    """Decorator: parse the function's AST and store IR on ``fn._dp_ir``.
+
+    Does NOT mutate any global state.  Call ``fn.lower_module()`` to get an
+    IRModule containing just this function.
+
+    Usage::
+
+        @dp.function
+        def my_func(x: dp.Tensor[(4,), "float32", "cpu"]):
+            return dp.ops.relu(x)
+
+        module = my_func.lower_module()
+    """
     annotations = {k: v for k, v in fn.__annotations__.items() if k != "return"}
     src = inspect.getsource(fn)
     src = textwrap.dedent(src)
     tree = ast.parse(src)
     fn_def = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
-    builder = DSLBuilder(annotations=annotations)
+    builder = DSLBuilder(annotations=annotations, globals_dict=fn.__globals__)
     ir_name, ir_func = builder.build(fn_def)
-    _module.functions[ir_name] = ir_func
+    fn._dp_ir = (ir_name, ir_func)
+
+    def lower_module():
+        mod = IRModule()
+        mod.functions[ir_name] = ir_func
+        return mod
+
+    fn.lower_module = lower_module
+    _decorated_fns.append(fn)
     return fn
 
 
@@ -127,10 +245,12 @@ def function(fn):
 # ---------------------------------------------------------------------------
 
 class DSLBuilder:
-    def __init__(self, annotations: Optional[dict] = None) -> None:
+    def __init__(self, annotations: Optional[dict] = None,
+                 globals_dict: Optional[dict] = None) -> None:
         self.scope = ScopeStack()
         self._counter = 0
         self._annotations = annotations or {}
+        self._globals = globals_dict or {}
 
     # ------------------------------------------------------------------
     # Public entry
@@ -177,6 +297,12 @@ class DSLBuilder:
             val_expr = stmt.value
 
             if isinstance(val_expr, ast.Call):
+                callee_str = ast.unparse(val_expr.func)
+                if callee_str in ("dp.empty", "empty"):
+                    result_name = self._pick_name(name)
+                    create_op = self._build_empty(val_expr, result_name)
+                    self.scope.define(name, create_op.results[0])
+                    return [create_op]
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 result_name = self._pick_name(name)
@@ -356,10 +482,11 @@ class DSLBuilder:
             inp_node = kwargs["inputs"]
             if isinstance(inp_node, ast.List):
                 inputs = tuple(self._build_value(e) for e in inp_node.elts)
-        output: Optional[Var] = None
+        output: Optional[Value] = None
         if "output" in kwargs:
-            out_val = self._build_value(kwargs["output"])
-            if isinstance(out_val, Var):
+            out_node = kwargs["output"]
+            if not (isinstance(out_node, ast.Constant) and out_node.value is None):
+                out_val = self._build_value(kwargs["output"])
                 output = out_val
         return CallDPSOp(
             callee=callee,
@@ -368,6 +495,43 @@ class DSLBuilder:
             output=output,
             effect=OpaqueEffect(),
         )
+
+    # ------------------------------------------------------------------
+    # dp.empty()
+    # ------------------------------------------------------------------
+
+    def _build_empty(self, node: ast.Call, result_name: str) -> TensorCreateOp:
+        if not node.args:
+            raise DSLError("dp.empty requires shape as first argument")
+        shape_node = node.args[0]
+        if isinstance(shape_node, ast.Tuple):
+            shape = tuple(self._build_prim_expr(e) for e in shape_node.elts)
+        else:
+            shape = (self._build_prim_expr(shape_node),)
+        kwargs = {kw.arg: kw.value for kw in node.keywords}
+        dtype = kwargs["dtype"].value if "dtype" in kwargs and isinstance(kwargs["dtype"], ast.Constant) else "float32"
+        device = kwargs["device"].value if "device" in kwargs and isinstance(kwargs["device"], ast.Constant) else "cpu"
+        return TensorCreateOp(
+            result_name=result_name,
+            kind=TensorCreateKind.empty,
+            shape=shape,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _build_prim_expr(self, node: ast.expr) -> PrimExpr:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return IntImm(node.value)
+        if isinstance(node, ast.Name):
+            v = self.scope.lookup(node.id)
+            if isinstance(v, PrimVar):
+                return v
+            # Resolve named integer constants from the caller's module globals
+            gval = self._globals.get(node.id)
+            if isinstance(gval, int):
+                return IntImm(gval)
+            return PrimVar(node.id)
+        raise DSLError(f"Unsupported shape expression: {ast.unparse(node)}")
 
     # ------------------------------------------------------------------
     # Value materialization

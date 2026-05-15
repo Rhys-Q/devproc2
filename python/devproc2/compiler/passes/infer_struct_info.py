@@ -1,8 +1,8 @@
 """InferStructInfoPass — propagate TensorStructInfo through the IR."""
 from __future__ import annotations
 
-from devproc2.ir.nodes import Function, IRModule, Op, OpResult, StructInfo, Value, Var
-from devproc2.ir.ops import CallOp, ForOp, IfOp
+from devproc2.ir.nodes import Function, IRModule, Op, OpResult, StructInfo, TensorStructInfo, Value, Var
+from devproc2.ir.ops import CallOp, ForOp, IfOp, TensorCreateOp
 from devproc2.compiler.passes._rewriter import IRRewriter
 
 
@@ -24,6 +24,15 @@ class InferStructInfoPass(IRRewriter):
         return Function(new_body, fn.ret_struct_info)
 
     def rewrite_op(self, op: Op) -> Op:
+        if isinstance(op, TensorCreateOp):
+            # Derive struct_info from the op's shape/dtype/device declaration.
+            si = TensorStructInfo(op.shape, op.dtype, op.device)
+            new_op = self._subst_op(op)
+            # Stamp struct_info onto the OpResult so downstream ops (e.g.
+            # DPSLoweringPass.build_input_dtypes) can read it directly.
+            object.__setattr__(new_op.results[0], "struct_info", si)
+            self._type_env[new_op.results[0]] = si
+            return new_op
         if isinstance(op, CallOp) and op.result_name:
             # Record existing struct_info.
             if op.results[0].struct_info is not None:

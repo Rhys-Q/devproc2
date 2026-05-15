@@ -19,6 +19,9 @@ public:
     std::vector<uint8_t>       cubin_data;
     std::vector<uint8_t>       ptx_data;
     std::array<int32_t, 3>     block_dims{1, 1, 1};
+    int32_t                    smem_bytes{0};   // dynamic shared memory for cuLaunchKernel
+    int32_t                    num_warps{4};
+    int32_t                    num_stages{3};
 };
 
 class Kernel : public ObjectRef {

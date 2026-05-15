@@ -11,3 +11,17 @@ target_compile_options(test_m9_artifact PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>
 )
 add_test(NAME test_m9_artifact COMMAND test_m9_artifact)
+
+add_executable(test_m10_packed_func test_m10_packed_func.cc)
+target_link_libraries(test_m10_packed_func PRIVATE devproc2_runtime)
+target_compile_options(test_m10_packed_func PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>
+)
+add_test(NAME test_m10_packed_func COMMAND test_m10_packed_func)
+
+add_executable(test_m11_kernel test_m11_kernel.cc)
+target_link_libraries(test_m11_kernel PRIVATE devproc2_runtime)
+target_compile_options(test_m11_kernel PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>
+)
+add_test(NAME test_m11_kernel COMMAND test_m11_kernel)

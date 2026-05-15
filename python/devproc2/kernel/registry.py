@@ -40,25 +40,45 @@ class KernelSpec:
     op_name / device / input_dtypes must be canonical (exact, no wildcards).
     input_dtypes is coerced to tuple in __post_init__ so callers may pass a list.
 
-    sm_arches: SM compute capabilities this kernel supports, e.g. (80, 90).
-               Empty tuple means the kernel runs on any SM.
-    match:     Optional predicate for shape/attr/custom second-level filtering.
-               Receives the CallOp; return False to skip this spec.
-               When call_op is None at lookup time, the predicate is skipped
-               and the spec is treated as matching.
+    backend:     "triton" | "cuda_c" | "python" | "llvm" — which compiler backend
+                 to use for AOT compilation.  Determines how the kernel function
+                 is turned into executable code (cubin, .so, or mock).
+    sm_arches:   SM compute capabilities this kernel supports, e.g. (80, 90).
+                 Empty tuple means the kernel runs on any SM.
+    match:       Optional predicate for shape/attr/custom second-level filtering.
+                 Receives the CallOp; return False to skip this spec.
+                 When call_op is None at lookup time, the predicate is skipped
+                 and the spec is treated as matching.
+    grid_fn:     Callable returning (grid_x, grid_y, grid_z).  Currently only
+                 static grids are supported (called with no args at codegen time).
+                 Dynamic grids based on input shapes are future work.
+    num_warps:   Number of warps per thread block (block_threads / 32).
+    num_stages:  Software pipeline depth for Triton kernels.
+    block_size:  Tiling size (BLOCK_SIZE constexpr passed to the kernel).
+    smem_bytes:  Dynamic shared memory bytes for cuLaunchKernel.
+    launch_kwargs: Extra kwargs forwarded to triton.compile() / backend compiler.
     """
-    op_name:      str
-    device:       str
-    input_dtypes: tuple[str, ...]
-    kernel_name:  str               # callee in CallDPSOp, e.g. "kernel.relu_fp16"
-    sm_arches:    tuple[int, ...] = ()   # () = any SM
-    priority:     int = 0
-    match:        Optional[Callable[["CallOp"], bool]] = None
+    op_name:       str
+    device:        str
+    input_dtypes:  tuple[str, ...]
+    kernel_name:   str               # callee in CallDPSOp, e.g. "kernel.relu_fp16"
+    backend:       str = "triton"    # "triton" | "cuda_c" | "python" | "llvm"
+    sm_arches:     tuple[int, ...] = ()   # () = any SM
+    priority:      int = 0
+    match:         Optional[Callable[["CallOp"], bool]] = None
+    grid_fn:       Optional[Callable[..., tuple[int, int, int]]] = None
+    num_warps:     int = 4
+    num_stages:    int = 3
+    block_size:    int = 256
+    smem_bytes:    int = 0
+    launch_kwargs: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Coerce sequence fields to tuple so callers may pass lists.
         object.__setattr__(self, "input_dtypes", tuple(self.input_dtypes))
         object.__setattr__(self, "sm_arches", tuple(self.sm_arches))
+        # grid_fn is a callable; leave it as-is
+        # launch_kwargs is a dict; leave it as-is
 
 
 def build_input_dtypes(args: tuple) -> tuple[str, ...]:

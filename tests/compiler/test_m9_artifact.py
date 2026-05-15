@@ -356,7 +356,7 @@ def test_storage_plan_json_present_after_memory_planning(tmp_dir):
         y = dp.ops.relu(x)
         return y
 
-    raw_module = dp.get_module()
+    raw_module = main.lower_module()
     inferred, exe, ctx = _run_pipeline(raw_module, _spec("relu"))
     EmitABIPass().run(inferred, exe, ctx, tmp_dir)
     with open(os.path.join(tmp_dir, "metadata", "storage_plan.json")) as f:
@@ -405,7 +405,7 @@ def test_full_artifact_structure(tmp_dir):
         y = dp.ops.relu(x)
         return y
 
-    raw_module = dp.get_module()
+    raw_module = main.lower_module()
     inferred, exe, ctx = _run_pipeline(raw_module, _spec("relu"))
 
     EmitExecutablePass().run(exe, tmp_dir)

@@ -416,7 +416,7 @@ def test_full_dsl_dynamic_shape_pipeline():
         y = dp.ops.relu(x)
         return y
 
-    module = dp.get_module()
+    module = main.lower_module()
     exe = _run_pipeline(module, _spec("relu"))
 
     # Executable must have shape_of and assert_le_i64
@@ -443,7 +443,7 @@ def test_full_dsl_dynamic_shape_assert_fails():
         y = dp.ops.relu(x)
         return y
 
-    module = dp.get_module()
+    module = main.lower_module()
     exe = _run_pipeline(module, _spec("relu"))
 
     interp = VMInterpreter(exe)

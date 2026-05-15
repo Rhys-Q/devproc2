@@ -136,7 +136,7 @@ def test_registry_lookup_match_predicate():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     fn = module.functions["f"]
     call_op = next(op for op in fn.body.entry_block.ops if isinstance(op, CallOp))
     key = KernelMatchKey("relu", "cuda", ("float16",))
@@ -157,7 +157,7 @@ def test_kernel_select_finds_annotated_call():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     reg = _make_registry(_relu_spec())
     sel = KernelSelectPass(reg).run(module)
 
@@ -173,7 +173,7 @@ def test_kernel_select_skips_unannotated_call():
         y = dp.ops.relu(x)
         return y
 
-    module = dp.get_module()
+    module = f.lower_module()
     reg = _make_registry(_relu_spec())
     sel = KernelSelectPass(reg).run(module)
     assert len(sel) == 0
@@ -187,7 +187,7 @@ def test_kernel_select_no_registry_hit():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     sel = KernelSelectPass(KernelRegistry()).run(module)
     assert len(sel) == 0
 
@@ -201,7 +201,7 @@ def test_kernel_select_sm_arch_filter():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     hopper_spec = _relu_spec(kernel_name="kernel.relu_hopper", sm_arches=(90,))
     reg = _make_registry(hopper_spec)
 
@@ -218,8 +218,8 @@ def test_kernel_select_sm_arch_filter():
 # DPSLoweringPass tests
 # ---------------------------------------------------------------------------
 
-def _lowered_module(*specs):
-    module = InferStructInfoPass().run(dp.get_module())
+def _lowered_module(module, *specs):
+    module = InferStructInfoPass().run(module)
     reg = _make_registry(*specs)
     return DPSLoweringPass(reg).run(module)
 
@@ -232,7 +232,7 @@ def test_dps_lowering_inserts_tensor_create():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered_module(_relu_spec())
+    module = _lowered_module(f.lower_module(), _relu_spec())
     fn = module.functions["f"]
     ops = fn.body.entry_block.ops
     assert isinstance(ops[0], TensorCreateOp)
@@ -247,7 +247,7 @@ def test_dps_lowering_removes_call_op():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered_module(_relu_spec())
+    module = _lowered_module(f.lower_module(), _relu_spec())
     fn = module.functions["f"]
     assert not any(isinstance(op, CallOp) for op in fn.body.entry_block.ops)
 
@@ -260,7 +260,7 @@ def test_dps_lowering_callee_name():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered_module(_relu_spec())
+    module = _lowered_module(f.lower_module(), _relu_spec())
     fn = module.functions["f"]
     dps = next(op for op in fn.body.entry_block.ops if isinstance(op, CallDPSOp))
     assert dps.callee == "kernel.relu_fp16"
@@ -274,7 +274,7 @@ def test_dps_lowering_output_is_tensor_create_result():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered_module(_relu_spec())
+    module = _lowered_module(f.lower_module(), _relu_spec())
     fn = module.functions["f"]
     ops = fn.body.entry_block.ops
     create_op = ops[0]
@@ -292,7 +292,7 @@ def test_dps_lowering_return_uses_create_result():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered_module(_relu_spec())
+    module = _lowered_module(f.lower_module(), _relu_spec())
     fn = module.functions["f"]
     ops = fn.body.entry_block.ops
     create_op = ops[0]
@@ -308,7 +308,7 @@ def test_dps_lowering_unmatched_call_unchanged():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     module = DPSLoweringPass(KernelRegistry()).run(module)
     fn = module.functions["f"]
     assert any(isinstance(op, CallOp) for op in fn.body.entry_block.ops)
@@ -324,7 +324,7 @@ def test_dps_lowering_printed_ir():
         y = dp.ops.layernorm(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(main.lower_module())
     module = DPSLoweringPass(_make_registry(_layernorm_spec())).run(module)
     text = print_module(module)
     assert "dp.empty" in text
@@ -343,7 +343,7 @@ def test_dps_lowering_sm_arch_selects_correct_kernel():
 
     hopper  = _relu_spec(kernel_name="kernel.relu_hopper",  sm_arches=(90,), priority=10)
     generic = _relu_spec(kernel_name="kernel.relu_generic", sm_arches=(),    priority=0)
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
 
     # SM 90 → hopper kernel
     m90 = DPSLoweringPass(_make_registry(hopper, generic), sm_arch=90).run(module)
@@ -370,7 +370,7 @@ def test_dps_lowering_verifier_passes():
         y = dp.ops.relu(x)
         return y
 
-    module = _lowered_module(_relu_spec())
+    module = _lowered_module(f.lower_module(), _relu_spec())
     verify(module)
 
 
@@ -383,7 +383,7 @@ def test_full_m6_pipeline():
         y = dp.ops.layernorm(x)
         return y
 
-    module = dp.get_module()
+    module = main.lower_module()
     module = InferStructInfoPass().run(module)
     module = DPSLoweringPass(_make_registry(_layernorm_spec())).run(module)
 
@@ -413,7 +413,7 @@ def test_m4_regression_no_lowering_without_registry():
         y = dp.ops.relu(x)
         return y
 
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     module = DPSLoweringPass(KernelRegistry()).run(module)
     verify(module)
     fn = module.functions["f"]
@@ -432,7 +432,7 @@ def test_dps_lowering_chained_ops():
         return z
 
     reg = _make_registry(_relu_spec(), _layernorm_spec())
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     module = DPSLoweringPass(reg).run(module)
 
     verify(module)
@@ -471,7 +471,7 @@ def test_dps_lowering_inside_if_branch():
     silu_spec = KernelSpec(op_name="silu", device="cuda", input_dtypes=("float16",),
                            kernel_name="kernel.silu_fp16")
     reg = _make_registry(_relu_spec(), silu_spec)
-    module = InferStructInfoPass().run(dp.get_module())
+    module = InferStructInfoPass().run(f.lower_module())
     module = DPSLoweringPass(reg).run(module)
 
     verify(module)
