@@ -43,6 +43,9 @@ struct Instruction {
     int32_t offset = 0;
     // CALL arg registers
     std::vector<int32_t> arg_regs;
+    // Kernel CALL launch registers: grid_x/y/z, block_x/y/z, shared_memory.
+    // Not part of arg_regs, so launch metadata does not affect kernel ABI.
+    std::vector<int32_t> launch_regs;
 };
 
 // ── FunctionEntry ─────────────────────────────────────────────────────────────
@@ -185,7 +188,8 @@ private:
                       int32_t caller_dst_reg, int32_t caller_reg_base);
     VMValue ExecuteLoop();
     VMValue DispatchExternal(const FunctionEntry& callee,
-                             std::vector<VMValue>& args);
+                             std::vector<VMValue>& args,
+                             const std::vector<int64_t>& launch_args);
 };
 
 

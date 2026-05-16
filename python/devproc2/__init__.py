@@ -26,9 +26,15 @@ from devproc2.frontend.dsl import (
     reset_module,
     symbolic_dim,
 )
+from devproc2.kernel import (
+    AttrConstraint,
+    KernelLaunchSpec,
+    KernelParamSpec,
+)
 
 __all__ = [
     "Tensor",
+    "AttrConstraint",
     "add",
     "adarms_norm",
     "call",
@@ -40,6 +46,8 @@ __all__ = [
     "gelu",
     "ir",
     "kernel",
+    "KernelLaunchSpec",
+    "KernelParamSpec",
     "layer_norm",
     "matmul",
     "multiply",

@@ -62,40 +62,50 @@ CUfunction get_or_load_function(const KernelObj* kernel) {
 
 // CUDAKernelLauncher::Launch
 //
-// Args convention (matches VMCodegenPass kernel output):
-//   args[0..n-1]     : input tensors + output tensor (as ObjectRef VMValues)
-//   args[n..n+2]     : grid_x, grid_y, grid_z (Int VMValues), when grid_fn was set
+// Args convention:
+//   args:         explicit kernel ABI params only.
+//   launch_args:  optional grid_x/y/z, block_x/y/z, shared_memory_bytes.
 //
 // Tensor args are passed as void* pointers to the kernel (device data ptrs).
 // Int args are passed as int64_t by value.
-//
-// If grid dims are not provided in args (< block_dims + 3), falls back to (1,1,1).
 void CUDAKernelLauncher_Launch(
     const KernelObj*       kernel,
     std::vector<VMValue>&  args,
+    const std::vector<int64_t>& launch_args,
     void*                  stream
 ) {
-    // Detect whether grid dims were appended as last 3 Int args.
-    // Heuristic: count how many trailing args are Int (up to 3).
-    uint32_t grid_x = 1, grid_y = 1, grid_z = 1;
-    int tensor_count = static_cast<int>(args.size());
+    uint32_t grid_x = static_cast<uint32_t>(kernel->grid_dims[0]);
+    uint32_t grid_y = static_cast<uint32_t>(kernel->grid_dims[1]);
+    uint32_t grid_z = static_cast<uint32_t>(kernel->grid_dims[2]);
+    uint32_t block_x = static_cast<uint32_t>(kernel->block_dims[0]);
+    uint32_t block_y = static_cast<uint32_t>(kernel->block_dims[1]);
+    uint32_t block_z = static_cast<uint32_t>(kernel->block_dims[2]);
+    uint32_t shared_memory_bytes =
+        static_cast<uint32_t>(kernel->shared_memory_bytes);
 
-    if (args.size() >= 3) {
-        int tail = static_cast<int>(args.size()) - 1;
-        if (args[tail].IsInt() && args[tail-1].IsInt() && args[tail-2].IsInt()) {
-            grid_z = static_cast<uint32_t>(args[tail].AsInt());
-            grid_y = static_cast<uint32_t>(args[tail-1].AsInt());
-            grid_x = static_cast<uint32_t>(args[tail-2].AsInt());
-            tensor_count -= 3;
+    if (!launch_args.empty()) {
+        if (launch_args.size() != 7) {
+            throw std::runtime_error(
+                "CUDAKernelLauncher: launch metadata must have 7 values "
+                "(grid3, block3, shared_memory_bytes)");
         }
+        grid_x = static_cast<uint32_t>(launch_args[0]);
+        grid_y = static_cast<uint32_t>(launch_args[1]);
+        grid_z = static_cast<uint32_t>(launch_args[2]);
+        block_x = static_cast<uint32_t>(launch_args[3]);
+        block_y = static_cast<uint32_t>(launch_args[4]);
+        block_z = static_cast<uint32_t>(launch_args[5]);
+        shared_memory_bytes = static_cast<uint32_t>(launch_args[6]);
     }
 
     // Collect kernel argument pointers.
     // Tensor args → data pointer; Int args → int64_t value.
     std::vector<void*> raw_args;
     std::vector<int64_t> int_storage;  // stable storage for int args
+    int_storage.reserve(args.size());
+    raw_args.reserve(args.size());
 
-    for (int i = 0; i < tensor_count; ++i) {
+    for (int i = 0; i < static_cast<int>(args.size()); ++i) {
         const VMValue& v = args[i];
         if (v.IsObjectRef()) {
             auto* tobj = v.AsObjectAs<TensorObj>();
@@ -104,7 +114,7 @@ void CUDAKernelLauncher_Launch(
                     "CUDAKernelLauncher: expected TensorObj arg at index " +
                     std::to_string(i));
             }
-            raw_args.push_back(tobj->dl().data);
+            raw_args.push_back(tobj->data());
         } else if (v.IsInt()) {
             int_storage.push_back(v.AsInt());
             raw_args.push_back(&int_storage.back());
@@ -124,17 +134,13 @@ void CUDAKernelLauncher_Launch(
     // Load (or retrieve from cache) the CUfunction.
     CUfunction fn = get_or_load_function(kernel);
 
-    uint32_t block_x = static_cast<uint32_t>(kernel->block_dims[0]);
-    uint32_t block_y = static_cast<uint32_t>(kernel->block_dims[1]);
-    uint32_t block_z = static_cast<uint32_t>(kernel->block_dims[2]);
-
     CUstream cu_stream = static_cast<CUstream>(stream);
 
     CU_CHECK(cuLaunchKernel(
         fn,
         grid_x, grid_y, grid_z,
         block_x, block_y, block_z,
-        static_cast<unsigned int>(kernel->smem_bytes),  // sharedMemBytes
+        static_cast<unsigned int>(shared_memory_bytes),
         cu_stream,
         params.empty() ? nullptr : params.data(),
         nullptr      // extra

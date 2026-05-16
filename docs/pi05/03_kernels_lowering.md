@@ -1,182 +1,141 @@
-# Kernel 与 Lowering 设计
+# Kernel 与 Lowering 机制
 
-## 当前状态
+## 当前结论
 
-devproc2 已有：
+标准 op 是唯一高层语义。Triton、CuTeDSL、CUDA C++、预编译 cubin/PTX 都只是同一个标准 op 的 CUDA backend implementation。
 
-- `KernelRegistry`
-- `KernelSpec`
-- `@dp.kernel`
-- `DPSLoweringPass`
-- `TritonAOTCompilePass`
-- C++ `CUDAKernelRegistry` 与 VM `kKernel` dispatch
+因此 kernel lowering 分三层：
 
-当前不足：
+1. `KernelSpec` 描述实现选择、ABI、launch、artifact metadata。
+2. `DPSLoweringPass` 只把标准 op lower 到选中的 `CallDPSOp + KernelRef(spec)`。
+3. runtime 从 `metadata/kernel_table.json` 加载 cubin/symbol/launch，不从 VM CALL 参数尾部猜测 grid。
 
-- kernel selection 只按 `(op_name, device, input_dtypes)` 初筛。
-- `KernelSpec` 缺少 attrs/layout/shape 约束的结构化描述。
-- dynamic grid 和 kernel 参数 ABI 尚未系统化。
-- cubin 与 artifact kernel table 尚未完整贯通。
+## KernelSpec
 
-## KernelSpec 扩展
-
-建议扩展字段：
+`KernelSpec` 是 backend-neutral descriptor：
 
 ```python
-@dataclass(frozen=True)
-class KernelSpec:
-    op_name: str
-    device: str
-    input_dtypes: tuple[str, ...]
-    output_dtype: str | None
-    kernel_name: str
-    backend: str = "triton"
-    sm_arches: tuple[int, ...] = ()
-    priority: int = 0
-    attr_constraints: Mapping[str, AttrConstraint] = field(default_factory=dict)
-    layout_constraints: tuple[str, ...] = ()
-    match: Callable[[CallOp], bool] | None = None
-    grid_fn: Callable[[CallOp], tuple[GridExpr, GridExpr, GridExpr]] | None = None
-    launch_meta: LaunchMeta = LaunchMeta()
+KernelSpec(
+    op_name="matmul",
+    device="cuda",
+    input_dtypes=("float16", "float16"),
+    output_dtype="float16",
+    kernel_name="kernel.matmul_fp16_sm90",
+    backend="cutedsl",          # triton | cutedsl | cuda | python | llvm
+    symbol="matmul_fp16_sm90",
+    sm_arches=(90,),
+    priority=10,
+    attr_constraints={...},
+    layout_constraints=("contiguous", "contiguous"),
+    launch=KernelLaunchSpec(
+        grid=(ceildiv(M, 16), ceildiv(N, 16), 1),
+        block=(256, 1, 1),
+        shared_memory_bytes=0,
+    ),
+    params=(
+        KernelParamSpec("a", "tensor", source="input", index=0),
+        KernelParamSpec("b", "tensor", source="input", index=1),
+        KernelParamSpec("out", "tensor", source="output", index=0),
+    ),
+    compile_options={"num_warps": 8},
+)
 ```
 
-selection 顺序：
+选择顺序固定：
 
-1. op name、device、input dtype 精确匹配。
-2. SM arch 过滤。
-3. attr constraints 过滤。
-4. layout constraints 过滤。
-5. shape/custom predicate 过滤。
-6. priority 选择最高优先级。
+1. `(op_name, device, input_dtypes)` 精确匹配。
+2. `sm_arches` 过滤。
+3. `attr_constraints` 过滤。
+4. `layout_constraints` 过滤。
+5. `match(call_op)` 作为 shape/custom predicate escape hatch。
+6. `priority` 预排序，最高优先。
 
-## DPS lowering
+## Backend Provider
 
-高层：
+backend provider 只负责把 implementation 编译为 artifact：
+
+```python
+provider.compile(spec, kernel_impl, output_dir=..., sm_arch=...)
+```
+
+返回 `KernelCompileResult(kernel_name, backend, symbol, artifact_kind, data, metadata)`。
+
+registry/lowering/runtime 不 import Triton、CuTeDSL 或 CUDA 编译 API。后续新增 backend 只注册 provider，不改标准 op lowering 机制。
+
+## DPS Lowering
+
+高层 IR 保留标准 op：
 
 ```text
-%wt = call @transpose(%w) {dim0=0, dim1=1}
-%y0 = call @matmul(%x, %wt)
-%y = call @add(%y0, %b)
+%y = call @gelu(%x) {approximate="tanh"}
 ```
 
 lower 后：
 
 ```text
-%wt = tensor_create.empty(...)
-call_dps @kernel.transpose_fp16(%w, %wt) {dim0=0, dim1=1}
-%y0 = tensor_create.empty(...)
-call_dps @kernel.matmul_fp16(%x, %wt, %y0)
 %y = tensor_create.empty(...)
-call_dps @kernel.add_fp16(%y0, %b, %y)
+call_dps @kernel.gelu_tanh_sm90(%x, %y) {approximate="tanh"}
 ```
 
 规则：
 
-- 所有 matched tensor-producing `CallOp` lower 为 DPS kernel。
-- attrs 保留到 `CallDPSOp`。
-- output tensor shape/dtype/device 来自 `InferStructInfoPass`。
-- 若 op 输出 tuple，第一阶段优先在 high-level 拆成多个单输出 op，降低 DPS lowering 复杂度。
-- high-level IR 必须保留标准 op。fused linear kernel 只能作为 `transpose + matmul + add` pattern 的 lowering 优化，不能要求前端生成 `linear` op。
+- 只 lower `LoweringKind.kernel` 的 tensor-producing 标准 op。
+- `CallDPSOp.attrs` 保留标准 op attrs。
+- `KernelRef.spec` 保存选中的 `KernelSpec`。
+- tuple-output kernel lowering 暂不展开；当前阶段保持单 tensor output。
 
-## Kernel 参数 ABI
+## Launch ABI
 
-建议 kernel 参数顺序固定：
+kernel 普通 ABI 参数只包含 `KernelParamSpec` 对应的输入、输出、shape/stride/runtime scalar。
 
-1. 所有 input tensors。
-2. 所有 weight tensors。
-3. output tensor。
-4. runtime shape scalars。
-5. attrs 中需要 runtime 传入的 scalar 常量。
+launch 不属于普通参数：
 
-对 Triton kernel，tensor 参数传 raw pointer，shape/stride/size 传 `int64` 或 `int32`。attrs 如果能作为 constexpr 编译进 cubin，则不进入 runtime 参数；否则进入参数列表。
+- 静态 launch 写入 `metadata/kernel_table.json`。
+- 动态 launch 在 `VMCodegenPass` 中 materialize 为 `Instruction.launch_regs`。
+- C++ launcher 接收独立的 `launch_args = grid3 + block3 + shared_memory_bytes`。
+- 不再使用“最后三个 int 是 grid”的旧约定。
 
-metadata 需要记录：
+## Artifact
+
+`metadata/kernel_table.json` 是 runtime kernel metadata 的事实来源：
 
 ```json
 {
-  "name": "kernel.matmul_fp16",
-  "op": "matmul",
-  "cubin": "kernels/kernel.matmul_fp16.sm90.cubin",
-  "symbol": "matmul_fp16",
-  "grid": ["ceildiv(M*N, BLOCK_MN)", 1, 1],
-  "block": [256, 1, 1],
-  "shared_memory_bytes": 0,
+  "name": "kernel.relu_fp16",
+  "kind": "kernel",
+  "backend": "cuda",
+  "op": "relu",
+  "cubin": "kernels/relu_fp16.cubin",
+  "symbol": "relu_fp16",
+  "launch": {
+    "grid": [128, 1, 1],
+    "block": [256, 1, 1],
+    "shared_memory_bytes": 0,
+    "cluster": [1, 1, 1],
+    "cooperative": false
+  },
   "params": [
-    {"name": "x", "kind": "tensor"},
-    {"name": "weight", "kind": "tensor"},
-    {"name": "bias", "kind": "tensor_optional"},
-    {"name": "out", "kind": "tensor"},
-    {"name": "M", "kind": "i64"},
-    {"name": "N", "kind": "i64"},
-    {"name": "K", "kind": "i64"}
+    {"name": "x", "kind": "tensor", "source": "input", "index": 0},
+    {"name": "out", "kind": "tensor", "source": "output", "index": 0}
   ]
 }
 ```
 
+C++ `Executable::Load()` 读取 kernel table，加载 cubin，并注册到 `CUDAKernelRegistry`。缺失 cubin、symbol 或非法 launch 字段必须报出包含 kernel name 和字段名的错误。
+
 ## 首批 kernel 顺序
 
-### 阶段 A：基础 activation 与 elementwise
+1. elementwise：`add`、`mul`、`silu`、`gelu_tanh`、`where`、`mask_fill`。
+2. dense/norm：`matmul_fp16`、`embedding`、`layer_norm`、`rms_norm`、`adarms_norm`。
+3. movement：metadata-only `reshape/view`，必要 `permute_dims`、`cat`、`slice/gather`。
+4. attention：先 correctness-first 标准 op 序列，再在 lowering 中做 pattern fusion。
 
-- `add`
-- `mul`
-- `silu`
-- `gelu_tanh`
-- `where`
-- `mask_fill`
-
-这些 kernel 简单，适合先打通 attrs、grid、artifact、C++ dispatch。
-
-### 阶段 B：dense 和 norm
-
-- `matmul_fp16`
-- `embedding`
-- `layer_norm`
-- `rms_norm`
-- `adarms_norm`
-
-PyTorch `Linear` 前端展开为 `matmul + add`。kernel 层可以先使用通用 matmul/add kernel，后续通过 pattern fusion 选择 shape-specialized fused kernel。
-
-### 阶段 C：shape/movement
-
-- `reshape/view` 尽量 metadata-only，不生成 kernel。
-- `transpose/permute` 先支持必要模式。
-- `cat` 支持 prefix/suffix 拼接。
-- `slice/gather` 支持取 action horizon、token embedding。
-
-### 阶段 D：attention
-
-先实现 correctness-first：
-
-- q/k/v projection 使用 `matmul + add`。
-- rope 单独 kernel。
-- attention 路径先按 `matmul + mask + softmax + matmul` 的标准 op 序列分别 lower；后续可在 lowering 阶段识别该 pattern 并选择 fused kernel。
-- 后续再融合成 FlashAttention-like kernel。
-
-## Triton AOT 编译
-
-编译流程：
-
-1. `KernelSelectPass` 收集所有被选中的 `KernelSpec`。
-2. `EmitKernelsPass` 对每个 spec 调用 `TritonAOTCompilePass`。
-3. cubin 写入 `artifact/kernels/`。
-4. `metadata/kernel_table.json` 记录 cubin、symbol、launch config、参数 ABI。
-5. C++ load artifact 时读取 kernel table，将 cubin 注册到 `CUDAKernelRegistry`。
-
-## shape-specialization 策略
-
-openpi0.5 首版固定：
-
-- batch size 1
-- image size 224
-- action horizon 和 action dim 来自 Pi0Config
-- `num_steps=10`
-
-因此首版允许对常见 shape 编译 specialized kernels。动态 shape 支持后续扩展，但 metadata 仍要记录 symbol 与 shape constraints，避免错误复用 cubin。
+PyTorch `Linear` 前端继续展开为 `matmul + add`；fused linear 只能作为 lowering/pattern selection 优化，不能要求前端生成 `linear` op。
 
 ## 测试策略
 
-- registry attr/layout/shape selection 单测。
-- DPS lowering 后 attrs 和 kernel name 正确。
-- mocked Triton compile 写入 cubin 和 kernel table。
-- C++ runtime 可加载 kernel table，并在缺失 cubin/symbol 时给出明确错误。
-- 每个 kernel 与 PyTorch/numpy reference 单独对齐。
+- registry：SM、attrs、layout、priority、custom predicate。
+- lowering：attrs 保留，`KernelRef.spec` 正确。
+- VM codegen：launch_regs 与 arg_regs 分离，动态 `PrimExpr` launch 可 materialize。
+- artifact：kernel table 输出 backend、symbol、launch、params、cubin。
+- runtime：artifact load 注册 kernel，launcher 不解析普通参数尾部。

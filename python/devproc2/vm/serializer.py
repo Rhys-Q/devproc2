@@ -12,7 +12,7 @@ from .executable import (
 )
 
 _MAGIC = b"DV2E"
-_VERSION = 1
+_VERSION = 2
 
 _TAG_NULL  = 0
 _TAG_INT   = 1
@@ -47,6 +47,9 @@ def serialize(exe: Executable) -> bytes:
             len(instr.arg_regs),
         )
         for r in instr.arg_regs:
+            buf += struct.pack("<i", r)
+        buf += struct.pack("<I", len(instr.launch_regs))
+        for r in instr.launch_regs:
             buf += struct.pack("<i", r)
 
     for c in exe.constants:
@@ -101,6 +104,8 @@ def deserialize(data: bytes) -> Executable:
     for _ in range(num_instrs):
         (op, dst, fidx, src, cond, to, fo, off, nargs) = read("<BiiiiiiiI")
         arg_regs = list(read(f"<{nargs}i")) if nargs else []
+        (nlaunch,) = read("<I")
+        launch_regs = list(read(f"<{nlaunch}i")) if nlaunch else []
         instructions.append(Instruction(
             opcode=Opcode(op),
             dst_reg=dst, func_idx=fidx,
@@ -108,6 +113,7 @@ def deserialize(data: bytes) -> Executable:
             cond_reg=cond, true_offset=to, false_offset=fo,
             offset=off,
             arg_regs=arg_regs,
+            launch_regs=launch_regs,
         ))
 
     constants = []

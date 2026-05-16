@@ -8,20 +8,18 @@ void CUDAKernelRegistry::Register(
     const std::string&          name,
     const std::vector<uint8_t>& cubin_data,
     const std::string&          func_name,
+    std::array<int32_t, 3>      grid_dims,
     std::array<int32_t, 3>      block_dims,
-    int32_t                     smem_bytes,
-    int32_t                     num_warps,
-    int32_t                     num_stages
+    int32_t                     shared_memory_bytes
 ) {
     std::lock_guard<std::mutex> lock(mu_);
     auto obj = std::make_unique<KernelObj>();
     obj->name       = name;
     obj->func_name  = func_name;
     obj->cubin_data = cubin_data;
+    obj->grid_dims  = grid_dims;
     obj->block_dims = block_dims;
-    obj->smem_bytes = smem_bytes;
-    obj->num_warps  = num_warps;
-    obj->num_stages = num_stages;
+    obj->shared_memory_bytes = shared_memory_bytes;
     kernels_[name]  = std::move(obj);
 }
 

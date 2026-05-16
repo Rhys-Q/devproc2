@@ -6,10 +6,15 @@
 // Forward declaration for CUDAKernelLauncher_Launch (defined in cuda_kernel.cc)
 namespace devproc2 {
     class KernelObj;
-    void CUDAKernelLauncher_Launch(const KernelObj*, std::vector<VMValue>&, void*);
+    void CUDAKernelLauncher_Launch(
+        const KernelObj*,
+        std::vector<VMValue>&,
+        const std::vector<int64_t>&,
+        void*);
 }
 #endif
 #include <nlohmann/json.hpp>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -53,7 +58,7 @@ struct ByteReader {
 };
 
 static constexpr uint8_t _MAGIC[4] = {'D', 'V', '2', 'E'};
-static constexpr uint32_t _VERSION  = 1;
+static constexpr uint32_t _VERSION  = 2;
 static constexpr uint8_t _TAG_NULL  = 0;
 static constexpr uint8_t _TAG_INT   = 1;
 static constexpr uint8_t _TAG_FLOAT = 2;
@@ -79,6 +84,92 @@ static std::vector<uint8_t> read_file_binary(const std::string& path) {
     f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(size));
     return buf;
 }
+
+static bool file_exists(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return f.good();
+}
+
+#ifdef DEVPROC2_WITH_CUDA
+static std::string artifact_path_join(
+    const std::string& artifact_dir,
+    const std::string& rel
+) {
+    if (!rel.empty() && rel[0] == '/') return rel;
+    return artifact_dir + "/" + rel;
+}
+
+static std::string require_string_field(
+    const nlohmann::json& obj,
+    const std::string& field,
+    const std::string& kernel_name
+) {
+    if (!obj.contains(field) || !obj[field].is_string()) {
+        throw std::runtime_error(
+            "kernel_table entry for '" + kernel_name
+            + "' missing string field '" + field + "'");
+    }
+    return obj[field].get<std::string>();
+}
+
+static std::array<int32_t, 3> read_i32_triple(
+    const nlohmann::json& obj,
+    const std::string& field,
+    std::array<int32_t, 3> defaults,
+    bool allow_dynamic
+) {
+    if (!obj.contains(field)) return defaults;
+    const auto& arr = obj[field];
+    if (!arr.is_array() || arr.size() != 3) {
+        throw std::runtime_error("kernel_table field '" + field + "' must be a 3-element array");
+    }
+    std::array<int32_t, 3> out = defaults;
+    for (size_t i = 0; i < 3; ++i) {
+        if (arr[i].is_number_integer()) {
+            out[i] = arr[i].get<int32_t>();
+        } else if (!allow_dynamic) {
+            throw std::runtime_error(
+                "kernel_table field '" + field + "' must contain integer values");
+        }
+    }
+    return out;
+}
+
+static void load_kernel_table_into_cuda_registry(const std::string& artifact_dir) {
+    std::string path = artifact_dir + "/metadata/kernel_table.json";
+    if (!file_exists(path)) return;
+
+    auto table = nlohmann::json::parse(read_file_text(path));
+    if (!table.is_array()) {
+        throw std::runtime_error("metadata/kernel_table.json must be an array");
+    }
+
+    for (const auto& entry : table) {
+        if (!entry.is_object()) {
+            throw std::runtime_error("kernel_table entries must be objects");
+        }
+        std::string name = require_string_field(entry, "name", "<unknown>");
+        std::string cubin = require_string_field(entry, "cubin", name);
+        std::string symbol = require_string_field(entry, "symbol", name);
+        std::string cubin_path = artifact_path_join(artifact_dir, cubin);
+        if (!file_exists(cubin_path)) {
+            throw std::runtime_error(
+                "Kernel '" + name + "' cubin not found: " + cubin_path);
+        }
+
+        const nlohmann::json& launch =
+            entry.contains("launch") && entry["launch"].is_object()
+                ? entry["launch"]
+                : entry;
+        auto grid = read_i32_triple(launch, "grid", {1, 1, 1}, /*allow_dynamic=*/true);
+        auto block = read_i32_triple(launch, "block", {256, 1, 1}, /*allow_dynamic=*/false);
+        int32_t smem = launch.value("shared_memory_bytes", 0);
+
+        CUDAKernelRegistry::Global().Register(
+            name, read_file_binary(cubin_path), symbol, grid, block, smem);
+    }
+}
+#endif
 
 }  // namespace
 
@@ -138,6 +229,10 @@ std::shared_ptr<Executable> Executable::Deserialize(const uint8_t* data, size_t 
         ins.arg_regs.resize(nargs);
         for (uint32_t j = 0; j < nargs; ++j)
             ins.arg_regs[j] = r.read<int32_t>();
+        uint32_t nlaunch = r.read<uint32_t>();
+        ins.launch_regs.resize(nlaunch);
+        for (uint32_t j = 0; j < nlaunch; ++j)
+            ins.launch_regs[j] = r.read<int32_t>();
     }
 
     // Constants: each is 1 tag byte + 8 value bytes
@@ -206,6 +301,19 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
                 "PackedFunc '" + fn + "' is required but not registered.");
         }
     }
+
+#ifdef DEVPROC2_WITH_CUDA
+    load_kernel_table_into_cuda_registry(artifact_dir);
+#else
+    std::string kernel_table_path = artifact_dir + "/metadata/kernel_table.json";
+    if (file_exists(kernel_table_path)) {
+        auto table = nlohmann::json::parse(read_file_text(kernel_table_path));
+        if (table.is_array() && !table.empty()) {
+            throw std::runtime_error(
+                "Artifact contains CUDA kernels but runtime was built without DEVPROC2_WITH_CUDA");
+        }
+    }
+#endif
 
     return exe;
 }
@@ -277,6 +385,12 @@ VMValue VMState::ExecuteLoop() {
             for (int32_t r : instr.arg_regs) {
                 call_args.push_back(regs_[static_cast<size_t>(frame.reg_base + r)]);
             }
+            std::vector<int64_t> launch_args;
+            launch_args.reserve(instr.launch_regs.size());
+            for (int32_t r : instr.launch_regs) {
+                launch_args.push_back(
+                    regs_[static_cast<size_t>(frame.reg_base + r)].AsInt());
+            }
 
             if (callee.kind == VMCalleeKind::kVMFunc) {
                 // Advance pc before pushing new frame (caller resumes at pc+1)
@@ -285,7 +399,7 @@ VMValue VMState::ExecuteLoop() {
                           instr.dst_reg, frame.reg_base);
                 continue;  // no extra ++pc
             } else {
-                VMValue result = DispatchExternal(callee, call_args);
+                VMValue result = DispatchExternal(callee, call_args, launch_args);
                 if (instr.dst_reg >= 0) {
                     regs_[static_cast<size_t>(frame.reg_base + instr.dst_reg)] =
                         std::move(result);
@@ -336,8 +450,11 @@ VMValue VMState::ExecuteLoop() {
     return VMValue{};
 }
 
-VMValue VMState::DispatchExternal(const FunctionEntry& callee,
-                                  std::vector<VMValue>& args) {
+VMValue VMState::DispatchExternal(
+    const FunctionEntry& callee,
+    std::vector<VMValue>& args,
+    const std::vector<int64_t>& launch_args
+) {
     switch (callee.kind) {
     case VMCalleeKind::kBuiltin: {
         auto fn = BuiltinRegistry::Global().Get(callee.name);
@@ -368,7 +485,7 @@ VMValue VMState::DispatchExternal(const FunctionEntry& callee,
         }
         Device cuda_dev{kDLCUDA, 0};
         void* stream = GetDefaultStream(cuda_dev);
-        CUDAKernelLauncher_Launch(k, args, stream);
+        CUDAKernelLauncher_Launch(k, args, launch_args, stream);
         return VMValue{};
 #else
         throw std::runtime_error(

@@ -65,8 +65,8 @@ static std::vector<uint8_t> make_minimal_vm_bytes() {
     std::vector<uint8_t> buf;
     // Magic
     buf.insert(buf.end(), {'D', 'V', '2', 'E'});
-    // version=1, num_funcs=0, num_instrs=0 (3 x uint32 LE)
-    uint32_t v[4] = {1, 0, 0, 0};  // version, funcs, instrs, consts
+    // version=2, num_funcs=0, num_instrs=0 (3 x uint32 LE)
+    uint32_t v[4] = {2, 0, 0, 0};  // version, funcs, instrs, consts
     for (uint32_t x : v) {
         buf.push_back(x & 0xFF);
         buf.push_back((x >> 8) & 0xFF);

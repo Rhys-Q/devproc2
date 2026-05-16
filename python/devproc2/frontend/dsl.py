@@ -36,7 +36,12 @@ from devproc2.ir.ops import (
 from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
 from devproc2.compiler.op import get_op
 from devproc2.frontend.scope import ScopeStack
-from devproc2.kernel.registry import KernelRegistry, KernelSpec
+from devproc2.kernel.registry import (
+    KernelLaunchSpec,
+    KernelParamSpec,
+    KernelRegistry,
+    KernelSpec,
+)
 
 
 class DSLError(Exception):
@@ -117,10 +122,26 @@ def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque")
     pass
 
 
-def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
-           dtype: str = "", dtypes: list = None, grid=None, sm_arches=(),
-           num_warps: int = 4, num_stages: int = 3, block_size: int = 256,
-           smem_bytes: int = 0, launch_kwargs: dict = None):
+def kernel(
+    *,
+    op: str,
+    backend: str,
+    device: str = "cuda",
+    dtype: str = "",
+    dtypes: list | tuple | None = None,
+    output_dtype: str | None = None,
+    symbol: str | None = None,
+    sm_arches=(),
+    priority: int = 0,
+    attr_constraints=None,
+    layout_constraints=(),
+    shape_constraints=(),
+    launch: KernelLaunchSpec | None = None,
+    params: tuple[KernelParamSpec, ...] = (),
+    cubin_path: str | None = None,
+    ptx_path: str | None = None,
+    compile_options: dict | None = None,
+):
     """Decorator to register a kernel implementation.
 
     Parameters
@@ -129,8 +150,7 @@ def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
         High-level operator name (e.g. "relu", "matmul").  Matched against
         ``dp.ops.relu(x)`` → ``CallOp(StandardOpRef("relu"))`` during DPS lowering.
     backend : str
-        Compiler backend: "triton" | "cuda_c" | "python" | "llvm".
-        Determines how the kernel function is AOT-compiled.
+        Compiler backend: "triton" | "cutedsl" | "cuda" | "python" | "llvm".
     device : str
         Target device: "cuda", "cpu", etc.
     dtype : str
@@ -140,34 +160,30 @@ def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
     dtypes : list[str]
         Explicit per-input dtype list for multi-input kernels (e.g. matmul
         needs ``["float16", "float16"]``).  Takes precedence over ``dtype``.
-    grid : callable
-        Returns ``(grid_x, grid_y, grid_z)``.  Called at codegen time.
-        When all input shapes are static (known at compile time), receives
-        ``shapes: list[tuple[int,...]]`` — one tuple per input tensor.
-        Falls back to no-arg call for dynamic shapes or backward compat.
-        Example: ``grid=lambda shapes: (shapes[0][0] // 256 + 1, 1, 1)``
+    launch : KernelLaunchSpec
+        Explicit runtime launch metadata. Dynamic entries can use PrimExpr.
     sm_arches : tuple[int]
         Supported SM compute capabilities, e.g. ``(80, 90)``.  Empty = any SM.
-    num_warps : int
-        Warps per thread block (block_threads / 32).
-    num_stages : int
-        Triton software pipeline depth.
-    block_size : int
-        Tiling size (BLOCK_SIZE constexpr).
-    smem_bytes : int
-        Dynamic shared memory bytes for cuLaunchKernel.
-    launch_kwargs : dict
-        Extra kwargs forwarded to the backend compiler (e.g. triton.compile).
+    params : tuple[KernelParamSpec, ...]
+        Explicit kernel ABI parameters. Empty means artifact emission derives
+        a conservative inputs+outputs tensor ABI from the selected CallDPSOp.
+    compile_options : dict
+        Backend-specific compile options for the provider.
 
     Example::
 
-        @dp.kernel(op="relu", backend="triton", device="cuda", dtype="float16",
-                   grid=lambda: (128, 1, 1))
+        @dp.kernel(
+            op="relu",
+            backend="triton",
+            device="cuda",
+            dtype="float16",
+            launch=KernelLaunchSpec(grid=(128, 1, 1), block=(256, 1, 1)),
+        )
         def relu_kernel(x, out):
             ...  # Triton kernel body
 
-        @dp.kernel(op="matmul", backend="triton", device="cuda",
-                   dtypes=["float16", "float16"], grid=lambda: (32, 32, 1))
+        @dp.kernel(op="matmul", backend="cutedsl", device="cuda",
+                   dtypes=["float16", "float16"])
         def matmul_kernel(a, b, out):
             ...
     """
@@ -188,13 +204,18 @@ def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
             input_dtypes=resolved_dtypes,
             kernel_name=f"kernel.{fn.__name__}",
             backend=backend,
+            output_dtype=output_dtype,
+            symbol=symbol,
             sm_arches=sm_arches,
-            grid_fn=grid,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            block_size=block_size,
-            smem_bytes=smem_bytes,
-            launch_kwargs=launch_kwargs or {},
+            priority=priority,
+            attr_constraints=attr_constraints or {},
+            layout_constraints=tuple(layout_constraints),
+            shape_constraints=tuple(shape_constraints),
+            launch=launch or KernelLaunchSpec(),
+            params=tuple(params),
+            cubin_path=cubin_path,
+            ptx_path=ptx_path,
+            compile_options=compile_options or {},
         )
         _kernel_registry.register(spec)
         fn._kernel_spec = spec

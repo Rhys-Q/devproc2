@@ -17,6 +17,9 @@ from devproc2.ir.nodes import (
 from devproc2.ir.prim_expr import (
     Add, CeilDiv, FloorDiv, IntImm, Max, Min, Mul, PrimVar, Sub,
 )
+from devproc2.ir.op_ref import KernelRef
+from devproc2.ir.ops import CallDPSOp, ForOp, IfOp
+from devproc2.kernel.registry import derive_kernel_params
 from devproc2.vm.executable import CalleeKind, Executable
 
 _ABI_VERSION = "0.1"
@@ -134,11 +137,7 @@ class EmitABIPass:
         meta = os.path.join(output_dir, "metadata")
         function_table = [_function_entry_to_dict(fe) for fe in exe.function_table]
         self._write_json(meta, "function_table.json", function_table)
-        self._write_json(meta, "kernel_table.json", [
-            _function_entry_to_dict(fe)
-            for fe in exe.function_table
-            if fe.kind == CalleeKind.kernel
-        ])
+        self._write_json(meta, "kernel_table.json", self._extract_kernel_table(module, exe))
         self._write_json(meta, "packed_func_table.json", [
             _function_entry_to_dict(fe)
             for fe in exe.function_table
@@ -195,6 +194,48 @@ class EmitABIPass:
             for fe in exe.function_table
             if fe.kind == CalleeKind.packed_func
         ]
+
+    def _extract_kernel_table(self, module: IRModule, exe: Executable) -> list[dict[str, Any]]:
+        specs = dict(getattr(exe, "kernel_specs", {}))
+        for fn in module.functions.values():
+            for op in self._walk_ops(fn.body):
+                if isinstance(op, CallDPSOp) and isinstance(op.target_ref, KernelRef):
+                    spec = op.target_ref.spec
+                    if spec is not None:
+                        if not spec.params:
+                            spec = spec.with_params(derive_kernel_params(op.inputs, op.outputs))
+                        specs[op.target_ref.name] = spec
+
+        entries = []
+        for fe in exe.function_table:
+            if fe.kind != CalleeKind.kernel:
+                continue
+            spec = specs.get(fe.name)
+            if spec is None:
+                # A hand-written KernelRef without a KernelSpec has no runtime
+                # artifact metadata. Keep the function table entry authoritative
+                # and omit it from the artifact kernel table.
+                continue
+            entry = spec.to_json_obj()
+            entry.update({
+                "instr_offset": fe.instr_offset,
+                "instr_count": fe.instr_count,
+                "num_regs": fe.num_regs,
+                "num_args": fe.num_args,
+            })
+            entries.append(entry)
+        return entries
+
+    def _walk_ops(self, region):
+        for block in region.blocks:
+            for op in block.ops:
+                yield op
+                if isinstance(op, IfOp):
+                    yield from self._walk_ops(op.then_region)
+                    if op.else_region is not None:
+                        yield from self._walk_ops(op.else_region)
+                elif isinstance(op, ForOp):
+                    yield from self._walk_ops(op.body_region)
 
     def _storage_plan_to_json(self, plan) -> list[dict[str, Any]]:
         result = []
