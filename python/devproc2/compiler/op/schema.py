@@ -1,9 +1,8 @@
 """Standard op schema objects.
 
-The op registry is the single source of truth for standard tensor ops.  IR
-calls reference an op by callee name, while this module describes the stable
-schema, attr normalization, inference, validation, and high-level lowering
-metadata associated with that callee.
+The op registry is the single source of truth for standard tensor ops. IR
+calls reference an op through StandardOpRef, while this module describes the
+stable schema, attr normalization, inference, validation, and lowering policy.
 """
 from __future__ import annotations
 
@@ -12,7 +11,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from devproc2.ir.nodes import StructInfo, TensorStructInfo
+from devproc2.ir.attrs import AttrDict, AttrType, wrap_attr_value
+from devproc2.ir.nodes import DialectKind
+from devproc2.ir.nodes import StructInfo
 
 
 @dataclass(frozen=True)
@@ -25,9 +26,17 @@ class Input:
 @dataclass(frozen=True)
 class Attr:
     name: str
-    type_name: str
+    type: AttrType
     default: object = None
     required: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.type, str):
+            object.__setattr__(self, "type", AttrType.parse(self.type))
+
+    @property
+    def type_name(self) -> str:
+        return self.type.describe()
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,28 @@ class LoweringKind(Enum):
 
 
 @dataclass(frozen=True)
+class LoweringPolicy:
+    kind: LoweringKind
+    target: str | None = None
+
+    @staticmethod
+    def none() -> "LoweringPolicy":
+        return LoweringPolicy(LoweringKind.none)
+
+    @staticmethod
+    def kernel() -> "LoweringPolicy":
+        return LoweringPolicy(LoweringKind.kernel)
+
+    @staticmethod
+    def builtin(target: str | None = None) -> "LoweringPolicy":
+        return LoweringPolicy(LoweringKind.builtin, target)
+
+    @staticmethod
+    def external(target: str | None = None) -> "LoweringPolicy":
+        return LoweringPolicy(LoweringKind.external, target)
+
+
+@dataclass(frozen=True)
 class InferContext:
     args: tuple[Optional[StructInfo], ...]
     attrs: Mapping[str, object]
@@ -82,7 +113,7 @@ class CallLike:
     layer, which would create an unnecessary dependency cycle.
     """
 
-    callee: str
+    name: str
     args: tuple[object, ...]
     attrs: Mapping[str, object]
 
@@ -98,19 +129,19 @@ class OpDef:
     validate: Optional[ValidateFn] = None
     purity: PurityKind = PurityKind.pure
     pattern: OpPatternKind = OpPatternKind.opaque
-    lowering_kind: LoweringKind = LoweringKind.kernel
-
-    @property
-    def callee(self) -> str:
-        return f"@{self.name}"
+    dialect: DialectKind = DialectKind.tensor
+    lowering: LoweringPolicy = LoweringPolicy.kernel()
 
     def normalize_attrs(
         self,
         attrs: Optional[Mapping[str, object]] = None,
         *,
         include_defaults: bool = True,
-    ) -> dict[str, object]:
-        provided = dict(attrs or {})
+    ) -> AttrDict:
+        if isinstance(attrs, AttrDict):
+            provided = attrs.to_python_dict()
+        else:
+            provided = dict(attrs or {})
         declared = {attr.name: attr for attr in self.attrs}
         unknown = set(provided) - set(declared)
         if unknown:
@@ -124,7 +155,7 @@ class OpDef:
                 raise ValueError(f"{self.name}: missing required attr {attr.name!r}")
             elif include_defaults:
                 normalized[attr.name] = _normalize_attr_value(self.name, attr, attr.default)
-        return normalized
+        return AttrDict(normalized)
 
     def validate_call(
         self,
@@ -132,16 +163,16 @@ class OpDef:
         attrs: Optional[Mapping[str, object]] = None,
     ) -> None:
         self._validate_num_inputs(args)
-        self.normalize_attrs(attrs, include_defaults=True)
+        normalized = self.normalize_attrs(attrs, include_defaults=True)
         if self.validate is not None:
-            self.validate(_SimpleCall(self.callee, args, attrs or {}))
+            self.validate(_SimpleCall(self.name, args, normalized.to_python_dict()))
 
     def infer_struct_info(
         self,
         args: tuple[Optional[StructInfo], ...],
         attrs: Optional[Mapping[str, object]] = None,
     ) -> Optional[StructInfo]:
-        return self.infer(InferContext(args, self.normalize_attrs(attrs)))
+        return self.infer(InferContext(args, self.normalize_attrs(attrs).to_python_dict()))
 
     def _validate_num_inputs(self, args: tuple[object, ...]) -> None:
         min_inputs = sum(1 for inp in self.inputs if not inp.optional)
@@ -162,73 +193,19 @@ OutputDef = Output
 
 @dataclass(frozen=True)
 class _SimpleCall(CallLike):
-    callee: str
+    name: str
     args: tuple[object, ...]
     attrs: Mapping[str, object]
 
 
-def _normalize_attr_value(op_name: str, attr: Attr, value: object) -> object:
-    type_name = attr.type_name.strip()
-    if " | " in type_name:
-        errors = []
-        for part in type_name.split("|"):
-            candidate = Attr(attr.name, part.strip(), attr.default, attr.required)
-            try:
-                return _normalize_attr_value(op_name, candidate, value)
-            except TypeError as err:
-                errors.append(str(err))
+def _normalize_attr_value(op_name: str, attr: Attr, value: object):
+    try:
+        return wrap_attr_value(value, attr.type)
+    except TypeError as err:
         raise TypeError(
             f"{op_name}: attr {attr.name!r} expects {attr.type_name}, "
             f"got {type(value).__name__}"
-        )
-    if type_name.startswith("optional[") and type_name.endswith("]"):
-        if value is None:
-            return None
-        candidate = Attr(attr.name, type_name[len("optional["):-1], attr.default, attr.required)
-        return _normalize_attr_value(op_name, candidate, value)
-    if type_name == "float" and isinstance(value, int) and not isinstance(value, bool):
-        return float(value)
-    if _matches_type(type_name, value):
-        if type_name == "array[int]" and isinstance(value, list):
-            return tuple(value)
-        if type_name == "array[str]" and isinstance(value, list):
-            return tuple(value)
-        return value
-    raise TypeError(
-        f"{op_name}: attr {attr.name!r} expects {attr.type_name}, "
-        f"got {type(value).__name__}"
-    )
-
-
-def _matches_type(type_name: str, value: object) -> bool:
-    if " | " in type_name:
-        return any(_matches_type(part.strip(), value) for part in type_name.split("|"))
-    if type_name.startswith("optional[") and type_name.endswith("]"):
-        return value is None or _matches_type(type_name[len("optional["):-1], value)
-    if type_name in ("None", "none"):
-        return value is None
-    if type_name in ("int", "Integer"):
-        return isinstance(value, int) and not isinstance(value, bool)
-    if type_name == "float":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if type_name == "bool":
-        return isinstance(value, bool)
-    if type_name in ("str", "string", "dtype"):
-        return isinstance(value, str)
-    if type_name == "shape":
-        return isinstance(value, tuple)
-    if type_name == "array[int]":
-        return isinstance(value, (tuple, list)) and all(
-            isinstance(item, int) and not isinstance(item, bool)
-            for item in value
-        )
-    if type_name == "array[str]":
-        return isinstance(value, (tuple, list)) and all(isinstance(item, str) for item in value)
-    if type_name == "tensor":
-        return isinstance(value, TensorStructInfo)
-    if type_name == "object":
-        return True
-    return True
+        ) from err
 
 
 __all__ = [
@@ -240,6 +217,7 @@ __all__ = [
     "Input",
     "InputDef",
     "LoweringKind",
+    "LoweringPolicy",
     "NormalizeFn",
     "OpDef",
     "OpPatternKind",

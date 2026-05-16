@@ -3,16 +3,16 @@ from __future__ import annotations
 
 from devproc2.compiler.op.emit import emit
 from devproc2.compiler.op.registry import register_op
-from devproc2.compiler.op.schema import Attr, Input, OpPatternKind
+from devproc2.compiler.op.schema import Attr, AttrType, Input, OpPatternKind
 
 
 @register_op(
     inputs=(Input("x"), Input("weight"), Input("bias")),
     attrs=(
-        Attr("axes", "array[int]", default=(-1,)),
-        Attr("epsilon", "float", default=1e-6),
-        Attr("center", "bool", default=True),
-        Attr("scale", "bool", default=True),
+        Attr("axes", AttrType.array(AttrType.int()), default=(-1,)),
+        Attr("epsilon", AttrType.float(), default=1e-6),
+        Attr("center", AttrType.bool(), default=True),
+        Attr("scale", AttrType.bool(), default=True),
     ),
     pattern=OpPatternKind.injective,
 )
@@ -47,8 +47,8 @@ def layer_norm(
 @register_op(
     inputs=(Input("x"), Input("weight")),
     attrs=(
-        Attr("axes", "array[int]", default=(-1,)),
-        Attr("epsilon", "float", default=1e-6),
+        Attr("axes", AttrType.array(AttrType.int()), default=(-1,)),
+        Attr("epsilon", AttrType.float(), default=1e-6),
     ),
     pattern=OpPatternKind.injective,
 )
@@ -61,8 +61,8 @@ def rms_norm(x, weight, axes=(-1,), epsilon: float = 1e-6, *, eps: float | None 
 @register_op(
     inputs=(Input("x"), Input("weight"), Input("cond")),
     attrs=(
-        Attr("axes", "array[int]", default=(-1,)),
-        Attr("epsilon", "float", default=1e-6),
+        Attr("axes", AttrType.array(AttrType.int()), default=(-1,)),
+        Attr("epsilon", AttrType.float(), default=1e-6),
     ),
     pattern=OpPatternKind.injective,
 )

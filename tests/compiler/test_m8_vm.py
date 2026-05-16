@@ -11,9 +11,10 @@ from devproc2.compiler.passes.vm_codegen import VMCodegenPass
 from devproc2.ir import (
     Block,
     Constant,
+    EffectSummary,
     Function,
     IRModule,
-    OpaqueEffect,
+    KernelRef,
     Region,
     ReturnOp,
     TensorStructInfo,
@@ -24,7 +25,6 @@ from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
     CallDPSOp,
-    CalleeKind as IRCalleeKind,
     ForOp,
     IfOp,
     IterArg,
@@ -110,11 +110,10 @@ def _build_calldps_fn() -> IRModule:
     t_op = AllocTensorOp(result_name="t0", storage=s_op.results[0],
                          offset=0, shape=(IntImm(512),), dtype="float16")
     call_op = CallDPSOp(
-        callee="kernel.relu_fp16",
-        callee_kind=IRCalleeKind.kernel,
+        target_ref=KernelRef("kernel.relu_fp16"),
         inputs=(x,),
-        output=t_op.results[0],
-        effect=OpaqueEffect(),
+        outputs=(t_op.results[0],),
+        effect=EffectSummary.opaque_call(),
     )
     ret_op = ReturnOp(values=(t_op.results[0],))
     block = Block(args=(x,), ops=(s_op, t_op, call_op, ret_op))

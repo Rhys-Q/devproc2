@@ -124,7 +124,7 @@ def test_top_level_layer_norm_accepts_parameters_and_kwargs():
         if isinstance(op, CallOp)
     )
 
-    assert op.callee == "@layer_norm"
+    assert op.op_ref.name == "layer_norm"
     assert op.attrs == {
         "axes": (-1,),
         "center": True,
@@ -165,17 +165,17 @@ def test_basic_modules_emit_expected_attrs_and_paths():
         for op in module.functions["forward"].body.entry_block.ops
         if isinstance(op, CallOp)
     ]
-    assert ops[0].callee == "@embedding"
+    assert ops[0].op_ref.name == "embedding"
     assert ops[0].attrs == {"padding_idx": 0}
-    assert ops[1].callee == "@multiply"
-    assert ops[2].callee == "@layer_norm"
+    assert ops[1].op_ref.name == "multiply"
+    assert ops[2].op_ref.name == "layer_norm"
     assert ops[2].attrs == {
         "axes": (-1,),
         "center": True,
         "epsilon": 1e-5,
         "scale": True,
     }
-    assert ops[3].callee == "@adarms_norm"
+    assert ops[3].op_ref.name == "adarms_norm"
     assert ops[3].attrs == {"axes": (-1,), "epsilon": 1e-6}
 
     assert [p.name for p in module.functions["forward"].params] == [
@@ -209,20 +209,20 @@ def test_non_elementwise_nn_ops_stamp_correct_struct_info():
         if isinstance(op, CallOp)
     ]
 
-    assert ops[0].callee == "@embedding"
+    assert ops[0].op_ref.name == "embedding"
     assert ops[0].results[0].struct_info == TensorStructInfo(
         (IntImm(2), IntImm(3), IntImm(4)),
         "float16",
         "cuda",
     )
-    assert ops[1].callee == "@permute_dims"
+    assert ops[1].op_ref.name == "permute_dims"
     assert ops[1].attrs == {"axes": (1, 0)}
     assert ops[1].results[0].struct_info == TensorStructInfo(
         (IntImm(4), IntImm(8)),
         "float16",
         "cuda",
     )
-    assert ops[2].callee == "@matmul"
+    assert ops[2].op_ref.name == "matmul"
     assert ops[2].results[0].struct_info == TensorStructInfo(
         (IntImm(2), IntImm(3), IntImm(8)),
         "float16",
@@ -293,7 +293,7 @@ def test_standard_ops_are_explicitly_registered_with_infer_fns():
 
     a = TensorStructInfo((IntImm(2), IntImm(3), IntImm(4)), "float16", "cuda")
     b = TensorStructInfo((IntImm(4), IntImm(8)), "float16", "cuda")
-    assert infer_struct_info("@matmul", (a, b), {}) == TensorStructInfo(
+    assert infer_struct_info("matmul", (a, b), {}) == TensorStructInfo(
         (IntImm(2), IntImm(3), IntImm(8)),
         "float16",
         "cuda",

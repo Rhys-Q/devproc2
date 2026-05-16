@@ -10,20 +10,18 @@ from typing import Optional
 from devproc2.ir.nodes import (
     Block,
     Constant,
+    EffectSummary,
     Function,
     IRModule,
-    OpaqueEffect,
     Op,
-    OpResult,
     Region,
     TensorStructInfo,
     Value,
     Var,
 )
+from devproc2.ir.op_ref import ExternalFuncRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
-    CalleeKind,
-    CallKind,
     CallOp,
     ForOp,
     IfOp,
@@ -32,7 +30,6 @@ from devproc2.ir.ops import (
     ReturnOp,
     TensorCreateKind,
     TensorCreateOp,
-    TupleGetItemOp,
     TupleOp,
     YieldOp,
 )
@@ -130,7 +127,7 @@ def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
     ----------
     op : str
         High-level operator name (e.g. "relu", "matmul").  Matched against
-        ``dp.ops.relu(x)`` → ``CallOp(@relu)`` during DPS lowering.
+        ``dp.ops.relu(x)`` → ``CallOp(StandardOpRef("relu"))`` during DPS lowering.
     backend : str
         Compiler backend: "triton" | "cuda_c" | "python" | "llvm".
         Determines how the kernel function is AOT-compiled.
@@ -309,10 +306,9 @@ class DSLBuilder:
                 pre_ops, args = self._materialize_args(val_expr.args)
                 result_name = self._pick_name(name)
                 call_op = CallOp(
-                    callee=callee,
+                    op_ref=self._op_ref_for_callee(callee, produces_result=True),
                     args=args,
                     result_name=result_name,
-                    call_kind=self._call_kind_for_callee(callee, produces_result=True),
                 )
                 self.scope.define(name, call_op.results[0])
                 return pre_ops + [call_op]
@@ -321,7 +317,11 @@ class DSLBuilder:
             else:
                 pre_ops, val = self._materialize_value(val_expr)
                 result_name = self._pick_name(name)
-                call_op = CallOp(callee="@identity", args=(val,), result_name=result_name)
+                call_op = CallOp(
+                    op_ref=StandardOpRef("identity", get_op("identity")),
+                    args=(val,),
+                    result_name=result_name,
+                )
                 self.scope.define(name, call_op.results[0])
                 return pre_ops + [call_op]
 
@@ -335,9 +335,8 @@ class DSLBuilder:
                 pre_ops, args = self._materialize_args(val_expr.args)
                 return pre_ops + [
                     CallOp(
-                        callee=callee,
+                        op_ref=self._op_ref_for_callee(callee, produces_result=False),
                         args=args,
-                        call_kind=self._call_kind_for_callee(callee, produces_result=False),
                     )
                 ]
             return []
@@ -502,11 +501,10 @@ class DSLBuilder:
                 out_val = self._build_value(kwargs["output"])
                 output = out_val
         return CallDPSOp(
-            callee=callee,
-            callee_kind=CalleeKind.packed_func,
+            target_ref=PackedFuncRef(callee),
             inputs=inputs,
-            output=output,
-            effect=OpaqueEffect(),
+            outputs=() if output is None else (output,),
+            effect=EffectSummary.opaque_call(),
         )
 
     # ------------------------------------------------------------------
@@ -570,10 +568,9 @@ class DSLBuilder:
             pre_ops, args = self._materialize_args(node.args)
             tmp_name = self._fresh("tmp")
             call_op = CallOp(
-                callee=callee,
+                op_ref=self._op_ref_for_callee(callee, produces_result=True),
                 args=args,
                 result_name=tmp_name,
-                call_kind=self._call_kind_for_callee(callee, produces_result=True),
             )
             return pre_ops + [call_op], call_op.results[0]
         if isinstance(node, ast.Compare):
@@ -586,7 +583,11 @@ class DSLBuilder:
                 }.get(type(node.ops[0]), "__cmp__")
                 rhs_pre, rhs = self._materialize_value(node.comparators[0])
                 cmp_name = self._fresh("cmp")
-                cmp_op = CallOp(callee=f"@{op_name}", args=(lhs, rhs), result_name=cmp_name)
+                cmp_op = CallOp(
+                    op_ref=StandardOpRef(op_name, get_op(op_name)),
+                    args=(lhs, rhs),
+                    result_name=cmp_name,
+                )
                 return lhs_pre + rhs_pre + [cmp_op], cmp_op.results[0]
             raise DSLError(f"Complex comparison not supported: {ast.dump(node)}")
         return [], Var(ast.unparse(node))
@@ -618,15 +619,18 @@ class DSLBuilder:
 
     def _extract_callee(self, node: ast.expr) -> str:
         if isinstance(node, ast.Attribute):
-            return f"@{node.attr}"
+            return node.attr
         if isinstance(node, ast.Name):
-            return f"@{node.id}"
-        return f"@{ast.unparse(node)}"
+            return node.id
+        return ast.unparse(node)
 
-    def _call_kind_for_callee(self, callee: str, *, produces_result: bool) -> CallKind:
-        if get_op(callee) is not None:
-            return CallKind.standard
-        return CallKind.standard if produces_result else CallKind.external
+    def _op_ref_for_callee(self, callee: str, *, produces_result: bool):
+        op_def = get_op(callee)
+        if op_def is not None:
+            return StandardOpRef(callee, op_def)
+        if produces_result:
+            return StandardOpRef(callee)
+        return ExternalFuncRef(callee)
 
     def _pick_name(self, python_name: str) -> str:
         """Return a unique SSA name for python_name (fresh if already in scope)."""

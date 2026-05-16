@@ -4,26 +4,24 @@ from io import StringIO
 from typing import Optional
 
 from devproc2.ir.nodes import (
-    Block,
     Constant,
-    EffectInfo,
+    EffectSummary,
     Function,
     IRModule,
-    OpaqueEffect,
     Op,
     OpResult,
     ObjectStructInfo,
-    PureEffect,
-    ReadOnlyEffect,
     Region,
     ScalarStructInfo,
+    ShapeStructInfo,
     StructInfo,
     TensorStructInfo,
-    TerminatorOp,
+    TupleStructInfo,
     Value,
     Var,
-    WriteEffect,
+    shape_values,
 )
+from devproc2.ir.attrs import AttrValue
 from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
@@ -31,8 +29,6 @@ from devproc2.ir.ops import (
     CallOp,
     ForOp,
     IfOp,
-    IterArg,
-    Range,
     ReturnOp,
     ShapeAssertOp,
     TensorCreateKind,
@@ -159,7 +155,7 @@ class Printer:
 
         elif isinstance(op, CallOp):
             args_str = ", ".join(self._value_str(a) for a in op.args)
-            expr = f"{op.callee}({args_str}){self._attrs_str(op.attrs)}"
+            expr = f"{op.op_ref.display_name()}({args_str}){self._attrs_str(op.attrs)}"
             if op.results:
                 rname = self._result_names[id(op.results[0])]
                 self._buf.write(f"{indent}%{rname} = {expr}\n")
@@ -222,11 +218,10 @@ class Printer:
     def _print_calldps(self, op: CallDPSOp, indent: str) -> None:
         inner = indent + "  "
         inputs_str = "[" + ", ".join(self._value_str(a) for a in op.inputs) + "]"
-        output_str = self._value_str(op.output) if op.output is not None else "None"
-        self._buf.write(f"{indent}call_dps {op.callee}(\n")
+        outputs_str = "[" + ", ".join(self._value_str(a) for a in op.outputs) + "]"
+        self._buf.write(f"{indent}call_dps {op.target_ref.display_name()}(\n")
         self._buf.write(f"{inner}inputs={inputs_str},\n")
-        self._buf.write(f"{inner}output={output_str},\n")
-        self._buf.write(f"{inner}callee_kind={op.callee_kind.name},\n")
+        self._buf.write(f"{inner}outputs={outputs_str},\n")
         self._buf.write(f"{inner}effect={self._effect_str(op.effect)}")
         if op.attrs:
             self._buf.write(f",\n{inner}attrs={self._attrs_str(op.attrs)}")
@@ -319,6 +314,8 @@ class Printer:
         return " {" + ", ".join(parts) + "}"
 
     def _attr_value_str(self, value: object) -> str:
+        if isinstance(value, AttrValue):
+            value = value.to_python()
         if isinstance(value, str):
             return repr(value)
         if isinstance(value, tuple):
@@ -335,7 +332,7 @@ class Printer:
 
     def print_struct_info(self, si: StructInfo) -> str:
         if isinstance(si, TensorStructInfo):
-            shape_str = ", ".join(self.print_prim_expr(s) for s in si.shape)
+            shape_str = ", ".join(self.print_prim_expr(s) for s in shape_values(si.shape))
             return f"Tensor[({shape_str}), {si.dtype}, {si.device}]"
         if isinstance(si, ScalarStructInfo):
             return f"Scalar[{si.dtype}]"
@@ -343,6 +340,14 @@ class Printer:
             if si.role is not None:
                 return f"Object[{si.type_key}, role={si.role}]"
             return f"Object[{si.type_key}]"
+        if isinstance(si, ShapeStructInfo):
+            if si.values is not None:
+                shape_str = ", ".join(self.print_prim_expr(s) for s in shape_values(si.values))
+                return f"Shape[({shape_str})]"
+            return f"Shape[ndim={si.ndim}]"
+        if isinstance(si, TupleStructInfo):
+            fields = ", ".join(self.print_struct_info(field) for field in si.fields)
+            return f"Tuple[{fields}]"
         raise NotImplementedError(f"No printer for StructInfo type: {type(si).__name__}")
 
     def print_prim_expr(self, e: PrimExpr) -> str:
@@ -369,15 +374,26 @@ class Printer:
             return f"({self.print_prim_expr(e.lhs)} {op_sym} {self.print_prim_expr(e.rhs)})"
         raise NotImplementedError(f"No printer for PrimExpr type: {type(e).__name__}")
 
-    def _effect_str(self, eff: EffectInfo) -> str:
-        if isinstance(eff, PureEffect):
+    def _effect_str(self, eff: EffectSummary) -> str:
+        if eff.is_pure:
             return "pure"
-        if isinstance(eff, ReadOnlyEffect):
-            return "read_only"
-        if isinstance(eff, WriteEffect):
-            return "write(" + ", ".join(f"%{v.name}" for v in eff.vars) + ")"
-        if isinstance(eff, OpaqueEffect):
-            return "opaque"
+        parts: list[str] = []
+        if eff.reads:
+            parts.append("read(" + ", ".join(self._value_str(v) for v in eff.reads) + ")")
+        if eff.writes:
+            parts.append("write(" + ", ".join(self._value_str(v) for v in eff.writes) + ")")
+        if eff.allocates:
+            parts.append("allocate")
+        if eff.frees:
+            parts.append("free")
+        if eff.opaque:
+            if not parts and eff.external_state is None:
+                return "opaque"
+            parts.append("opaque")
+        if eff.external_state is not None:
+            parts.append(f"state={eff.external_state!r}")
+        if parts:
+            return ", ".join(parts)
         return repr(eff)
 
 

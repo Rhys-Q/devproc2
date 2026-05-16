@@ -263,7 +263,7 @@ def test_dps_lowering_callee_name():
     module = _lowered_module(f.lower_module(), _relu_spec())
     fn = module.functions["f"]
     dps = next(op for op in fn.body.entry_block.ops if isinstance(op, CallDPSOp))
-    assert dps.callee == "kernel.relu_fp16"
+    assert dps.target_ref.name == "kernel.relu_fp16"
 
 
 def test_dps_lowering_output_is_tensor_create_result():
@@ -281,7 +281,7 @@ def test_dps_lowering_output_is_tensor_create_result():
     dps_op    = ops[1]
     assert isinstance(create_op, TensorCreateOp)
     assert isinstance(dps_op, CallDPSOp)
-    assert dps_op.output is create_op.results[0]
+    assert dps_op.outputs == (create_op.results[0],)
 
 
 def test_dps_lowering_return_uses_create_result():
@@ -349,13 +349,13 @@ def test_dps_lowering_sm_arch_selects_correct_kernel():
     m90 = DPSLoweringPass(_make_registry(hopper, generic), sm_arch=90).run(module)
     dps = next(op for op in m90.functions["f"].body.entry_block.ops
                if isinstance(op, CallDPSOp))
-    assert dps.callee == "kernel.relu_hopper"
+    assert dps.target_ref.name == "kernel.relu_hopper"
 
     # SM 80 → generic kernel (hopper rejected)
     m80 = DPSLoweringPass(_make_registry(hopper, generic), sm_arch=80).run(module)
     dps = next(op for op in m80.functions["f"].body.entry_block.ops
                if isinstance(op, CallDPSOp))
-    assert dps.callee == "kernel.relu_generic"
+    assert dps.target_ref.name == "kernel.relu_generic"
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +400,8 @@ def test_full_m6_pipeline():
     assert create_op.dtype == "float16"
     assert create_op.device == "cuda"
 
-    assert dps_op.callee == "kernel.silu_fp16"
-    assert dps_op.output is create_op.results[0]
+    assert dps_op.target_ref.name == "kernel.silu_fp16"
+    assert dps_op.outputs == (create_op.results[0],)
 
 
 def test_m4_regression_no_lowering_without_registry():
@@ -448,8 +448,8 @@ def test_dps_lowering_chained_ops():
     relu_create, ln_create = creates
     relu_dps, ln_dps = dpss
 
-    assert relu_dps.output is relu_create.results[0]
-    assert ln_dps.output is ln_create.results[0]
+    assert relu_dps.outputs == (relu_create.results[0],)
+    assert ln_dps.outputs == (ln_create.results[0],)
     assert ln_dps.inputs[0] is relu_create.results[0]
 
     ret = next(op for op in ops if isinstance(op, ReturnOp))

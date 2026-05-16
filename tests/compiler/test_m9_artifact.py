@@ -16,9 +16,11 @@ from devproc2.compiler.passes.memory_planning import MemoryPlanningPass
 from devproc2.compiler.passes.vm_codegen import VMCodegenPass
 from devproc2.ir import (
     Block,
+    EffectSummary,
     Function,
     IRModule,
-    OpaqueEffect,
+    KernelRef,
+    PackedFuncRef,
     Region,
     ReturnOp,
     TensorStructInfo,
@@ -28,7 +30,6 @@ from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
     CallDPSOp,
-    CalleeKind as IRCalleeKind,
 )
 from devproc2.ir.prim_expr import IntImm, PrimVar
 from devproc2.kernel.registry import KernelRegistry, KernelSpec
@@ -78,8 +79,12 @@ def _simple_tensor_module() -> IRModule:
     x = Var("x", TensorStructInfo((IntImm(4),), "float16", "cpu"))
     s0 = AllocStorageOp("s0", IntImm(8), 256, "cpu")
     y = AllocTensorOp("y", s0.results[0], 0, (IntImm(4),), "float16")
-    dps = CallDPSOp("kernel.relu_fp16", IRCalleeKind.kernel,
-                    (x,), y.results[0], OpaqueEffect())
+    dps = CallDPSOp(
+        KernelRef("kernel.relu_fp16"),
+        (x,),
+        (y.results[0],),
+        EffectSummary.opaque_call(),
+    )
     ret = ReturnOp(values=(y.results[0],))
     si = TensorStructInfo((IntImm(4),), "float16", "cpu")
     fn = Function(body=Region(blocks=(Block(args=(x,), ops=(s0, y, dps, ret)),)),
@@ -105,8 +110,12 @@ def _packed_func_module() -> IRModule:
     x = Var("x", TensorStructInfo((IntImm(4),), "float16", "cpu"))
     s0 = AllocStorageOp("s0", IntImm(8), 256, "cpu")
     out = AllocTensorOp("out", s0.results[0], 0, (IntImm(4),), "float16")
-    pf_call = CallDPSOp("runtime.tokenizer.encode", IRCalleeKind.packed_func,
-                        (x,), out.results[0], OpaqueEffect())
+    pf_call = CallDPSOp(
+        PackedFuncRef("runtime.tokenizer.encode"),
+        (x,),
+        (out.results[0],),
+        EffectSummary.opaque_call(),
+    )
     ret = ReturnOp(values=(out.results[0],))
     si = TensorStructInfo((IntImm(4),), "float16", "cpu")
     fn = Function(body=Region(blocks=(Block(args=(x,), ops=(s0, out, pf_call, ret)),)),

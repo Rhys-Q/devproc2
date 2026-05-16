@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from functools import reduce as _reduce
 from math import prod
 from typing import Optional
 
@@ -34,16 +33,14 @@ from devproc2.ir.prim_expr import (
     prim_expr_structural_eq,
 )
 from devproc2.ir.nodes import (
-    Block,
     Function,
     IRModule,
-    OpaqueEffect,
+    IRStage,
     OpResult,
     Region,
     TensorStructInfo,
     Value,
-    Var,
-    WriteEffect,
+    shape_values,
 )
 from devproc2.ir.ops import (
     AllocTensorOp,
@@ -247,8 +244,12 @@ def _operand_results(op: Op) -> list[OpResult]:
     if isinstance(op, CallDPSOp):
         for v in op.inputs:
             _add(v)
-        if op.output is not None:
-            _add(op.output)
+        for v in op.outputs:
+            _add(v)
+        for v in op.effect.reads:
+            _add(v)
+        for v in op.effect.writes:
+            _add(v)
     elif isinstance(op, ReturnOp):
         for v in op.values:
             _add(v)
@@ -276,7 +277,7 @@ def _operand_results(op: Op) -> list[OpResult]:
         for fname in ("args", "inputs", "values", "elems"):
             for v in getattr(op, fname, ()):
                 _add(v)
-        for fname in ("output", "tup", "storage"):
+        for fname in ("tup", "storage"):
             v = getattr(op, fname, None)
             if v is not None:
                 _add(v)
@@ -289,6 +290,10 @@ def _operand_results(op: Op) -> list[OpResult]:
 
 class MemoryPlanningPass:
     """Analysis-only pass; writes StoragePlan to PassContext."""
+    input_stage = IRStage.dps
+    output_stage = IRStage.dps
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ("storage_plan",)
 
     def run(self, module: IRModule, ctx: PassContext) -> IRModule:
         for fn_name, fn in module.functions.items():
@@ -328,7 +333,7 @@ class MemoryPlanningPass:
         for cop in create_ops:
             first_def[cop.result_name] = op_index[id(cop)]
 
-        # Phase B step 1: explicit last_use from data flow only (no OpaqueEffect yet)
+        # Phase B step 1: explicit last_use from data flow only.
         explicit_last_use: dict[str, int] = {n: first_def[n] for n in first_def}
         for op in all_ops:
             idx = op_index[id(op)]
@@ -342,12 +347,17 @@ class MemoryPlanningPass:
         for op in all_ops:
             idx = op_index[id(op)]
             if isinstance(op, CallDPSOp):
-                if isinstance(op.effect, WriteEffect):
-                    for var in op.effect.vars:
-                        name = result_to_name.get(id(var))
+                if op.effect.reads:
+                    for value in op.effect.reads:
+                        name = result_to_name.get(id(value))
                         if name is not None:
                             last_use[name] = max(last_use[name], idx)
-                elif isinstance(op.effect, OpaqueEffect):
+                if op.effect.writes:
+                    for value in op.effect.writes:
+                        name = result_to_name.get(id(value))
+                        if name is not None:
+                            last_use[name] = max(last_use[name], idx)
+                if op.effect.opaque:
                     # Conservative: extend tensors that are ALREADY live at this point.
                     # "Already live" = defined before AND last-used (explicitly) at or after
                     # this index.  This avoids resurrecting tensors that have already been
@@ -397,7 +407,7 @@ def _get_shape_dtype_device(
     if cop.kind == TensorCreateKind.empty_like:
         si = cop.like.struct_info if cop.like is not None else None
         if isinstance(si, TensorStructInfo):
-            return si.shape, si.dtype, si.device
+            return shape_values(si.shape), si.dtype, si.device
         raise ValueError(
             f"TensorCreateOp(empty_like) '{cop.result_name}': "
             "cannot determine shape; ensure InferStructInfoPass ran first"

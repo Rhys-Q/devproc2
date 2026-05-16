@@ -7,27 +7,25 @@ from devproc2.ir.nodes import (
     Block,
     Function,
     IRModule,
+    IRStage,
     Op,
     Value,
-    Var,
     Constant,
-    OpResult,
 )
 from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
     CallDPSOp,
-    CalleeKind as IRCalleeKind,
     ForOp,
     IfOp,
-    IterArg,
     ReturnOp,
     ShapeAssertOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
 )
-from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
+from devproc2.ir.op_ref import BuiltinOpRef, KernelRef, PackedFuncRef
+from devproc2.ir.prim_expr import IntImm, PrimVar
 from devproc2.compiler.passes.shape_expr_lowering import ShapeExprLoweringPass, _PrimExprLowerer
 from devproc2.vm.executable import (
     CalleeKind,
@@ -40,13 +38,14 @@ from devproc2.vm.executable import (
 from devproc2.utils.dtype import parse_dtype, parse_device
 
 
-def _ir_callee_kind(kind: IRCalleeKind) -> CalleeKind:
-    return {
-        IRCalleeKind.vm_func:     CalleeKind.vm_func,
-        IRCalleeKind.builtin:     CalleeKind.builtin,
-        IRCalleeKind.packed_func: CalleeKind.packed_func,
-        IRCalleeKind.kernel:      CalleeKind.kernel,
-    }[kind]
+def _target_callee_kind(ref) -> CalleeKind:
+    if isinstance(ref, KernelRef):
+        return CalleeKind.kernel
+    if isinstance(ref, PackedFuncRef):
+        return CalleeKind.packed_func
+    if isinstance(ref, BuiltinOpRef):
+        return CalleeKind.builtin
+    raise TypeError(f"unsupported CallDPS target ref {type(ref).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +170,10 @@ class VMCodegenPass:
         KernelSpec. When provided, grid dims from spec.grid_fn are emitted
         as constant args appended to the kernel CALL instruction.
     """
+    input_stage = IRStage.memory
+    output_stage = IRStage.vm
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ()
 
     def __init__(self, kernel_specs=None) -> None:
         self._kernel_specs: dict = kernel_specs or {}
@@ -312,16 +315,16 @@ class VMCodegenPass:
 
     def _lower_calldps(self, op: CallDPSOp, ctx: _FnCtx) -> None:
         arg_regs = [ctx.reg_of(v) for v in op.inputs]
-        if op.output is not None:
-            arg_regs.append(ctx.reg_of(op.output))
+        for output in op.outputs:
+            arg_regs.append(ctx.reg_of(output))
         # For kernel callees: emit static grid dims (gx, gy, gz) as extra args.
-        if op.callee_kind == IRCalleeKind.kernel:
-            spec = self._kernel_specs.get(op.callee)
+        if isinstance(op.target_ref, KernelRef):
+            spec = op.target_ref.spec or self._kernel_specs.get(op.target_ref.name)
             if spec is not None and spec.grid_fn is not None:
                 grid = self._compute_grid(spec.grid_fn, op.inputs)
                 for g in grid:
                     arg_regs.append(ctx.reg_for_int(int(g)))
-        func_idx = ctx.intern_func(op.callee, _ir_callee_kind(op.callee_kind))
+        func_idx = ctx.intern_func(op.target_ref.name, _target_callee_kind(op.target_ref))
         ctx.emit(Instruction(
             opcode=Opcode.CALL,
             dst_reg=-1,  # DPS ops produce no SSA result

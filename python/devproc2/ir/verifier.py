@@ -1,36 +1,34 @@
 from __future__ import annotations
 
-from typing import Iterator, Optional
+from typing import Iterator
 
 from devproc2.ir.nodes import (
     Block,
-    Constant,
     Function,
     IRModule,
+    IRStage,
     Op,
     OpResult,
     Region,
     TerminatorOp,
     Value,
     Var,
-    WriteEffect,
+    allowed_dialects,
 )
+from devproc2.ir.op_ref import BuiltinOpRef, ExternalFuncRef, KernelRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
-    CallKind,
     CallOp,
     ForOp,
     IfOp,
+    AllocStorageOp,
+    AllocTensorOp,
     ReturnOp,
     ShapeAssertOp,
-    TensorCreateOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
 )
-from devproc2.compiler.op import get_op
-
-_FORBIDDEN_CALLEES = frozenset({"@alloc_storage", "@alloc_tensor"})
 
 
 class IRVerificationError(Exception):
@@ -38,6 +36,11 @@ class IRVerificationError(Exception):
 
 
 class Verifier:
+    def __init__(self, stage: IRStage | str | None = None) -> None:
+        if isinstance(stage, str):
+            stage = IRStage(stage)
+        self.stage = stage
+
     def verify_module(self, module: IRModule) -> None:
         for name, fn in module.functions.items():
             self._verify_function(name, fn)
@@ -154,7 +157,7 @@ class Verifier:
         defined_names: set[str],
         defined_results: set[int],
     ) -> None:
-        self._check_forbidden(fn_name, op)
+        self._check_stage(fn_name, op)
 
         def chk(v: Value) -> None:
             self._chk_value(fn_name, v, defined_names, defined_results)
@@ -167,8 +170,11 @@ class Verifier:
         elif isinstance(op, CallDPSOp):
             for v in _value_refs(op.inputs):
                 chk(v)
-            if op.output is not None:
-                chk(op.output)
+            for v in _value_refs(op.outputs):
+                chk(v)
+            for v in _value_refs(op.effect.reads + op.effect.writes):
+                chk(v)
+            self._verify_dps_target(fn_name, op)
 
         elif isinstance(op, TupleOp):
             for v in _value_refs(op.elems):
@@ -282,25 +288,36 @@ class Verifier:
     # ------------------------------------------------------------------
 
     def _check_forbidden(self, fn_name: str, op: Op) -> None:
-        callee: Optional[str] = None
-        if isinstance(op, CallOp):
-            callee = op.callee
-        elif isinstance(op, CallDPSOp):
-            callee = op.callee
-        if callee and callee in _FORBIDDEN_CALLEES:
-            node_name = callee.lstrip("@")
+        raise AssertionError("_check_forbidden has been replaced by stage verification")
+
+    def _check_stage(self, fn_name: str, op: Op) -> None:
+        if self.stage is None:
+            return
+        dialect = op.dialect
+        if dialect not in allowed_dialects(self.stage):
             raise IRVerificationError(
-                f"In @{fn_name}: {node_name} is forbidden in high-level IR "
-                f"(use TensorCreateOp instead)"
+                f"In @{fn_name}: {type(op).__name__} dialect {dialect.value!r} "
+                f"is not allowed in {self.stage.value}"
             )
+        if self.stage in (IRStage.raw, IRStage.normalized, IRStage.inferred):
+            if isinstance(op, (AllocStorageOp, AllocTensorOp)):
+                raise IRVerificationError(
+                    f"In @{fn_name}: {type(op).__name__} is forbidden before MemoryIR"
+                )
+        if self.stage in (IRStage.dps, IRStage.memory, IRStage.vm):
+            if isinstance(op, CallOp) and isinstance(op.op_ref, StandardOpRef):
+                raise IRVerificationError(
+                    f"In @{fn_name}: high-level tensor op {op.op_ref.display_name()} "
+                    f"is not allowed in {self.stage.value}"
+                )
 
     def _verify_call_op_schema(self, fn_name: str, op: CallOp) -> None:
-        op_def = op.op or get_op(op.callee)
-        if op.call_kind == CallKind.standard:
+        if isinstance(op.op_ref, StandardOpRef):
+            op_def = op.op_ref.resolve()
             if op_def is None:
                 raise IRVerificationError(
-                    f"In @{fn_name}: unknown standard op {op.callee!r}; "
-                    "mark the call as external for opaque runtime calls"
+                    f"In @{fn_name}: unknown standard op {op.op_ref.name!r}; "
+                    "use ExternalFuncRef for opaque runtime calls"
                 )
             try:
                 op_def.validate_call(op.args, op.attrs)
@@ -308,13 +325,22 @@ class Verifier:
                 raise IRVerificationError(f"In @{fn_name}: {err}") from err
             if op.results and not op_def.outputs:
                 raise IRVerificationError(
-                    f"In @{fn_name}: {op.callee} produces no schema outputs "
+                    f"In @{fn_name}: {op.op_ref.display_name()} produces no schema outputs "
                     f"but CallOp has {len(op.results)} result(s)"
                 )
-        elif op.call_kind == CallKind.external:
             return
-        else:
-            raise IRVerificationError(f"In @{fn_name}: unknown CallKind {op.call_kind!r}")
+        if isinstance(op.op_ref, (ExternalFuncRef, BuiltinOpRef)):
+            return
+        raise IRVerificationError(
+            f"In @{fn_name}: invalid CallOp op_ref {type(op.op_ref).__name__}"
+        )
+
+    def _verify_dps_target(self, fn_name: str, op: CallDPSOp) -> None:
+        if not isinstance(op.target_ref, (KernelRef, PackedFuncRef, BuiltinOpRef)):
+            raise IRVerificationError(
+                f"In @{fn_name}: invalid CallDPSOp target_ref "
+                f"{type(op.target_ref).__name__}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -335,5 +361,5 @@ def _region_terminator(region: Region) -> TerminatorOp:
     return last
 
 
-def verify(module: IRModule) -> None:
-    Verifier().verify_module(module)
+def verify(module: IRModule, stage: IRStage | str | None = None) -> None:
+    Verifier(stage).verify_module(module)

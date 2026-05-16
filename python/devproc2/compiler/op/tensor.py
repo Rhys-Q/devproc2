@@ -11,7 +11,7 @@ from devproc2.compiler.op.infer import matmul as infer_matmul
 from devproc2.compiler.op.infer import permute_dims as infer_permute_dims
 from devproc2.compiler.op.infer import same_as_first
 from devproc2.compiler.op.registry import register_op
-from devproc2.compiler.op.schema import Attr, LoweringKind, OpPatternKind
+from devproc2.compiler.op.schema import Attr, AttrType, LoweringPolicy, OpPatternKind
 
 
 @register_op(inputs=("x",), pattern=OpPatternKind.elementwise)
@@ -36,7 +36,7 @@ def multiply(lhs, rhs):
 
 @register_op(
     inputs=("x",),
-    attrs=(Attr("approximate", "str", default="none"),),
+    attrs=(Attr("approximate", AttrType.string(), default="none"),),
     pattern=OpPatternKind.elementwise,
 )
 def gelu(x, approximate: str = "none"):
@@ -46,7 +46,7 @@ def gelu(x, approximate: str = "none"):
 @register_op(
     inputs=("indices", "weight"),
     attrs=(
-        Attr("padding_idx", "int | None", default=None),
+        Attr("padding_idx", AttrType.optional(AttrType.int()), default=None),
     ),
     outputs=("embeddings",),
     infer=infer_embedding,
@@ -59,7 +59,7 @@ def embedding(indices, weight, padding_idx: Optional[int] = None):
 @register_op(
     name="permute_dims",
     inputs=("x",),
-    attrs=(Attr("axes", "array[int] | None", default=None),),
+    attrs=(Attr("axes", AttrType.optional(AttrType.array(AttrType.int())), default=None),),
     infer=infer_permute_dims,
     pattern=OpPatternKind.injective,
 )
@@ -74,7 +74,7 @@ def transpose(x, axes: Optional[tuple[int, ...]] = None):
 
 @register_op(
     inputs=("a", "b"),
-    attrs=(Attr("out_dtype", "str | None", default=None),),
+    attrs=(Attr("out_dtype", AttrType.optional(AttrType.dtype()), default=None),),
     infer=infer_matmul,
     pattern=OpPatternKind.out_ewise_fusable,
 )
@@ -87,7 +87,7 @@ def matmul(a, b, out_dtype: Optional[str] = None):
     inputs=("x",),
     infer=same_as_first,
     pattern=OpPatternKind.injective,
-    lowering_kind=LoweringKind.none,
+    lowering=LoweringPolicy.none(),
 )
 def identity(x):
     return emit(identity, x)
@@ -99,7 +99,7 @@ def _register_comparison(name: str):
         inputs=("lhs", "rhs"),
         infer=infer_comparison,
         pattern=OpPatternKind.broadcast,
-        lowering_kind=LoweringKind.none,
+        lowering=LoweringPolicy.none(),
     )
     def _cmp(lhs, rhs):
         return emit(_cmp, lhs, rhs)

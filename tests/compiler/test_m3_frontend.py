@@ -278,12 +278,12 @@ def test_normalize_pass_nested_if_result_substitution():
 def test_cf_verify_rejects_effect_only_if_with_yielded_values():
     """An effect-only IfOp (no result_names) whose branches yield values
     passes the base verifier but must be caught by ControlFlowVerifyPass."""
-    from devproc2.ir import Block, CallOp, Function, IfOp, IRModule, Region, ReturnOp, Var, YieldOp
+    from devproc2.ir import Block, CallOp, Function, IfOp, IRModule, Region, ReturnOp, StandardOpRef, Var, YieldOp
     from devproc2.ir.verifier import IRVerificationError
 
     x = Var("x"); flag = Var("flag")
-    relu_op = CallOp(callee="@relu", args=(x,), result_name="v"); v = relu_op.results[0]
-    silu_op = CallOp(callee="@silu", args=(x,), result_name="v2"); v2 = silu_op.results[0]
+    relu_op = CallOp(StandardOpRef("relu"), args=(x,), result_name="v"); v = relu_op.results[0]
+    silu_op = CallOp(StandardOpRef("silu"), args=(x,), result_name="v2"); v2 = silu_op.results[0]
 
     # result_names=() means effect-only, but both branches yield a value —
     # base verifier doesn't catch this; ControlFlowVerifyPass must.
@@ -299,4 +299,3 @@ def test_cf_verify_rejects_effect_only_if_with_yielded_values():
     # ControlFlowVerifyPass must reject it.
     with pytest.raises(IRVerificationError, match="effect-only"):
         ControlFlowVerifyPass().run(module)
-

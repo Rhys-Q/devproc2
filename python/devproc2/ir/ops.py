@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Mapping, Optional
+from typing import ClassVar, Mapping, Optional
 
+from devproc2.ir.attrs import AttrDict
 from devproc2.ir.nodes import (
-    Block,
-    EffectInfo,
+    DialectKind,
+    EffectSummary,
     Op,
     OpResult,
     Region,
@@ -15,6 +16,13 @@ from devproc2.ir.nodes import (
     TerminatorOp,
     Value,
     Var,
+)
+from devproc2.ir.op_ref import (
+    BuiltinOpRef,
+    ExternalFuncRef,
+    KernelRef,
+    PackedFuncRef,
+    StandardOpRef,
 )
 from devproc2.ir.prim_expr import IntImm, PrimExpr
 
@@ -26,36 +34,15 @@ from devproc2.ir.prim_expr import IntImm, PrimExpr
 @dataclass(frozen=True, eq=False)
 class ReturnOp(TerminatorOp):
     """Function return."""
+    dialect: ClassVar[DialectKind] = DialectKind.control
     values: tuple[Value, ...]
 
 
 @dataclass(frozen=True, eq=False)
 class YieldOp(TerminatorOp):
     """Region yield.  values=() means effect-only."""
+    dialect: ClassVar[DialectKind] = DialectKind.control
     values: tuple[Value, ...]
-
-
-# ---------------------------------------------------------------------------
-# Callee kind
-# ---------------------------------------------------------------------------
-
-class CalleeKind(Enum):
-    vm_func     = auto()
-    builtin     = auto()
-    packed_func = auto()
-    kernel      = auto()
-
-
-class CallKind(Enum):
-    """High-level call classification.
-
-    ``standard`` calls must resolve to an op registry entry before they enter
-    verified compiler pipelines.  ``external`` calls are opaque escape hatches
-    such as runtime callbacks or effect-only custom calls.
-    """
-
-    standard = auto()
-    external = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -64,62 +51,66 @@ class CallKind(Enum):
 
 @dataclass(frozen=True, eq=False)
 class CallOp(Op):
-    """Ordinary function/op call.
+    """High-level call to a standard, builtin, or external operation.
 
     result_name=""  → no SSA result (effect-only call).
     result_name="y" → produces one OpResult accessible as results[0].
     result_struct_info optionally propagates type info into the OpResult.
     """
-    callee:             str
+    op_ref:             StandardOpRef | BuiltinOpRef | ExternalFuncRef
     args:               tuple[Value, ...]
     result_name:        str                  = ""
     result_struct_info: Optional[StructInfo] = None
-    attrs:              Mapping[str, object] = field(default_factory=dict)
-    call_kind:          CallKind             = CallKind.standard
-    op:                 object | None        = field(default=None, init=False, repr=False)
+    attrs:              AttrDict | Mapping[str, object] = field(default_factory=AttrDict.empty)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "callee", _normalize_callee(self.callee))
-        if not isinstance(self.call_kind, CallKind):
-            object.__setattr__(self, "call_kind", CallKind[self.call_kind])
-        op_def = _lookup_standard_op(self.callee)
+        attrs = self.attrs
+        if not isinstance(attrs, AttrDict):
+            attrs = AttrDict.from_python(attrs)
+        op_def = self.op_def
         if op_def is not None:
-            object.__setattr__(self, "op", op_def)
-            object.__setattr__(
-                self,
-                "attrs",
-                op_def.normalize_attrs(self.attrs, include_defaults=False),
-            )
-        else:
-            object.__setattr__(self, "attrs", dict(self.attrs or {}))
+            attrs = op_def.normalize_attrs(attrs.to_python_dict(), include_defaults=False)
+            if isinstance(self.op_ref, StandardOpRef) and self.op_ref.op_def is None:
+                object.__setattr__(self, "op_ref", StandardOpRef(self.op_ref.name, op_def))
+        object.__setattr__(self, "attrs", attrs)
         if self.result_name:
             object.__setattr__(self, "results", (
                 OpResult(op=self, index=0, struct_info=self.result_struct_info),
             ))
 
     @property
-    def op_name(self) -> str:
-        if self.op is not None:
-            return self.op.name
-        return self.callee.lstrip("@")
+    def dialect(self) -> DialectKind:
+        return self.op_ref.dialect
+
+    @property
+    def op_def(self):
+        if isinstance(self.op_ref, StandardOpRef):
+            return self.op_ref.resolve()
+        if isinstance(self.op_ref, BuiltinOpRef):
+            return self.op_ref.op_def
+        return None
+
+    @property
+    def symbol_name(self) -> str:
+        return self.op_ref.name
 
 
 @dataclass(frozen=True, eq=False)
 class CallDPSOp(Op):
     """Destination-passing-style call.
 
-    output=None means effect-only (no output tensor produced).
-    outputs is always empty — DPS ops define no SSA results.
+    outputs=() means effect-only.  DPS ops define no SSA results.
     """
-    callee:      str
-    callee_kind: CalleeKind
-    inputs:      tuple[Value, ...]
-    output:      Optional[Value]
-    effect:      EffectInfo
-    attrs:       Mapping[str, object] = field(default_factory=dict)
+    dialect:    ClassVar[DialectKind] = DialectKind.runtime
+    target_ref: KernelRef | PackedFuncRef | BuiltinOpRef
+    inputs:     tuple[Value, ...]
+    outputs:    tuple[Value, ...]
+    effect:     EffectSummary = field(default_factory=EffectSummary.opaque_call)
+    attrs:      AttrDict | Mapping[str, object] = field(default_factory=AttrDict.empty)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "attrs", dict(self.attrs or {}))
+        if not isinstance(self.attrs, AttrDict):
+            object.__setattr__(self, "attrs", AttrDict.from_python(self.attrs))
 
 
 class TensorCreateKind(Enum):
@@ -132,6 +123,7 @@ class TensorCreateKind(Enum):
 @dataclass(frozen=True, eq=False)
 class TensorCreateOp(Op):
     """Allocate / create a tensor buffer."""
+    dialect:     ClassVar[DialectKind] = DialectKind.memory
     result_name: str
     kind:        TensorCreateKind
     shape:       tuple[PrimExpr, ...]
@@ -159,6 +151,7 @@ class TensorCreateOp(Op):
 @dataclass(frozen=True, eq=False)
 class TupleOp(Op):
     """Construct a tuple value from its elements."""
+    dialect:     ClassVar[DialectKind] = DialectKind.tensor
     result_name: str
     elems:       tuple[Value, ...]
 
@@ -169,6 +162,7 @@ class TupleOp(Op):
 @dataclass(frozen=True, eq=False)
 class TupleGetItemOp(Op):
     """Extract element at `index` from a tuple."""
+    dialect:     ClassVar[DialectKind] = DialectKind.tensor
     tup:         Value
     index:       int
     result_name: str
@@ -207,6 +201,7 @@ class IfOp(Op):
     then_region:  Region
     else_region:  Optional[Region] = None
     result_names: tuple[str, ...]  = ()
+    dialect: ClassVar[DialectKind] = DialectKind.control
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results", tuple(
@@ -226,6 +221,7 @@ class ForOp(Op):
     iter_args:    tuple[IterArg, ...]
     body_region:  Region
     result_names: tuple[str, ...] = ()
+    dialect: ClassVar[DialectKind] = DialectKind.control
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results", tuple(
@@ -244,6 +240,7 @@ class AllocStorageOp(Op):
     size_bytes is a PrimExpr so it supports both static shapes (IntImm) and
     dynamic shapes (symbolic expressions evaluated at runtime).
     """
+    dialect:     ClassVar[DialectKind] = DialectKind.memory
     result_name: str
     size_bytes:  PrimExpr   # IntImm for static; symbolic expr for dynamic
     alignment:   int
@@ -258,6 +255,7 @@ class AllocStorageOp(Op):
 @dataclass(frozen=True, eq=False)
 class AllocTensorOp(Op):
     """Create a tensor view over a storage buffer."""
+    dialect:     ClassVar[DialectKind] = DialectKind.memory
     result_name: str
     storage:     Value             # OpResult from AllocStorageOp
     offset:      int               # byte offset; always 0 in MVP
@@ -279,18 +277,7 @@ class AllocTensorOp(Op):
 @dataclass(frozen=True, eq=False)
 class ShapeAssertOp(Op):
     """Runtime assertion: tensor.shape[dim_idx] <= upper."""
+    dialect: ClassVar[DialectKind] = DialectKind.shape
     tensor:  Var
     dim_idx: int
     upper:   int
-
-
-def _normalize_callee(callee: str) -> str:
-    return callee if callee.startswith("@") else f"@{callee}"
-
-
-def _lookup_standard_op(callee: str) -> object | None:
-    try:
-        from devproc2.compiler.op.registry import get_op
-    except Exception:
-        return None
-    return get_op(callee)

@@ -5,12 +5,14 @@ from collections.abc import Mapping
 from typing import Optional
 
 from devproc2.ir.nodes import StructInfo
+from devproc2.ir.attrs import AttrDict
+from devproc2.ir.nodes import DialectKind
 from devproc2.compiler.op.schema import (
     Attr,
     InferContext,
     InferFn,
     Input,
-    LoweringKind,
+    LoweringPolicy,
     NormalizeFn,
     OpDef,
     OpPatternKind,
@@ -24,6 +26,8 @@ _OPS: dict[str, OpDef] = {}
 
 
 def register(op: OpDef) -> OpDef:
+    if op.name.startswith("@"):
+        raise ValueError(f"op name must not include '@': {op.name!r}")
     if op.name in _OPS:
         raise ValueError(f"op {op.name!r} is already registered")
     _OPS[op.name] = op
@@ -41,7 +45,8 @@ def register_op(
     validate: ValidateFn | None = None,
     purity: PurityKind = PurityKind.pure,
     pattern: OpPatternKind = OpPatternKind.opaque,
-    lowering_kind: LoweringKind = LoweringKind.kernel,
+    dialect: DialectKind = DialectKind.tensor,
+    lowering: LoweringPolicy = LoweringPolicy.kernel(),
 ):
     def decorator(fn):
         op = register(OpDef(
@@ -54,7 +59,8 @@ def register_op(
             validate=validate,
             purity=purity,
             pattern=pattern,
-            lowering_kind=lowering_kind,
+            dialect=dialect,
+            lowering=lowering,
         ))
         fn.op_def = op
         return fn
@@ -63,7 +69,9 @@ def register_op(
 
 
 def get(name_or_callee: str) -> Optional[OpDef]:
-    return _OPS.get(name_or_callee.lstrip("@"))
+    if name_or_callee.startswith("@"):
+        return None
+    return _OPS.get(name_or_callee)
 
 
 def require(name_or_callee: str) -> OpDef:
@@ -78,7 +86,7 @@ def normalize_attrs(
     attrs: Optional[Mapping[str, object]] = None,
     *,
     include_defaults: bool = True,
-) -> dict[str, object]:
+) -> AttrDict:
     op = require(name_or_callee)
     return op.normalize_attrs(attrs, include_defaults=include_defaults)
 

@@ -11,8 +11,7 @@ For each matched CallOp:
 Shape scalars (%M, %N, %K) in inputs are NOT inserted here; that is the job
 of ShapeExprLoweringPass (M7/X2). For M6, inputs = original op arguments.
 
-Effect is set to OpaqueEffect() for all lowered kernels. M5 will refine this
-to WriteEffect once the effect system is implemented.
+Effect is set to an opaque EffectSummary for all lowered kernels.
 """
 from __future__ import annotations
 
@@ -20,19 +19,19 @@ from typing import Optional
 
 from devproc2.ir.nodes import (
     Block,
+    EffectSummary,
     IRModule,
-    OpaqueEffect,
+    IRStage,
     TensorStructInfo,
 )
+from devproc2.ir.op_ref import KernelRef, StandardOpRef
 from devproc2.ir.ops import (
-    CallKind,
     CallDPSOp,
-    CalleeKind,
     CallOp,
     TensorCreateKind,
     TensorCreateOp,
 )
-from devproc2.compiler.op import LoweringKind, get_op
+from devproc2.compiler.op import LoweringKind
 from devproc2.kernel.registry import (
     KernelMatchKey,
     KernelRegistry,
@@ -48,6 +47,10 @@ class DPSLoweringPass(IRRewriter):
     sm_arch: target SM compute capability passed to the registry lookup.
              None = skip SM filter.
     """
+    input_stage = IRStage.inferred
+    output_stage = IRStage.dps
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ()
 
     def __init__(self, registry: KernelRegistry, sm_arch: Optional[int] = None) -> None:
         super().__init__()
@@ -61,14 +64,14 @@ class DPSLoweringPass(IRRewriter):
         new_ops = []
         for op in block.ops:
             if isinstance(op, CallOp) and op.results:
-                op_def = op.op or get_op(op.callee)
-                if op.call_kind != CallKind.standard or op_def is None:
+                op_def = op.op_def if isinstance(op.op_ref, StandardOpRef) else None
+                if op_def is None:
                     new_op = self._subst_op(op)
                     for old_r, new_r in zip(op.results, new_op.results):
                         self._sub[old_r] = new_r
                     new_ops.append(new_op)
                     continue
-                if op_def.lowering_kind != LoweringKind.kernel:
+                if op_def.lowering.kind != LoweringKind.kernel:
                     new_op = self._subst_op(op)
                     for old_r, new_r in zip(op.results, new_op.results):
                         self._sub[old_r] = new_r
@@ -87,11 +90,10 @@ class DPSLoweringPass(IRRewriter):
                     # Redirect downstream uses of the old CallOp result.
                     self._sub[op.results[0]] = create_op.results[0]
                     dps_op = CallDPSOp(
-                        callee=kernel.kernel_name,
-                        callee_kind=CalleeKind.kernel,
+                        target_ref=KernelRef(kernel.kernel_name, kernel),
                         inputs=self.svs(op.args),
-                        output=create_op.results[0],
-                        effect=OpaqueEffect(),
+                        outputs=(create_op.results[0],),
+                        effect=EffectSummary.opaque_call(),
                         attrs=op.attrs,
                     )
                     new_ops.append(create_op)
@@ -108,7 +110,7 @@ class DPSLoweringPass(IRRewriter):
         if not isinstance(si, TensorStructInfo):
             return None
         key = KernelMatchKey(
-            op_name=op.op_name,
+            op_name=op.op_ref.name,
             device=si.device,
             input_dtypes=build_input_dtypes(op.args),
         )

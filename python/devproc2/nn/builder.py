@@ -7,9 +7,9 @@ from typing import Optional
 from devproc2.compiler.op import (
     StandardOp,
     get_op,
-    infer_struct_info,
     set_current_emitter,
 )
+from devproc2.ir.op_ref import ExternalFuncRef, StandardOpRef
 from devproc2.ir.nodes import (
     Block,
     Constant,
@@ -21,7 +21,7 @@ from devproc2.ir.nodes import (
     Value,
     Var,
 )
-from devproc2.ir.ops import CallKind, CallOp, ReturnOp
+from devproc2.ir.ops import CallOp, ReturnOp
 
 from devproc2.nn.module import Module
 from devproc2.nn.specs import ObjectSpec, Parameter, ScalarSpec, TensorSpec
@@ -78,9 +78,9 @@ class GraphBuilder:
                 tuple(_struct_info_for_value(arg) for arg in ir_args),
                 attrs_dict,
             )
-            call_kind = CallKind.standard
+            op_ref = StandardOpRef(op_name, op)
         else:
-            op_name = op.lstrip("@")
+            op_name = op
             op_def = get_op(op_name)
             if op_def is not None:
                 attrs_dict = op_def.normalize_attrs(attrs)
@@ -88,25 +88,20 @@ class GraphBuilder:
                     tuple(_struct_info_for_value(arg) for arg in ir_args),
                     attrs_dict,
                 )
-                call_kind = CallKind.standard
+                op_ref = StandardOpRef(op_name, op_def)
             else:
-                attrs_dict = dict(attrs or {})
-                result_si = infer_struct_info(
-                    op_name,
-                    tuple(_struct_info_for_value(arg) for arg in ir_args),
-                    attrs_dict,
-                )
-                call_kind = CallKind.external
-        op = CallOp(
-            callee=f"@{op_name}",
+                attrs_dict = attrs or {}
+                result_si = None
+                op_ref = ExternalFuncRef(op_name)
+        call = CallOp(
+            op_ref=op_ref,
             args=ir_args,
             result_name=self._fresh(op_name),
             result_struct_info=result_si,
             attrs=attrs_dict,
-            call_kind=call_kind,
         )
-        self._ops.append(op)
-        return TraceValue(op.results[0], self)
+        self._ops.append(call)
+        return TraceValue(call.results[0], self)
 
     def parameter_value(self, parameter: Parameter) -> TraceValue:
         if parameter.name is None:

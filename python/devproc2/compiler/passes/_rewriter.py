@@ -8,7 +8,7 @@ to Value operands when rebuilding each op.
 from __future__ import annotations
 
 from devproc2.ir.nodes import (
-    Block, Function, IRModule, Op, OpResult, Region, Value, Var,
+    Block, EffectSummary, Function, IRModule, Op, OpResult, Region, Value,
 )
 from devproc2.ir.ops import (
     AllocStorageOp, AllocTensorOp,
@@ -89,16 +89,15 @@ class IRRewriter:
         if isinstance(op, YieldOp):
             return YieldOp(values=self.svs(op.values))
         if isinstance(op, CallOp):
-            return CallOp(callee=op.callee, args=self.svs(op.args),
+            return CallOp(op_ref=op.op_ref, args=self.svs(op.args),
                          result_name=op.result_name,
                          result_struct_info=op.result_struct_info,
-                         attrs=op.attrs,
-                         call_kind=op.call_kind)
+                         attrs=op.attrs)
         if isinstance(op, CallDPSOp):
-            return CallDPSOp(callee=op.callee, callee_kind=op.callee_kind,
+            return CallDPSOp(target_ref=op.target_ref,
                             inputs=self.svs(op.inputs),
-                            output=self.sv(op.output) if op.output is not None else None,
-                            effect=op.effect,
+                            outputs=self.svs(op.outputs),
+                            effect=self._subst_effect(op.effect),
                             attrs=op.attrs)
         if isinstance(op, TupleOp):
             return TupleOp(result_name=op.result_name, elems=self.svs(op.elems))
@@ -144,3 +143,13 @@ class IRRewriter:
             f"{type(op).__name__}. Add an explicit case to preserve operand substitution."
         )
         return op
+
+    def _subst_effect(self, effect: EffectSummary) -> EffectSummary:
+        return EffectSummary(
+            reads=self.svs(effect.reads),
+            writes=self.svs(effect.writes),
+            allocates=effect.allocates,
+            frees=effect.frees,
+            opaque=effect.opaque,
+            external_state=effect.external_state,
+        )

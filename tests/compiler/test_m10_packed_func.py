@@ -19,9 +19,10 @@ from devproc2.compiler.passes.memory_planning import MemoryPlanningPass
 from devproc2.compiler.passes.vm_codegen import VMCodegenPass
 from devproc2.ir import (
     Block,
+    EffectSummary,
     Function,
     IRModule,
-    OpaqueEffect,
+    PackedFuncRef,
     Region,
     ReturnOp,
     TensorStructInfo,
@@ -31,7 +32,6 @@ from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
     CallDPSOp,
-    CalleeKind as IRCalleeKind,
     TensorCreateOp,
     TensorCreateKind,
 )
@@ -112,8 +112,7 @@ class TestDSLEmitsCorrectIR:
         ops = fn.body.blocks[0].ops
         dps_ops = [o for o in ops if isinstance(o, CallDPSOp)]
         assert len(dps_ops) == 1
-        assert dps_ops[0].callee == "runtime.tokenizer.encode"
-        assert dps_ops[0].callee_kind == IRCalleeKind.packed_func
+        assert dps_ops[0].target_ref == PackedFuncRef("runtime.tokenizer.encode")
 
     def test_call_dps_packed_output_references_tensor_create(self):
         @dp.function
@@ -133,7 +132,7 @@ class TestDSLEmitsCorrectIR:
         assert len(tc_ops) == 1
         assert len(dps_ops) == 1
         # The output of CallDPSOp must be the result of TensorCreateOp
-        assert dps_ops[0].output is tc_ops[0].results[0]
+        assert dps_ops[0].outputs == (tc_ops[0].results[0],)
 
     def test_call_dps_packed_with_none_output(self):
         @dp.function
@@ -149,8 +148,8 @@ class TestDSLEmitsCorrectIR:
         ops = fn.body.blocks[0].ops
         dps_ops = [o for o in ops if isinstance(o, CallDPSOp)]
         assert len(dps_ops) == 1
-        assert dps_ops[0].output is None
-        assert dps_ops[0].callee_kind == IRCalleeKind.packed_func
+        assert dps_ops[0].outputs == ()
+        assert dps_ops[0].target_ref == PackedFuncRef("runtime.update_cache")
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +162,12 @@ class TestVMCodegen:
         x = Var("x", TensorStructInfo((IntImm(4),), "float32", "cpu"))
         s0 = AllocStorageOp("s0", IntImm(16), 256, "cpu")
         out = AllocTensorOp("out", s0.results[0], 0, (IntImm(4),), "float32")
-        pf_call = CallDPSOp("runtime.tokenizer.encode", IRCalleeKind.packed_func,
-                            (x,), out.results[0], OpaqueEffect())
+        pf_call = CallDPSOp(
+            PackedFuncRef("runtime.tokenizer.encode"),
+            (x,),
+            (out.results[0],),
+            EffectSummary.opaque_call(),
+        )
         ret = ReturnOp(values=(out.results[0],))
         si = TensorStructInfo((IntImm(4),), "float32", "cpu")
         fn = Function(body=Region(blocks=(Block(args=(x,), ops=(s0, out, pf_call, ret)),)),
@@ -210,8 +213,12 @@ class TestVMInterpreterPackedFunc:
         x = Var("x", TensorStructInfo((IntImm(4),), "float32", "cpu"))
         s0 = AllocStorageOp("s0", IntImm(16), 256, "cpu")
         out = AllocTensorOp("out", s0.results[0], 0, (IntImm(4),), "float32")
-        pf_call = CallDPSOp("runtime.fill_ones", IRCalleeKind.packed_func,
-                            (x,), out.results[0], OpaqueEffect())
+        pf_call = CallDPSOp(
+            PackedFuncRef("runtime.fill_ones"),
+            (x,),
+            (out.results[0],),
+            EffectSummary.opaque_call(),
+        )
         ret = ReturnOp(values=(out.results[0],))
         fn = Function(body=Region(blocks=(Block(args=(x,), ops=(s0, out, pf_call, ret)),)),)
         return IRModule(functions={"main": fn})
@@ -265,8 +272,12 @@ class TestVMInterpreterPackedFunc:
     def test_interpreter_none_output_packed_func(self):
         """output=None packed_func: call succeeds, no tensor return needed."""
         x = Var("x", TensorStructInfo((IntImm(4),), "float32", "cpu"))
-        pf_call = CallDPSOp("runtime.log_call", IRCalleeKind.packed_func,
-                            (x,), None, OpaqueEffect())
+        pf_call = CallDPSOp(
+            PackedFuncRef("runtime.log_call"),
+            (x,),
+            (),
+            EffectSummary.opaque_call(),
+        )
         ret = ReturnOp(values=(x,))
         fn = Function(body=Region(blocks=(Block(args=(x,), ops=(pf_call, ret)),)),)
         module = IRModule(functions={"main": fn})
@@ -309,9 +320,8 @@ class TestDSLAcceptance:
         dps_ops = [o for o in ops if isinstance(o, CallDPSOp)]
         assert len(tc_ops) == 1
         assert len(dps_ops) == 1
-        assert dps_ops[0].callee == "runtime.tokenizer.encode"
-        assert dps_ops[0].callee_kind == IRCalleeKind.packed_func
-        assert dps_ops[0].output is tc_ops[0].results[0]
+        assert dps_ops[0].target_ref == PackedFuncRef("runtime.tokenizer.encode")
+        assert dps_ops[0].outputs == (tc_ops[0].results[0],)
 
     def test_tokenize_full_pipeline(self):
         """Full pipeline: DSL → IR → memory planning → VMCodegen → VMInterpreter."""
@@ -385,8 +395,12 @@ class TestABIArtifact:
         x = Var("x", TensorStructInfo((IntImm(4),), "float32", "cpu"))
         s0 = AllocStorageOp("s0", IntImm(16), 256, "cpu")
         out = AllocTensorOp("out", s0.results[0], 0, (IntImm(4),), "float32")
-        pf_call = CallDPSOp("runtime.tokenizer.encode", IRCalleeKind.packed_func,
-                            (x,), out.results[0], OpaqueEffect())
+        pf_call = CallDPSOp(
+            PackedFuncRef("runtime.tokenizer.encode"),
+            (x,),
+            (out.results[0],),
+            EffectSummary.opaque_call(),
+        )
         ret = ReturnOp(values=(out.results[0],))
         si = TensorStructInfo((IntImm(4),), "float32", "cpu")
         fn = Function(body=Region(blocks=(Block(args=(x,), ops=(s0, out, pf_call, ret)),)),
