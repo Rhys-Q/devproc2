@@ -316,6 +316,8 @@ class Printer:
     def _attr_value_str(self, value: object) -> str:
         if isinstance(value, AttrValue):
             value = value.to_python()
+        if isinstance(value, PrimExpr):
+            return self.print_prim_expr(value)
         if isinstance(value, str):
             return repr(value)
         if isinstance(value, tuple):

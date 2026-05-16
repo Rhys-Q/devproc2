@@ -66,6 +66,52 @@ def permute_dims(ctx: InferContext) -> Optional[StructInfo]:
     return info if shape == info.shape else TensorStructInfo(shape, info.dtype, info.device)
 
 
+def reshape(ctx: InferContext) -> Optional[StructInfo]:
+    info = tensor(ctx.arg(0))
+    if info is None:
+        return None
+    target_shape = _normalize_shape_attr(ctx.attrs["shape"])
+    for dim in target_shape:
+        if isinstance(dim, IntImm) and dim.value < 0:
+            raise ValueError(f"reshape: shape dimensions must be non-negative, got {dim.value}")
+    input_elems = _static_num_elements(tuple(info.shape))
+    output_elems = _static_num_elements(target_shape)
+    if input_elems is not None and output_elems is not None and input_elems != output_elems:
+        raise ValueError(
+            f"reshape: element count mismatch, got {input_elems} and {output_elems}"
+        )
+    return TensorStructInfo(target_shape, info.dtype, info.device)
+
+
+def cat(ctx: InferContext) -> Optional[StructInfo]:
+    infos = tuple(tensor(arg) for arg in ctx.args)
+    if not infos or any(info is None for info in infos):
+        return None
+    tensors = tuple(info for info in infos if info is not None)
+    first = tensors[0]
+    rank = len(first.shape)
+    axis = normalize_dim(ctx.attrs["axis"], rank)
+    out_shape = list(first.shape)
+    axis_dims = [first.shape[axis]]
+    for info in tensors[1:]:
+        if info.dtype != first.dtype:
+            raise ValueError(f"cat: dtype mismatch: {first.dtype!r} vs {info.dtype!r}")
+        _check_same_device(first, info)
+        if len(info.shape) != rank:
+            raise ValueError(f"cat: rank mismatch: {rank} vs {len(info.shape)}")
+        for dim_index, (expected, actual) in enumerate(zip(first.shape, info.shape)):
+            if dim_index == axis:
+                continue
+            if not dims_may_equal(expected, actual):
+                raise ValueError(
+                    f"cat: non-axis dimension {dim_index} mismatch: "
+                    f"{expected!r} vs {actual!r}"
+                )
+        axis_dims.append(info.shape[axis])
+    out_shape[axis] = _sum_dims(axis_dims)
+    return TensorStructInfo(tuple(out_shape), first.dtype, first.device)
+
+
 def matmul(ctx: InferContext) -> Optional[StructInfo]:
     lhs = tensor(ctx.arg(0))
     rhs = tensor(ctx.arg(1))
@@ -75,8 +121,16 @@ def matmul(ctx: InferContext) -> Optional[StructInfo]:
     if not lhs.shape or not rhs.shape:
         raise ValueError("matmul: operands must not be scalar tensors")
 
-    lhs_shape = lhs.shape
-    rhs_shape = rhs.shape
+    lhs_shape = tuple(lhs.shape)
+    rhs_shape = tuple(rhs.shape)
+    if ctx.attrs["transpose_a"]:
+        if len(lhs_shape) < 2:
+            raise ValueError("matmul: transpose_a requires lhs rank >= 2")
+        lhs_shape = lhs_shape[:-2] + (lhs_shape[-1], lhs_shape[-2])
+    if ctx.attrs["transpose_b"]:
+        if len(rhs_shape) < 2:
+            raise ValueError("matmul: transpose_b requires rhs rank >= 2")
+        rhs_shape = rhs_shape[:-2] + (rhs_shape[-1], rhs_shape[-2])
     lhs_was_1d = len(lhs_shape) == 1
     rhs_was_1d = len(rhs_shape) == 1
     if lhs_was_1d:
@@ -104,6 +158,30 @@ def matmul(ctx: InferContext) -> Optional[StructInfo]:
 
 def tensor(info: Optional[StructInfo]) -> Optional[TensorStructInfo]:
     return info if isinstance(info, TensorStructInfo) else None
+
+
+def _normalize_shape_attr(shape: object) -> tuple[PrimExpr, ...]:
+    if not isinstance(shape, (tuple, list)):
+        raise ValueError(f"shape must be a tuple/list, got {type(shape).__name__}")
+    return tuple(IntImm(dim) if isinstance(dim, int) else dim for dim in shape)
+
+
+def _static_num_elements(shape: tuple[PrimExpr, ...]) -> Optional[int]:
+    total = 1
+    for dim in shape:
+        if not isinstance(dim, IntImm):
+            return None
+        total *= dim.value
+    return total
+
+
+def _sum_dims(dims: list[PrimExpr]) -> PrimExpr:
+    if all(isinstance(dim, IntImm) for dim in dims):
+        return IntImm(sum(dim.value for dim in dims if isinstance(dim, IntImm)))
+    result = dims[0]
+    for dim in dims[1:]:
+        result = result + dim
+    return result
 
 
 def normalize_dim(dim: object, rank: int) -> int:
@@ -180,6 +258,7 @@ __all__ = [
     "broadcast",
     "broadcast_prefix",
     "broadcast_shape",
+    "cat",
     "comparison",
     "dims_equal",
     "dims_may_equal",
@@ -189,6 +268,7 @@ __all__ = [
     "normalize_dim",
     "normalize_axes",
     "permute_dims",
+    "reshape",
     "same_as_first",
     "tensor",
 ]

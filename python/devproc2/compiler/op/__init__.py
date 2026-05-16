@@ -28,6 +28,7 @@ from devproc2.compiler.op.schema import (
 )
 from devproc2.compiler.op.tensor import (
     add,
+    cat,
     embedding,
     equal,
     gelu,
@@ -41,6 +42,7 @@ from devproc2.compiler.op.tensor import (
     not_equal,
     permute_dims,
     relu,
+    reshape,
     silu,
     transpose,
 )
@@ -69,6 +71,7 @@ __all__ = [
     "add",
     "adarms_norm",
     "call",
+    "cat",
     "embedding",
     "equal",
     "emit",
@@ -88,6 +91,7 @@ __all__ = [
     "not_equal",
     "permute_dims",
     "relu",
+    "reshape",
     "register",
     "register_op",
     "require",

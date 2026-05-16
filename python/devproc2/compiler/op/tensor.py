@@ -5,13 +5,15 @@ from typing import Optional
 
 from devproc2.compiler.op.emit import emit
 from devproc2.compiler.op.infer import broadcast as infer_broadcast
+from devproc2.compiler.op.infer import cat as infer_cat
 from devproc2.compiler.op.infer import comparison as infer_comparison
 from devproc2.compiler.op.infer import embedding as infer_embedding
 from devproc2.compiler.op.infer import matmul as infer_matmul
 from devproc2.compiler.op.infer import permute_dims as infer_permute_dims
+from devproc2.compiler.op.infer import reshape as infer_reshape
 from devproc2.compiler.op.infer import same_as_first
 from devproc2.compiler.op.registry import register_op
-from devproc2.compiler.op.schema import Attr, AttrType, LoweringPolicy, OpPatternKind
+from devproc2.compiler.op.schema import Attr, AttrType, Input, LoweringPolicy, OpPatternKind
 
 
 @register_op(inputs=("x",), pattern=OpPatternKind.elementwise)
@@ -73,13 +75,54 @@ def transpose(x, axes: Optional[tuple[int, ...]] = None):
 
 
 @register_op(
+    inputs=("x",),
+    attrs=(Attr("shape", AttrType.shape(), required=True),),
+    infer=infer_reshape,
+    pattern=OpPatternKind.injective,
+)
+def reshape(x, shape):
+    if isinstance(shape, (tuple, list)):
+        normalized_shape = tuple(shape)
+    else:
+        normalized_shape = (shape,)
+    return emit(reshape, x, shape=normalized_shape)
+
+
+@register_op(
+    inputs=(Input("inputs", variadic=True),),
+    attrs=(Attr("axis", AttrType.int(), default=0),),
+    infer=infer_cat,
+    pattern=OpPatternKind.injective,
+)
+def cat(inputs, axis: int = 0):
+    return emit(cat, *tuple(inputs), axis=axis)
+
+
+@register_op(
     inputs=("a", "b"),
-    attrs=(Attr("out_dtype", AttrType.optional(AttrType.dtype()), default=None),),
+    attrs=(
+        Attr("out_dtype", AttrType.optional(AttrType.dtype()), default=None),
+        Attr("transpose_a", AttrType.bool(), default=False),
+        Attr("transpose_b", AttrType.bool(), default=False),
+    ),
     infer=infer_matmul,
     pattern=OpPatternKind.out_ewise_fusable,
 )
-def matmul(a, b, out_dtype: Optional[str] = None):
-    return emit(matmul, a, b, out_dtype=out_dtype)
+def matmul(
+    a,
+    b,
+    out_dtype: Optional[str] = None,
+    transpose_a: bool = False,
+    transpose_b: bool = False,
+):
+    return emit(
+        matmul,
+        a,
+        b,
+        out_dtype=out_dtype,
+        transpose_a=transpose_a,
+        transpose_b=transpose_b,
+    )
 
 
 @register_op(
@@ -118,6 +161,7 @@ not_equal = _register_comparison("__ne__")
 
 __all__ = [
     "add",
+    "cat",
     "embedding",
     "equal",
     "gelu",
@@ -131,6 +175,7 @@ __all__ = [
     "not_equal",
     "permute_dims",
     "relu",
+    "reshape",
     "silu",
     "transpose",
 ]

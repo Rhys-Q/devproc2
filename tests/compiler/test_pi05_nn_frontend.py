@@ -3,7 +3,15 @@ import devproc2.nn as nn
 from devproc2.compiler.passes.infer_struct_info import InferStructInfoPass
 from devproc2.ir import print_module, verify
 from devproc2.ir.nodes import ObjectStructInfo, ScalarStructInfo, TensorStructInfo
-from devproc2.compiler.op import gelu, get_op, infer_struct_info, matmul, permute_dims
+from devproc2.compiler.op import (
+    cat,
+    gelu,
+    get_op,
+    infer_struct_info,
+    matmul,
+    permute_dims,
+    reshape,
+)
 from devproc2.ir.ops import CallOp
 from devproc2.ir.prim_expr import IntImm
 
@@ -136,6 +144,44 @@ def test_top_level_layer_norm_accepts_parameters_and_kwargs():
         "weight",
         "bias",
     ]
+
+
+def test_top_level_shape_ops_emit_expected_attrs():
+    class ShapeOps(nn.Module):
+        def forward(self, x, y):
+            z = dp.cat([x, y], axis=1)
+            return dp.reshape(z, (3, 4))
+
+    module = nn.GraphBuilder().build(
+        ShapeOps().forward,
+        {
+            "x": nn.TensorSpec((2, 3), "float16"),
+            "y": nn.TensorSpec((2, 3), "float16"),
+        },
+    )
+    verify(module)
+
+    ops = [
+        op
+        for op in module.functions["forward"].body.entry_block.ops
+        if isinstance(op, CallOp)
+    ]
+    assert [op.op_ref.name for op in ops] == ["cat", "reshape"]
+    assert ops[0].attrs == {"axis": 1}
+    assert ops[0].results[0].struct_info == TensorStructInfo(
+        (IntImm(2), IntImm(6)),
+        "float16",
+        "cuda",
+    )
+    assert ops[1].attrs.to_json_obj() == {"shape": [3, 4]}
+    assert ops[1].results[0].struct_info == TensorStructInfo(
+        (IntImm(3), IntImm(4)),
+        "float16",
+        "cuda",
+    )
+    text = print_module(module)
+    assert "@cat(%x, %y) {axis=1}" in text
+    assert "@reshape(%cat_0) {shape=[3, 4]}" in text
 
 
 def test_basic_modules_emit_expected_attrs_and_paths():
@@ -289,7 +335,11 @@ def test_standard_ops_are_explicitly_registered_with_infer_fns():
     assert matmul.op_def.inputs[0].name == "a"
     assert matmul.op_def.inputs[1].name == "b"
     assert matmul.op_def.attrs[0].name == "out_dtype"
+    assert matmul.op_def.attrs[1].name == "transpose_a"
+    assert matmul.op_def.attrs[2].name == "transpose_b"
     assert permute_dims.op_def.attrs[0].name == "axes"
+    assert reshape.op_def.attrs[0].name == "shape"
+    assert cat.op_def.attrs[0].name == "axis"
 
     a = TensorStructInfo((IntImm(2), IntImm(3), IntImm(4)), "float16", "cuda")
     b = TensorStructInfo((IntImm(4), IntImm(8)), "float16", "cuda")

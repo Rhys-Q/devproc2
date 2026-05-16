@@ -164,20 +164,32 @@ class PrimExprAttr(AttrValue):
     def to_python(self) -> PrimExpr:
         return self.value
 
+    def to_json_obj(self) -> object:
+        return _prim_expr_to_json_obj(self.value)
+
 
 @dataclass(frozen=True)
 class ShapeAttr(AttrValue):
     values: tuple[PrimExpr, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "values",
-            tuple(IntImm(v) if isinstance(v, int) else v for v in self.values),
-        )
+        normalized = []
+        for value in self.values:
+            if isinstance(value, bool):
+                raise TypeError("shape dimensions must be int or PrimExpr")
+            if isinstance(value, int):
+                normalized.append(IntImm(value))
+            elif isinstance(value, PrimExpr):
+                normalized.append(value)
+            else:
+                raise TypeError("shape dimensions must be int or PrimExpr")
+        object.__setattr__(self, "values", tuple(normalized))
 
     def to_python(self) -> tuple[PrimExpr, ...]:
         return self.values
+
+    def to_json_obj(self) -> list[object]:
+        return [_prim_expr_to_json_obj(value) for value in self.values]
 
 
 @dataclass(frozen=True)
@@ -332,6 +344,27 @@ def wrap_attr_value(value: object, attr_type: AttrType | None = None) -> AttrVal
     if isinstance(value, Mapping):
         return DictAttr({str(key): wrap_attr_value(val) for key, val in value.items()})
     return ObjectAttr(value)
+
+
+def _prim_expr_to_json_obj(value: PrimExpr) -> object:
+    if isinstance(value, IntImm):
+        return value.value
+    if hasattr(value, "name"):
+        payload: dict[str, object] = {
+            "kind": type(value).__name__,
+            "name": getattr(value, "name"),
+        }
+        upper = getattr(value, "upper", None)
+        if upper is not None:
+            payload["upper"] = upper
+        return payload
+    if hasattr(value, "lhs") and hasattr(value, "rhs"):
+        return {
+            "kind": type(value).__name__,
+            "lhs": _prim_expr_to_json_obj(getattr(value, "lhs")),
+            "rhs": _prim_expr_to_json_obj(getattr(value, "rhs")),
+        }
+    return {"kind": type(value).__name__, "repr": repr(value)}
 
 
 __all__ = [

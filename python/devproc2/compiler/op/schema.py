@@ -21,6 +21,7 @@ class Input:
     name: str
     kind: str = "tensor"
     optional: bool = False
+    variadic: bool = False
 
 
 @dataclass(frozen=True)
@@ -175,6 +176,20 @@ class OpDef:
         return self.infer(InferContext(args, self.normalize_attrs(attrs).to_python_dict()))
 
     def _validate_num_inputs(self, args: tuple[object, ...]) -> None:
+        variadic_inputs = [i for i, inp in enumerate(self.inputs) if inp.variadic]
+        if variadic_inputs:
+            if len(variadic_inputs) != 1 or variadic_inputs[0] != len(self.inputs) - 1:
+                raise ValueError(f"{self.name}: variadic input must be the final input")
+            variadic = self.inputs[variadic_inputs[0]]
+            fixed_inputs = self.inputs[: variadic_inputs[0]]
+            min_inputs = sum(1 for inp in fixed_inputs if not inp.optional)
+            if not variadic.optional:
+                min_inputs += 1
+            if len(args) < min_inputs:
+                raise ValueError(
+                    f"{self.name}: expected at least {min_inputs} inputs, got {len(args)}"
+                )
+            return
         min_inputs = sum(1 for inp in self.inputs if not inp.optional)
         max_inputs = len(self.inputs)
         if not (min_inputs <= len(args) <= max_inputs):

@@ -19,6 +19,7 @@ from devproc2.ir import (
     StandardOpRef,
     TensorStructInfo,
     Var,
+    print_module,
     verify,
 )
 from devproc2.ir.ops import CallDPSOp
@@ -125,6 +126,79 @@ def test_permute_dims_uses_axes_attr_like_relax():
 
     with pytest.raises(ValueError, match="permutation"):
         get_op("permute_dims").infer_struct_info((x,), {"axes": (0, 0, 1)})
+
+
+def test_reshape_infer_and_shape_attr_printing_are_stable():
+    x_info = TensorStructInfo((IntImm(2), IntImm(3), IntImm(4)), "float16", "cuda")
+
+    assert get_op("reshape").infer_struct_info(
+        (x_info,),
+        {"shape": (IntImm(6), IntImm(4))},
+    ) == TensorStructInfo((IntImm(6), IntImm(4)), "float16", "cuda")
+
+    with pytest.raises(ValueError, match="element count mismatch"):
+        get_op("reshape").infer_struct_info((x_info,), {"shape": (5, 5)})
+
+    attrs = get_op("reshape").normalize_attrs({"shape": (6, 4)})
+    assert attrs.to_json_obj() == {"shape": [6, 4]}
+
+    x = Var("x", x_info)
+    op = CallOp(StandardOpRef("reshape"), (x,), result_name="y", attrs={"shape": (6, 4)})
+    y = op.results[0]
+    module = IRModule({"f": Function(Region((Block((x,), (op, ReturnOp((y,)))),)))})
+    assert "@reshape(%x) {shape=[6, 4]}" in print_module(module)
+
+    with pytest.raises(TypeError, match="expects shape"):
+        CallOp(StandardOpRef("reshape"), (x,), result_name="bad", attrs={"shape": ("bad",)})
+
+
+def test_cat_infer_checks_axis_shape_dtype_and_device():
+    lhs = TensorStructInfo((IntImm(2), IntImm(3), IntImm(4)), "float16", "cuda")
+    rhs = TensorStructInfo((IntImm(2), IntImm(5), IntImm(4)), "float16", "cuda")
+
+    assert get_op("cat").infer_struct_info((lhs, rhs), {"axis": 1}) == TensorStructInfo(
+        (IntImm(2), IntImm(8), IntImm(4)),
+        "float16",
+        "cuda",
+    )
+    assert get_op("cat").infer_struct_info((lhs, rhs), {"axis": -2}) == TensorStructInfo(
+        (IntImm(2), IntImm(8), IntImm(4)),
+        "float16",
+        "cuda",
+    )
+
+    bad_shape = TensorStructInfo((IntImm(2), IntImm(5), IntImm(7)), "float16", "cuda")
+    with pytest.raises(ValueError, match="non-axis dimension"):
+        get_op("cat").infer_struct_info((lhs, bad_shape), {"axis": 1})
+
+    bad_dtype = TensorStructInfo((IntImm(2), IntImm(5), IntImm(4)), "float32", "cuda")
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        get_op("cat").infer_struct_info((lhs, bad_dtype), {"axis": 1})
+
+    bad_device = TensorStructInfo((IntImm(2), IntImm(5), IntImm(4)), "float16", "cpu")
+    with pytest.raises(ValueError, match="device mismatch"):
+        get_op("cat").infer_struct_info((lhs, bad_device), {"axis": 1})
+
+
+def test_matmul_transpose_attrs_affect_infer():
+    lhs = TensorStructInfo((IntImm(2), IntImm(5), IntImm(3)), "float16", "cuda")
+    rhs = TensorStructInfo((IntImm(2), IntImm(4), IntImm(3)), "float16", "cuda")
+    assert get_op("matmul").infer_struct_info(
+        (lhs, rhs),
+        {"transpose_b": True},
+    ) == TensorStructInfo((IntImm(2), IntImm(5), IntImm(4)), "float16", "cuda")
+
+    lhs_t = TensorStructInfo((IntImm(2), IntImm(3), IntImm(5)), "float16", "cuda")
+    rhs_t = TensorStructInfo((IntImm(2), IntImm(3), IntImm(4)), "float16", "cuda")
+    assert get_op("matmul").infer_struct_info(
+        (lhs_t, rhs_t),
+        {"transpose_a": True},
+    ) == TensorStructInfo((IntImm(2), IntImm(5), IntImm(4)), "float16", "cuda")
+
+    x = Var("x", lhs)
+    y = Var("y", rhs)
+    with pytest.raises(TypeError, match="expects bool"):
+        CallOp(StandardOpRef("matmul"), (x, y), result_name="z", attrs={"transpose_b": 1})
 
 
 def test_norm_ops_use_axes_and_epsilon_attrs():
