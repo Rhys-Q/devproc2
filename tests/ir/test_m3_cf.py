@@ -2,6 +2,7 @@
 import pytest
 
 from devproc2.ir import (
+    AliasAnalysis,
     Block,
     CallDPSOp,
     CallOp,
@@ -23,6 +24,8 @@ from devproc2.ir import (
     AllocStorageOp,
     TensorStructInfo,
     TerminatorOp,
+    TupleGetItemOp,
+    TupleOp,
     Var,
     YieldOp,
     print_module,
@@ -75,6 +78,40 @@ def test_ssa_if_printer():
 
 def test_ssa_if_verifier_passes():
     verify(_make_ssa_if_module())
+
+
+def test_alias_analysis_resolves_if_result_sources():
+    module = _make_ssa_if_module()
+    if_op = module.functions["branch_relu_silu"].body.entry_block.ops[0]
+    aliases = AliasAnalysis.from_region(module.functions["branch_relu_silu"].body)
+
+    assert aliases.sources(if_op.results[0]) == (
+        if_op.then_region.entry_block.ops[-1].values[0],
+        if_op.else_region.entry_block.ops[-1].values[0],
+    )
+
+
+def test_alias_analysis_projects_tuple_get_item_through_if_result():
+    x0 = Var("x0")
+    x1 = Var("x1")
+    y0 = Var("y0")
+    y1 = Var("y1")
+    flag = Var("flag")
+
+    then_tuple = TupleOp("then_pair", (x0, x1))
+    else_tuple = TupleOp("else_pair", (y0, y1))
+    if_op = IfOp(
+        cond=flag,
+        then_region=_cf_region(then_tuple, YieldOp((then_tuple.results[0],))),
+        else_region=_cf_region(else_tuple, YieldOp((else_tuple.results[0],))),
+        result_names=("pair",),
+    )
+    item = TupleGetItemOp(if_op.results[0], 0, "picked")
+
+    aliases = AliasAnalysis((if_op, then_tuple, else_tuple, item))
+
+    assert aliases.sources(item.results[0]) == (x0, y0)
+    assert aliases.resolve_matching(item.results[0], lambda v: v in (x0, y0)) == frozenset({x0, y0})
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +258,17 @@ def test_verifier_if_yield_count_mismatch():
     y = if_op.results[0]
     block = Block(args=(x, flag), ops=(if_op, ReturnOp((y,))))
     with pytest.raises(IRVerificationError):
+        verify(IRModule({"f": Function(Region((block,)))}))
+
+
+def test_verifier_if_result_requires_else_region():
+    x = Var("x"); flag = Var("flag")
+    relu_op = CallOp(std("relu"), args=(x,), result_name="v0"); v0 = relu_op.results[0]
+    then_region = _cf_region(relu_op, YieldOp((v0,)))
+    if_op = IfOp(cond=flag, then_region=then_region, result_names=("y",))
+    y = if_op.results[0]
+    block = Block(args=(x, flag), ops=(if_op, ReturnOp((y,))))
+    with pytest.raises(IRVerificationError, match="requires an else_region"):
         verify(IRModule({"f": Function(Region((block,)))}))
 
 

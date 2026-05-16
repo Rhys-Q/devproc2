@@ -2,6 +2,7 @@ from devproc2.ir.nodes import (
     AliasInfo,
     AliasKind,
     Block,
+    BlockArg,
     Constant,
     DialectKind,
     EffectSummary,
@@ -12,6 +13,7 @@ from devproc2.ir.nodes import (
     KnownShape,
     Op,
     OpResult,
+    Operation,
     ObjectStructInfo,
     Region,
     ScalarStructInfo,
@@ -58,19 +60,23 @@ from devproc2.ir.op_ref import (
 from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
+    BuiltinCallOp,
     CallDPSOp,
     CallOp,
+    ExternalCallOp,
     ForOp,
     IfOp,
     IterArg,
     Range,
     ReturnOp,
     ShapeAssertOp,
+    StandardCallOp,
     TensorCreateKind,
     TensorCreateOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
+    make_call_op,
 )
 from devproc2.ir.prim_expr import (
     Add,
@@ -96,12 +102,14 @@ from devproc2.ir.prim_expr import (
 )
 from devproc2.ir.printer import Printer, print_module
 from devproc2.ir.verifier import IRVerificationError, verify
+from devproc2.ir.analysis import AliasAnalysis, iter_ops
 
 __all__ = [
     # Core nodes
     "AliasInfo",
     "AliasKind",
     "Block",
+    "BlockArg",
     "Constant",
     "DialectKind",
     "EffectSummary",
@@ -112,6 +120,7 @@ __all__ = [
     "KnownShape",
     "Op",
     "OpResult",
+    "Operation",
     "ObjectStructInfo",
     "Region",
     "ScalarStructInfo",
@@ -154,19 +163,23 @@ __all__ = [
     # Ops
     "AllocStorageOp",
     "AllocTensorOp",
+    "BuiltinCallOp",
     "CallDPSOp",
     "CallOp",
+    "ExternalCallOp",
     "ForOp",
     "IfOp",
     "IterArg",
     "Range",
     "ReturnOp",
     "ShapeAssertOp",
+    "StandardCallOp",
     "TensorCreateKind",
     "TensorCreateOp",
     "TupleGetItemOp",
     "TupleOp",
     "YieldOp",
+    "make_call_op",
     # PrimExpr hierarchy
     "PrimExpr",
     "PrimExprLike",
@@ -191,7 +204,9 @@ __all__ = [
     "prim_expr_structural_eq",
     # Printer / verifier
     "IRVerificationError",
+    "AliasAnalysis",
     "Printer",
+    "iter_ops",
     "print_module",
     "verify",
 ]

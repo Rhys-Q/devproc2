@@ -33,6 +33,10 @@ class StandardOpRef(OpRef):
     op_def: Optional["OpDef"] = None
     dialect: DialectKind = DialectKind.tensor
 
+    def __post_init__(self) -> None:
+        if self.op_def is not None:
+            object.__setattr__(self, "dialect", self.op_def.dialect)
+
     def resolve(self) -> Optional["OpDef"]:
         if self.op_def is not None:
             return self.op_def

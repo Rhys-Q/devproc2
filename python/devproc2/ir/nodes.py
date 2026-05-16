@@ -12,14 +12,25 @@ from devproc2.ir.prim_expr import IntImm, PrimExpr
 # ---------------------------------------------------------------------------
 
 class Value:
-    """Base class for Op operands (Var, OpResult, or Constant)."""
+    """Base class for Op operands (BlockArg, OpResult, or Constant)."""
 
 
 @dataclass(frozen=True, eq=False)
-class Var(Value):
-    """Block argument — defined at block entry (function params, iter args)."""
+class BlockArg(Value):
+    """SSA value defined at block entry (function params, iter args).
+
+    ``Var`` remains a public compatibility alias for older frontend and tests,
+    but the semantic name is BlockArg: this value is defined by a block, not by
+    a globally meaningful string name.
+    """
     name: str
     struct_info: Optional[StructInfo] = None
+    owner: Optional["Block"] = None
+    index: int = 0
+
+
+# Compatibility name used throughout the existing frontend and tests.
+Var = BlockArg
 
 
 @dataclass(frozen=True)
@@ -185,6 +196,7 @@ class EffectSummary:
     frees: bool = False
     opaque: bool = False
     external_state: Optional[str] = None
+    alias: AliasInfo | None = None
 
     @classmethod
     def pure(cls) -> "EffectSummary":
@@ -211,6 +223,7 @@ class EffectSummary:
             and not self.frees
             and not self.opaque
             and self.external_state is None
+            and self.alias is None
         )
 
 
@@ -221,6 +234,7 @@ class EffectSummary:
 class DialectKind(Enum):
     tensor = "tensor"
     shape = "shape"
+    object = "object"
     memory = "memory"
     runtime = "runtime"
     control = "control"
@@ -240,6 +254,7 @@ _STAGE_DIALECTS: dict[IRStage, frozenset[DialectKind]] = {
         {
             DialectKind.tensor,
             DialectKind.shape,
+            DialectKind.object,
             DialectKind.memory,
             DialectKind.control,
             DialectKind.runtime,
@@ -249,6 +264,7 @@ _STAGE_DIALECTS: dict[IRStage, frozenset[DialectKind]] = {
         {
             DialectKind.tensor,
             DialectKind.shape,
+            DialectKind.object,
             DialectKind.memory,
             DialectKind.control,
             DialectKind.runtime,
@@ -258,6 +274,7 @@ _STAGE_DIALECTS: dict[IRStage, frozenset[DialectKind]] = {
         {
             DialectKind.tensor,
             DialectKind.shape,
+            DialectKind.object,
             DialectKind.memory,
             DialectKind.control,
             DialectKind.runtime,
@@ -268,6 +285,7 @@ _STAGE_DIALECTS: dict[IRStage, frozenset[DialectKind]] = {
             DialectKind.tensor,
             DialectKind.memory,
             DialectKind.shape,
+            DialectKind.object,
             DialectKind.control,
             DialectKind.runtime,
         }
@@ -277,6 +295,7 @@ _STAGE_DIALECTS: dict[IRStage, frozenset[DialectKind]] = {
             DialectKind.tensor,
             DialectKind.memory,
             DialectKind.shape,
+            DialectKind.object,
             DialectKind.control,
             DialectKind.runtime,
         }
@@ -286,6 +305,7 @@ _STAGE_DIALECTS: dict[IRStage, frozenset[DialectKind]] = {
             DialectKind.tensor,
             DialectKind.memory,
             DialectKind.shape,
+            DialectKind.object,
             DialectKind.control,
             DialectKind.runtime,
         }
@@ -319,6 +339,49 @@ class Op:
     """
     dialect: ClassVar[DialectKind] = DialectKind.tensor
     results: tuple[OpResult, ...] = field(default_factory=tuple, init=False)
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        """SSA values consumed by this operation.
+
+        Effect metadata is intentionally exposed separately through ``effects``;
+        callers that need all value references should combine both.
+        """
+        return ()
+
+    @property
+    def regions(self) -> tuple["Region", ...]:
+        return ()
+
+    @property
+    def effects(self) -> EffectSummary:
+        return EffectSummary.pure()
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple["Region", ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "Op":
+        """Return an equivalent op with substituted public operands.
+
+        Concrete ops with operands or regions override this method.  The base
+        implementation covers leaf ops with no Value operands.
+        """
+        if operands:
+            raise NotImplementedError(
+                f"{type(self).__name__}.replace_operands must be implemented"
+            )
+        if regions not in (None, ()):
+            raise NotImplementedError(
+                f"{type(self).__name__}.replace_operands must handle regions"
+            )
+        return self
+
+
+# Compatibility name matching the design document terminology.
+Operation = Op
 
 
 @dataclass(frozen=True, eq=False)

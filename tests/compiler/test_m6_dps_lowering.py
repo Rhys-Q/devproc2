@@ -282,6 +282,7 @@ def test_dps_lowering_output_is_tensor_create_result():
     assert isinstance(create_op, TensorCreateOp)
     assert isinstance(dps_op, CallDPSOp)
     assert dps_op.outputs == (create_op.results[0],)
+    assert dps_op.effect.writes == (create_op.results[0],)
 
 
 def test_dps_lowering_return_uses_create_result():

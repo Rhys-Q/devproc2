@@ -892,6 +892,72 @@ def test_dsl_tuple_return_marks_both_tensors_non_reusable():
     assert a_sid != b_sid
 
 
+def test_if_result_return_keeps_branch_tensors_alive():
+    """Tensors yielded through IfOp results must remain live until return.
+
+    Regression: memory planning used to only inspect direct ReturnOp operands.
+    `return if_result` therefore missed the branch TensorCreateOps and allowed
+    a later tensor to reuse their storage even though the selected branch output
+    escapes to the caller.
+    """
+    from devproc2.ir.nodes import Block, Function, Region, ScalarStructInfo, Var
+    from devproc2.ir.ops import IfOp, ReturnOp, YieldOp
+
+    cond = Var("cond", ScalarStructInfo("bool"))
+    create_y = TensorCreateOp("y", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    create_z = TensorCreateOp("z", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    create_tmp = TensorCreateOp("tmp", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+
+    if_op = IfOp(
+        cond=cond,
+        then_region=Region((Block(args=(), ops=(create_y, YieldOp((create_y.results[0],)))),)),
+        else_region=Region((Block(args=(), ops=(create_z, YieldOp((create_z.results[0],)))),)),
+        result_names=("out",),
+    )
+    block = Block(args=(cond,), ops=(if_op, create_tmp, ReturnOp((if_op.results[0],))))
+    module = IRModule({"f": Function(Region((block,)))})
+
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+
+    tmp_sid = plan.tensor_to_storage["tmp"]
+    assert plan.tensor_to_storage["y"] != tmp_sid
+    assert plan.tensor_to_storage["z"] != tmp_sid
+
+
+def test_tuple_get_item_of_if_result_keeps_projected_branch_tensors_alive():
+    from devproc2.ir.nodes import Block, Function, Region, ScalarStructInfo, Var
+    from devproc2.ir.ops import IfOp, ReturnOp, TupleGetItemOp, TupleOp, YieldOp
+
+    cond = Var("cond", ScalarStructInfo("bool"))
+    y0 = TensorCreateOp("y0", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    y1 = TensorCreateOp("y1", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    z0 = TensorCreateOp("z0", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    z1 = TensorCreateOp("z1", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    tmp = TensorCreateOp("tmp", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+
+    then_tuple = TupleOp("then_pair", (y0.results[0], y1.results[0]))
+    else_tuple = TupleOp("else_pair", (z0.results[0], z1.results[0]))
+    if_op = IfOp(
+        cond=cond,
+        then_region=Region((Block(args=(), ops=(y0, y1, then_tuple, YieldOp((then_tuple.results[0],)))),)),
+        else_region=Region((Block(args=(), ops=(z0, z1, else_tuple, YieldOp((else_tuple.results[0],)))),)),
+        result_names=("pair",),
+    )
+    picked = TupleGetItemOp(if_op.results[0], 0, "picked")
+    block = Block(args=(cond,), ops=(if_op, picked, tmp, ReturnOp((picked.results[0],))))
+    module = IRModule({"f": Function(Region((block,)))})
+
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+
+    tmp_sid = plan.tensor_to_storage["tmp"]
+    assert plan.tensor_to_storage["y0"] != tmp_sid
+    assert plan.tensor_to_storage["z0"] != tmp_sid
+
+
 # ---------------------------------------------------------------------------
 # AllocStorageOp: int size_bytes is auto-coerced to IntImm
 # ---------------------------------------------------------------------------

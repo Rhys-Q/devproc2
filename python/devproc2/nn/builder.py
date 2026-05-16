@@ -21,7 +21,7 @@ from devproc2.ir.nodes import (
     Value,
     Var,
 )
-from devproc2.ir.ops import CallOp, ReturnOp
+from devproc2.ir.ops import CallOp, ReturnOp, make_call_op
 
 from devproc2.nn.module import Module
 from devproc2.nn.specs import ObjectSpec, Parameter, ScalarSpec, TensorSpec
@@ -93,7 +93,7 @@ class GraphBuilder:
                 attrs_dict = attrs or {}
                 result_si = None
                 op_ref = ExternalFuncRef(op_name)
-        call = CallOp(
+        call = make_call_op(
             op_ref=op_ref,
             args=ir_args,
             result_name=self._fresh(op_name),

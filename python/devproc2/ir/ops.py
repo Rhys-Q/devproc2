@@ -7,6 +7,8 @@ from typing import ClassVar, Mapping, Optional
 
 from devproc2.ir.attrs import AttrDict
 from devproc2.ir.nodes import (
+    AliasInfo,
+    AliasKind,
     DialectKind,
     EffectSummary,
     Op,
@@ -37,12 +39,38 @@ class ReturnOp(TerminatorOp):
     dialect: ClassVar[DialectKind] = DialectKind.control
     values: tuple[Value, ...]
 
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return self.values
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "ReturnOp":
+        return ReturnOp(values=operands)
+
 
 @dataclass(frozen=True, eq=False)
 class YieldOp(TerminatorOp):
     """Region yield.  values=() means effect-only."""
     dialect: ClassVar[DialectKind] = DialectKind.control
     values: tuple[Value, ...]
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return self.values
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "YieldOp":
+        return YieldOp(values=operands)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +122,102 @@ class CallOp(Op):
     def symbol_name(self) -> str:
         return self.op_ref.name
 
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return self.args
+
+    @property
+    def effects(self) -> EffectSummary:
+        if isinstance(self.op_ref, ExternalFuncRef):
+            return EffectSummary.opaque_call(self.op_ref.name)
+        if isinstance(self.op_ref, BuiltinOpRef) and self.op_ref.op_def is None:
+            return EffectSummary.opaque_call(self.op_ref.name)
+        op_def = self.op_def
+        purity = getattr(getattr(op_def, "purity", None), "value", None)
+        if purity == "readonly":
+            return EffectSummary.readonly(*self.args)
+        if purity == "impure":
+            return EffectSummary.opaque_call(self.op_ref.name)
+        return EffectSummary.pure()
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "CallOp":
+        return make_call_op(
+            op_ref=self.op_ref,
+            args=operands,
+            result_name=self.result_name,
+            result_struct_info=self.result_struct_info,
+            attrs=self.attrs,
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class StandardCallOp(CallOp):
+    """Call to a registered high-level standard op."""
+
+    op_ref: StandardOpRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.op_ref, StandardOpRef):
+            raise TypeError("StandardCallOp requires StandardOpRef")
+        super().__post_init__()
+
+
+@dataclass(frozen=True, eq=False)
+class BuiltinCallOp(CallOp):
+    """Call to a VM/runtime builtin op."""
+
+    op_ref: BuiltinOpRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.op_ref, BuiltinOpRef):
+            raise TypeError("BuiltinCallOp requires BuiltinOpRef")
+        super().__post_init__()
+
+
+@dataclass(frozen=True, eq=False)
+class ExternalCallOp(CallOp):
+    """Call to an opaque external function.
+
+    External calls default to an opaque effect via CallOp.effects.
+    """
+
+    op_ref: ExternalFuncRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.op_ref, ExternalFuncRef):
+            raise TypeError("ExternalCallOp requires ExternalFuncRef")
+        super().__post_init__()
+
+
+def make_call_op(
+    op_ref: StandardOpRef | BuiltinOpRef | ExternalFuncRef,
+    args: tuple[Value, ...],
+    *,
+    result_name: str = "",
+    result_struct_info: Optional[StructInfo] = None,
+    attrs: AttrDict | Mapping[str, object] | None = None,
+) -> CallOp:
+    kwargs = {
+        "op_ref": op_ref,
+        "args": args,
+        "result_name": result_name,
+        "result_struct_info": result_struct_info,
+        "attrs": AttrDict.empty() if attrs is None else attrs,
+    }
+    if isinstance(op_ref, StandardOpRef):
+        return StandardCallOp(**kwargs)
+    if isinstance(op_ref, BuiltinOpRef):
+        return BuiltinCallOp(**kwargs)
+    if isinstance(op_ref, ExternalFuncRef):
+        return ExternalCallOp(**kwargs)
+    raise TypeError(f"unsupported op_ref for CallOp: {type(op_ref).__name__}")
+
 
 @dataclass(frozen=True, eq=False)
 class CallDPSOp(Op):
@@ -111,6 +235,49 @@ class CallDPSOp(Op):
     def __post_init__(self) -> None:
         if not isinstance(self.attrs, AttrDict):
             object.__setattr__(self, "attrs", AttrDict.from_python(self.attrs))
+        missing_writes = tuple(v for v in self.outputs if v not in self.effect.writes)
+        if missing_writes:
+            object.__setattr__(
+                self,
+                "effect",
+                EffectSummary(
+                    reads=self.effect.reads,
+                    writes=self.effect.writes + missing_writes,
+                    allocates=self.effect.allocates,
+                    frees=self.effect.frees,
+                    opaque=self.effect.opaque,
+                    external_state=self.effect.external_state,
+                    alias=self.effect.alias,
+                ),
+            )
+
+    @property
+    def op_ref(self) -> KernelRef | PackedFuncRef | BuiltinOpRef:
+        return self.target_ref
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return self.inputs + self.outputs
+
+    @property
+    def effects(self) -> EffectSummary:
+        return self.effect
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "CallDPSOp":
+        n_inputs = len(self.inputs)
+        return CallDPSOp(
+            target_ref=self.target_ref,
+            inputs=operands[:n_inputs],
+            outputs=operands[n_inputs:],
+            effect=effects if effects is not None else self.effect,
+            attrs=self.attrs,
+        )
 
 
 class TensorCreateKind(Enum):
@@ -130,7 +297,7 @@ class TensorCreateOp(Op):
     dtype:       str
     device:      str
     fill_value:  Optional[object] = None
-    like:        Optional[Var]    = None
+    like:        Optional[Value]  = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -147,6 +314,28 @@ class TensorCreateOp(Op):
                 raise ValueError(f"TensorCreateOp({self.kind.name}) must not specify 'like'")
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
 
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return () if self.like is None else (self.like,)
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "TensorCreateOp":
+        like = operands[0] if operands else None
+        return TensorCreateOp(
+            result_name=self.result_name,
+            kind=self.kind,
+            shape=self.shape,
+            dtype=self.dtype,
+            device=self.device,
+            fill_value=self.fill_value,
+            like=like,
+        )
+
 
 @dataclass(frozen=True, eq=False)
 class TupleOp(Op):
@@ -157,6 +346,19 @@ class TupleOp(Op):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return self.elems
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "TupleOp":
+        return TupleOp(result_name=self.result_name, elems=operands)
 
 
 @dataclass(frozen=True, eq=False)
@@ -169,6 +371,23 @@ class TupleGetItemOp(Op):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return (self.tup,)
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "TupleGetItemOp":
+        return TupleGetItemOp(
+            tup=operands[0],
+            index=self.index,
+            result_name=self.result_name,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +427,35 @@ class IfOp(Op):
             OpResult(op=self, index=i) for i in range(len(self.result_names))
         ))
 
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return (self.cond,)
+
+    @property
+    def regions(self) -> tuple[Region, ...]:
+        if self.else_region is None:
+            return (self.then_region,)
+        return (self.then_region, self.else_region)
+
+    @property
+    def effects(self) -> EffectSummary:
+        return _regions_effects(self.regions)
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "IfOp":
+        new_regions = self.regions if regions is None else regions
+        return IfOp(
+            cond=operands[0],
+            then_region=new_regions[0],
+            else_region=new_regions[1] if len(new_regions) > 1 else None,
+            result_names=self.result_names,
+        )
+
 
 @dataclass(frozen=True, eq=False)
 class ForOp(Op):
@@ -227,6 +475,49 @@ class ForOp(Op):
         object.__setattr__(self, "results", tuple(
             OpResult(op=self, index=i) for i in range(len(self.result_names))
         ))
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return (
+            self.range_.start,
+            self.range_.end,
+            self.range_.step,
+            *(ia.init for ia in self.iter_args),
+        )
+
+    @property
+    def regions(self) -> tuple[Region, ...]:
+        return (self.body_region,)
+
+    @property
+    def effects(self) -> EffectSummary:
+        return _regions_effects(self.regions)
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "ForOp":
+        n_range = 3
+        new_range = Range(
+            start=operands[0],
+            end=operands[1],
+            step=operands[2],
+        )
+        new_iter_args = tuple(
+            IterArg(var=ia.var, init=operands[n_range + i])
+            for i, ia in enumerate(self.iter_args)
+        )
+        new_regions = self.regions if regions is None else regions
+        return ForOp(
+            loop_var=self.loop_var,
+            range_=new_range,
+            iter_args=new_iter_args,
+            body_region=new_regions[0],
+            result_names=self.result_names,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +542,10 @@ class AllocStorageOp(Op):
             object.__setattr__(self, "size_bytes", IntImm(self.size_bytes))
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
 
+    @property
+    def effects(self) -> EffectSummary:
+        return EffectSummary(allocates=True)
+
 
 @dataclass(frozen=True, eq=False)
 class AllocTensorOp(Op):
@@ -269,6 +564,29 @@ class AllocTensorOp(Op):
         )
         object.__setattr__(self, "results", (OpResult(op=self, index=0),))
 
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return (self.storage,)
+
+    @property
+    def effects(self) -> EffectSummary:
+        return EffectSummary(alias=AliasInfo(AliasKind.view_of, source=self.storage))
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "AllocTensorOp":
+        return AllocTensorOp(
+            result_name=self.result_name,
+            storage=operands[0],
+            offset=self.offset,
+            shape=self.shape,
+            dtype=self.dtype,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Shape assertion Op
@@ -281,3 +599,57 @@ class ShapeAssertOp(Op):
     tensor:  Var
     dim_idx: int
     upper:   int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tensor, Var):
+            raise TypeError("ShapeAssertOp.tensor must be a BlockArg/Var")
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return (self.tensor,)
+
+    @property
+    def effects(self) -> EffectSummary:
+        return EffectSummary.readonly(self.tensor)
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "ShapeAssertOp":
+        return ShapeAssertOp(
+            tensor=operands[0],
+            dim_idx=self.dim_idx,
+            upper=self.upper,
+        )
+
+
+def _regions_effects(regions: tuple[Region, ...]) -> EffectSummary:
+    reads: list[Value] = []
+    writes: list[Value] = []
+    allocates = False
+    frees = False
+    opaque = False
+    external_state: str | None = None
+
+    for region in regions:
+        for block in region.blocks:
+            for op in block.ops:
+                effect = op.effects
+                reads.extend(effect.reads)
+                writes.extend(effect.writes)
+                allocates = allocates or effect.allocates
+                frees = frees or effect.frees
+                opaque = opaque or effect.opaque
+                external_state = external_state or effect.external_state
+
+    return EffectSummary(
+        reads=tuple(reads),
+        writes=tuple(writes),
+        allocates=allocates,
+        frees=frees,
+        opaque=opaque,
+        external_state=external_state,
+    )

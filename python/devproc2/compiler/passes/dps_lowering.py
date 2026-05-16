@@ -11,7 +11,8 @@ For each matched CallOp:
 Shape scalars (%M, %N, %K) in inputs are NOT inserted here; that is the job
 of ShapeExprLoweringPass (M7/X2). For M6, inputs = original op arguments.
 
-Effect is set to an opaque EffectSummary for all lowered kernels.
+Effect writes the destination buffer explicitly; opaque effects are reserved
+for calls whose behavior cannot be modeled more precisely.
 """
 from __future__ import annotations
 
@@ -93,7 +94,7 @@ class DPSLoweringPass(IRRewriter):
                         target_ref=KernelRef(kernel.kernel_name, kernel),
                         inputs=self.svs(op.args),
                         outputs=(create_op.results[0],),
-                        effect=EffectSummary.opaque_call(),
+                        effect=EffectSummary.write(create_op.results[0]),
                         attrs=op.attrs,
                     )
                     new_ops.append(create_op)

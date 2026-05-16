@@ -3,12 +3,16 @@ import pytest
 
 from devproc2.ir import (
     Add,
+    AliasAnalysis,
     Block,
+    BlockArg,
     CallDPSOp,
     CallOp,
     CeilDiv,
     Constant,
     EffectSummary,
+    ExternalFuncRef,
+    ExternalCallOp,
     FloorDiv,
     ForOp,
     Function,
@@ -30,6 +34,8 @@ from devproc2.ir import (
     Range,
     Region,
     ReturnOp,
+    ShapeAssertOp,
+    StandardCallOp,
     StandardOpRef,
     Sub,
     TensorCreateKind,
@@ -45,6 +51,7 @@ from devproc2.ir import (
     pmax,
     pmin,
     print_module,
+    make_call_op,
     verify,
 )
 
@@ -133,6 +140,18 @@ def test_tensor_struct_info_int_coercion():
     assert si.shape == (B, IntImm(4096))
 
 
+def test_block_arg_is_var_compatible_without_block_mutation():
+    x = BlockArg("x")
+    block = Block(args=(x,), ops=(ReturnOp((x,)),))
+    rewritten_block = Block(args=block.args, ops=block.ops)
+
+    assert Var is BlockArg
+    assert x.owner is None
+    assert x.index == 0
+    assert rewritten_block.args[0] is x
+    assert x.owner is None
+
+
 # ---------------------------------------------------------------------------
 # Printer tests
 # ---------------------------------------------------------------------------
@@ -210,6 +229,59 @@ def test_print_calldps_with_output():
     assert "call_dps @kernel.relu(" in text
     assert "outputs=[%out]" in text
     assert "effect=write(%out)" in text
+
+
+def test_common_op_interface_for_calls_and_effects():
+    x = Var("x")
+    out = Var("out")
+
+    standard = CallOp(std("relu"), args=(x,), result_name="y")
+    external = CallOp(ExternalFuncRef("runtime.log"), args=(x,), result_name="ignored")
+    dps = CallDPSOp(
+        target_ref=kernel_ref("kernel.relu"),
+        inputs=(x,),
+        outputs=(out,),
+        effect=EffectSummary.opaque_call(),
+    )
+
+    assert standard.operands == (x,)
+    assert standard.effects.is_pure
+    assert external.operands == (x,)
+    assert external.effects.opaque
+    assert external.effects.external_state == "runtime.log"
+    assert dps.op_ref == dps.target_ref
+    assert dps.operands == (x, out)
+    assert out in dps.effects.writes
+
+
+def test_make_call_op_projects_ref_kind_to_call_subclass():
+    x = Var("x")
+
+    standard = make_call_op(std("relu"), args=(x,), result_name="y")
+    external = make_call_op(ExternalFuncRef("runtime.log"), args=(x,), result_name="z")
+
+    assert isinstance(standard, StandardCallOp)
+    assert isinstance(external, ExternalCallOp)
+
+
+def test_alias_analysis_resolves_tuple_forwarding():
+    x = Var("x")
+    y = Var("y")
+    tup = TupleOp(result_name="pair", elems=(x, y))
+    item = TupleGetItemOp(tup=tup.results[0], index=1, result_name="picked")
+
+    aliases = AliasAnalysis((tup, item))
+
+    assert aliases.sources(tup.results[0]) == (x, y)
+    assert aliases.resolve_matching(item.results[0], lambda v: v is y) == frozenset({y})
+
+
+def test_shape_assert_requires_block_arg_tensor():
+    x = Var("x")
+    tup = TupleOp(result_name="pair", elems=(x,))
+
+    with pytest.raises(TypeError, match="BlockArg"):
+        ShapeAssertOp(tensor=tup.results[0], dim_idx=0, upper=1)
 
 
 def test_print_multi_function_separator():
@@ -406,6 +478,28 @@ def test_stage_verifier_keeps_tuple_ops_after_dps_lowering():
     fn = Function(Region((block,)))
 
     verify(IRModule({"f": fn}), stage=IRStage.dps)
+
+
+def test_stage_verifier_rejects_unlowered_kernel_op_in_dps_ir():
+    x = Var("x", TensorStructInfo((IntImm(4),), "float32", "cpu"))
+    call_op = CallOp(StandardOpRef("relu"), args=(x,), result_name="y")
+    y = call_op.results[0]
+    block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
+    fn = Function(Region((block,)))
+
+    with pytest.raises(IRVerificationError, match="not allowed in DPSIR"):
+        verify(IRModule({"f": fn}), stage=IRStage.dps)
+
+
+def test_stage_verifier_rejects_missing_struct_info_in_inferred_ir():
+    x = Var("x")
+    call_op = CallOp(StandardOpRef("relu"), args=(x,), result_name="y")
+    y = call_op.results[0]
+    block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
+    fn = Function(Region((block,)))
+
+    with pytest.raises(IRVerificationError, match="without struct_info"):
+        verify(IRModule({"f": fn}), stage=IRStage.inferred)
 
 
 def test_known_shape_hash_matches_tuple_equality():

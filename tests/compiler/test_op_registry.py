@@ -1,12 +1,15 @@
 import pytest
 
 from devproc2.compiler.op import get_op
+from devproc2.compiler.op.registry import register
+from devproc2.compiler.op.schema import LoweringPolicy, OpDef
 from devproc2.compiler.passes.dps_lowering import DPSLoweringPass
 from devproc2.compiler.passes.infer_struct_info import InferStructInfoPass
 from devproc2.ir import (
     AttrDict,
     Block,
     CallOp,
+    DialectKind,
     ExternalFuncRef,
     Function,
     IRModule,
@@ -30,6 +33,29 @@ def test_callop_resolves_registered_op_without_forcing_default_attrs():
     assert op.op_def is get_op("gelu")
     assert op.op_ref.name == "gelu"
     assert op.attrs == {}
+
+
+def test_standard_op_ref_inherits_registered_dialect():
+    name = "test_shape_marker"
+    op_def = get_op(name)
+    if op_def is None:
+        op_def = register(
+            OpDef(
+                name=name,
+                inputs=(),
+                attrs=(),
+                outputs=(),
+                infer=lambda ctx: None,
+                dialect=DialectKind.shape,
+                lowering=LoweringPolicy.none(),
+            )
+        )
+
+    ref = StandardOpRef(name, op_def)
+    call = CallOp(StandardOpRef(name), (), result_name="")
+
+    assert ref.dialect is DialectKind.shape
+    assert call.dialect is DialectKind.shape
 
 
 def test_registered_op_rejects_unknown_or_wrong_attrs():

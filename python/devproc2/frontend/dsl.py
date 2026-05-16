@@ -22,7 +22,6 @@ from devproc2.ir.nodes import (
 from devproc2.ir.op_ref import ExternalFuncRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
-    CallOp,
     ForOp,
     IfOp,
     IterArg,
@@ -32,6 +31,7 @@ from devproc2.ir.ops import (
     TensorCreateOp,
     TupleOp,
     YieldOp,
+    make_call_op,
 )
 from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
 from devproc2.compiler.op import get_op
@@ -305,7 +305,7 @@ class DSLBuilder:
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 result_name = self._pick_name(name)
-                call_op = CallOp(
+                call_op = make_call_op(
                     op_ref=self._op_ref_for_callee(callee, produces_result=True),
                     args=args,
                     result_name=result_name,
@@ -317,7 +317,7 @@ class DSLBuilder:
             else:
                 pre_ops, val = self._materialize_value(val_expr)
                 result_name = self._pick_name(name)
-                call_op = CallOp(
+                call_op = make_call_op(
                     op_ref=StandardOpRef("identity", get_op("identity")),
                     args=(val,),
                     result_name=result_name,
@@ -334,7 +334,7 @@ class DSLBuilder:
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 return pre_ops + [
-                    CallOp(
+                    make_call_op(
                         op_ref=self._op_ref_for_callee(callee, produces_result=False),
                         args=args,
                     )
@@ -567,7 +567,7 @@ class DSLBuilder:
             callee = self._extract_callee(node.func)
             pre_ops, args = self._materialize_args(node.args)
             tmp_name = self._fresh("tmp")
-            call_op = CallOp(
+            call_op = make_call_op(
                 op_ref=self._op_ref_for_callee(callee, produces_result=True),
                 args=args,
                 result_name=tmp_name,
@@ -583,7 +583,7 @@ class DSLBuilder:
                 }.get(type(node.ops[0]), "__cmp__")
                 rhs_pre, rhs = self._materialize_value(node.comparators[0])
                 cmp_name = self._fresh("cmp")
-                cmp_op = CallOp(
+                cmp_op = make_call_op(
                     op_ref=StandardOpRef(op_name, get_op(op_name)),
                     args=(lhs, rhs),
                     result_name=cmp_name,
