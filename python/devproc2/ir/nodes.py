@@ -70,6 +70,17 @@ class TensorStructInfo(StructInfo):
         )
 
 
+@dataclass(frozen=True)
+class ScalarStructInfo(StructInfo):
+    dtype: str
+
+
+@dataclass(frozen=True)
+class ObjectStructInfo(StructInfo):
+    type_key: str
+    role: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # EffectInfo — side-effect annotation for CallDPSOp
 # ---------------------------------------------------------------------------

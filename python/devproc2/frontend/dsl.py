@@ -23,6 +23,7 @@ from devproc2.ir.nodes import (
 from devproc2.ir.ops import (
     CallDPSOp,
     CalleeKind,
+    CallKind,
     CallOp,
     ForOp,
     IfOp,
@@ -36,6 +37,7 @@ from devproc2.ir.ops import (
     YieldOp,
 )
 from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
+from devproc2.compiler.op import get_op
 from devproc2.frontend.scope import ScopeStack
 from devproc2.kernel.registry import KernelRegistry, KernelSpec
 
@@ -306,7 +308,12 @@ class DSLBuilder:
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 result_name = self._pick_name(name)
-                call_op = CallOp(callee=callee, args=args, result_name=result_name)
+                call_op = CallOp(
+                    callee=callee,
+                    args=args,
+                    result_name=result_name,
+                    call_kind=self._call_kind_for_callee(callee, produces_result=True),
+                )
                 self.scope.define(name, call_op.results[0])
                 return pre_ops + [call_op]
             elif isinstance(val_expr, ast.If):
@@ -326,7 +333,13 @@ class DSLBuilder:
                     return [self._build_call_dps_packed(val_expr)]
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
-                return pre_ops + [CallOp(callee=callee, args=args)]
+                return pre_ops + [
+                    CallOp(
+                        callee=callee,
+                        args=args,
+                        call_kind=self._call_kind_for_callee(callee, produces_result=False),
+                    )
+                ]
             return []
 
         if isinstance(stmt, ast.If):
@@ -556,7 +569,12 @@ class DSLBuilder:
             callee = self._extract_callee(node.func)
             pre_ops, args = self._materialize_args(node.args)
             tmp_name = self._fresh("tmp")
-            call_op = CallOp(callee=callee, args=args, result_name=tmp_name)
+            call_op = CallOp(
+                callee=callee,
+                args=args,
+                result_name=tmp_name,
+                call_kind=self._call_kind_for_callee(callee, produces_result=True),
+            )
             return pre_ops + [call_op], call_op.results[0]
         if isinstance(node, ast.Compare):
             lhs_pre, lhs = self._materialize_value(node.left)
@@ -604,6 +622,11 @@ class DSLBuilder:
         if isinstance(node, ast.Name):
             return f"@{node.id}"
         return f"@{ast.unparse(node)}"
+
+    def _call_kind_for_callee(self, callee: str, *, produces_result: bool) -> CallKind:
+        if get_op(callee) is not None:
+            return CallKind.standard
+        return CallKind.standard if produces_result else CallKind.external
 
     def _pick_name(self, python_name: str) -> str:
         """Return a unique SSA name for python_name (fresh if already in scope)."""

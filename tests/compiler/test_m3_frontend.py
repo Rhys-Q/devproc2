@@ -37,7 +37,7 @@ def test_frontend_decode_step():
         else:
             y = dp.ops.gelu(x)
         for i in dp.range(0, n):
-            y = dp.ops.layernorm(y)
+            y = dp.ops.silu(y)
         return y
 
     module = decode_step.lower_module()
@@ -75,7 +75,7 @@ def test_frontend_decode_step_printed_ir():
         else:
             y = dp.ops.gelu(x)
         for i in dp.range(0, n):
-            y = dp.ops.layernorm(y)
+            y = dp.ops.silu(y)
         return y
 
     text = print_module(decode_step.lower_module())
@@ -85,7 +85,7 @@ def test_frontend_decode_step_printed_ir():
     assert "@gelu" in text
     assert "for %i in range" in text
     assert "iter_args" in text
-    assert "@layernorm" in text
+    assert "@silu" in text
     assert "return" in text
 
 

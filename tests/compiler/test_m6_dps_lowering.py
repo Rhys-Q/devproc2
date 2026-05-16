@@ -33,9 +33,9 @@ def _relu_spec(**kwargs) -> KernelSpec:
     return KernelSpec(**defaults)
 
 
-def _layernorm_spec(**kwargs) -> KernelSpec:
-    defaults = dict(op_name="layernorm", device="cuda", input_dtypes=("float16",),
-                    kernel_name="kernel.layernorm_fp16")
+def _silu_spec(**kwargs) -> KernelSpec:
+    defaults = dict(op_name="silu", device="cuda", input_dtypes=("float16",),
+                    kernel_name="kernel.silu_fp16")
     defaults.update(kwargs)
     return KernelSpec(**defaults)
 
@@ -321,15 +321,15 @@ def test_dps_lowering_printed_ir():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     module = InferStructInfoPass().run(main.lower_module())
-    module = DPSLoweringPass(_make_registry(_layernorm_spec())).run(module)
+    module = DPSLoweringPass(_make_registry(_silu_spec())).run(module)
     text = print_module(module)
     assert "dp.empty" in text
     assert "call_dps" in text
-    assert "kernel.layernorm_fp16" in text
+    assert "kernel.silu_fp16" in text
 
 
 def test_dps_lowering_sm_arch_selects_correct_kernel():
@@ -380,12 +380,12 @@ def test_full_m6_pipeline():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     module = main.lower_module()
     module = InferStructInfoPass().run(module)
-    module = DPSLoweringPass(_make_registry(_layernorm_spec())).run(module)
+    module = DPSLoweringPass(_make_registry(_silu_spec())).run(module)
 
     verify(module)
 
@@ -400,7 +400,7 @@ def test_full_m6_pipeline():
     assert create_op.dtype == "float16"
     assert create_op.device == "cuda"
 
-    assert dps_op.callee == "kernel.layernorm_fp16"
+    assert dps_op.callee == "kernel.silu_fp16"
     assert dps_op.output is create_op.results[0]
 
 
@@ -421,17 +421,17 @@ def test_m4_regression_no_lowering_without_registry():
 
 
 def test_dps_lowering_chained_ops():
-    """Chain: z = layernorm(relu(x)).  Both ops must be lowered and the
-    _sub substitution must correctly wire layernorm's input to relu's buffer."""
+    """Chain: z = silu(relu(x)).  Both ops must be lowered and the
+    _sub substitution must correctly wire silu's input to relu's buffer."""
     B = dp.symbolic_dim("B", upper=8)
 
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
         y = dp.ops.relu(x)
-        z = dp.ops.layernorm(y)
+        z = dp.ops.silu(y)
         return z
 
-    reg = _make_registry(_relu_spec(), _layernorm_spec())
+    reg = _make_registry(_relu_spec(), _silu_spec())
     module = InferStructInfoPass().run(f.lower_module())
     module = DPSLoweringPass(reg).run(module)
 

@@ -10,6 +10,8 @@ from devproc2.compiler.pass_context import PassContext
 from devproc2.ir.nodes import (
     Function,
     IRModule,
+    ObjectStructInfo,
+    ScalarStructInfo,
     TensorStructInfo,
 )
 from devproc2.ir.prim_expr import (
@@ -50,6 +52,21 @@ def _tensor_struct_info_to_dict(si: TensorStructInfo) -> dict[str, Any]:
         "shape": [_shape_dim_to_json(d) for d in si.shape],
         "device": si.device,
     }
+
+
+def _struct_info_to_input_dict(si) -> dict[str, Any]:
+    if isinstance(si, TensorStructInfo):
+        entry = {"kind": "tensor"}
+        entry.update(_tensor_struct_info_to_dict(si))
+        return entry
+    if isinstance(si, ScalarStructInfo):
+        return {"kind": "scalar", "dtype": si.dtype}
+    if isinstance(si, ObjectStructInfo):
+        entry = {"kind": "object", "type_key": si.type_key}
+        if si.role is not None:
+            entry["role"] = si.role
+        return entry
+    return {"kind": "unknown"}
 
 
 def _function_entry_to_dict(fe) -> dict[str, Any]:
@@ -148,10 +165,11 @@ class EmitABIPass:
 
         for param in fn.params:
             si = param.struct_info
-            if isinstance(si, TensorStructInfo):
+            if si is not None:
                 entry = {"name": param.name}
-                entry.update(_tensor_struct_info_to_dict(si))
+                entry.update(_struct_info_to_input_dict(si))
                 inputs_json.append(entry)
+            if isinstance(si, TensorStructInfo):
                 shape_constraints.update(self._constraints_from_struct_info(si))
 
         ret = fn.ret_struct_info

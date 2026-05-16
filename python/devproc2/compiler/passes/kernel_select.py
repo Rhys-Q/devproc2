@@ -4,7 +4,8 @@ from __future__ import annotations
 from typing import Optional
 
 from devproc2.ir.nodes import IRModule, Region, TensorStructInfo
-from devproc2.ir.ops import CallOp
+from devproc2.compiler.op import LoweringKind, get_op
+from devproc2.ir.ops import CallKind, CallOp
 from devproc2.kernel.registry import (
     KernelMatchKey,
     KernelRegistry,
@@ -39,10 +40,15 @@ class KernelSelectPass:
         for block in region.blocks:
             for op in block.ops:
                 if isinstance(op, CallOp) and op.results:
+                    op_def = op.op or get_op(op.callee)
+                    if op.call_kind != CallKind.standard or op_def is None:
+                        continue
+                    if op_def.lowering_kind != LoweringKind.kernel:
+                        continue
                     si = op.results[0].struct_info
                     if isinstance(si, TensorStructInfo):
                         key = KernelMatchKey(
-                            op_name=op.callee.lstrip("@"),
+                            op_name=op.op_name,
                             device=si.device,
                             input_dtypes=build_input_dtypes(op.args),
                         )

@@ -25,12 +25,14 @@ from devproc2.ir.nodes import (
     TensorStructInfo,
 )
 from devproc2.ir.ops import (
+    CallKind,
     CallDPSOp,
     CalleeKind,
     CallOp,
     TensorCreateKind,
     TensorCreateOp,
 )
+from devproc2.compiler.op import LoweringKind, get_op
 from devproc2.kernel.registry import (
     KernelMatchKey,
     KernelRegistry,
@@ -59,6 +61,19 @@ class DPSLoweringPass(IRRewriter):
         new_ops = []
         for op in block.ops:
             if isinstance(op, CallOp) and op.results:
+                op_def = op.op or get_op(op.callee)
+                if op.call_kind != CallKind.standard or op_def is None:
+                    new_op = self._subst_op(op)
+                    for old_r, new_r in zip(op.results, new_op.results):
+                        self._sub[old_r] = new_r
+                    new_ops.append(new_op)
+                    continue
+                if op_def.lowering_kind != LoweringKind.kernel:
+                    new_op = self._subst_op(op)
+                    for old_r, new_r in zip(op.results, new_op.results):
+                        self._sub[old_r] = new_r
+                    new_ops.append(new_op)
+                    continue
                 si = op.results[0].struct_info
                 kernel = self._lookup(op, si)
                 if kernel is not None:
@@ -77,6 +92,7 @@ class DPSLoweringPass(IRRewriter):
                         inputs=self.svs(op.args),
                         output=create_op.results[0],
                         effect=OpaqueEffect(),
+                        attrs=op.attrs,
                     )
                     new_ops.append(create_op)
                     new_ops.append(dps_op)
@@ -92,7 +108,7 @@ class DPSLoweringPass(IRRewriter):
         if not isinstance(si, TensorStructInfo):
             return None
         key = KernelMatchKey(
-            op_name=op.callee.lstrip("@"),
+            op_name=op.op_name,
             device=si.device,
             input_dtypes=build_input_dtypes(op.args),
         )

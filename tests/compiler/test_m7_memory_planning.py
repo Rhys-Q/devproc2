@@ -218,12 +218,12 @@ def test_dynamic_shape_tensors_can_share_storage():
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # same shape as a; intervals don't overlap
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -276,16 +276,16 @@ def test_reuse_intermediate_tensors():
 
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
-        a = dp.ops.relu(x)       # intermediate: a used only by layernorm
-        b = dp.ops.layernorm(a)  # b is returned
+        a = dp.ops.relu(x)       # intermediate: a used only by silu
+        b = dp.ops.silu(a)  # b is returned
         return b
 
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
 
-    # a is intermediate (live: relu → layernorm); b is returned
+    # a is intermediate (live: relu → silu); b is returned
     # a is reusable, b is not → they get different storage
     assert len(plan.entries) == 2
     a_id = plan.tensor_to_storage["a"]
@@ -302,14 +302,14 @@ def test_reuse_three_sequential_intermediates():
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.silu(b)
         return c
 
     silu_spec = KernelSpec(op_name="silu", device="cuda",
                            input_dtypes=("float16",),
                            kernel_name="kernel.silu_fp16")
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"), silu_spec)
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"), silu_spec)
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -335,12 +335,12 @@ def test_at_least_two_tensors_share_storage():
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # c is intermediate; same shape as a
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -583,14 +583,14 @@ def test_per_function_plan_keys():
 
     @dp.function
     def g(x: dp.Tensor[(B, 512), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     module = IRModule()
     module.functions["f"] = f.lower_module().functions["f"]
     module.functions["g"] = g.lower_module().functions["g"]
     module = InferStructInfoPass().run(module)
-    module = DPSLoweringPass(_reg(_spec("relu"), _spec("layernorm"))).run(module)
+    module = DPSLoweringPass(_reg(_spec("relu"), _spec("silu"))).run(module)
 
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
@@ -616,12 +616,12 @@ def test_acceptance_storage_plan_json_shape():
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # intermediate; reuses a's storage
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(main.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(main.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -651,12 +651,12 @@ def test_acceptance_lower_alloc_ir():
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # c reuses a's storage
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(main.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(main.lower_module(), _spec("relu"), _spec("silu"))
 
     # MemoryPlanningPass: IRModule unchanged
     ctx = PassContext()
@@ -771,12 +771,12 @@ def test_dynamic_reuse_with_reconstructed_primvars():
     create_a = TensorCreateOp("a", TensorCreateKind.empty, shape1, "float16", "cuda")
     dps_a = CallDPSOp("k.relu", CalleeKind.kernel, (x,), create_a.results[0], OpaqueEffect())
     create_b = TensorCreateOp("b", TensorCreateKind.empty, shape2, "float16", "cuda")
-    dps_b = CallDPSOp("k.layernorm", CalleeKind.kernel, (create_a.results[0],), create_b.results[0], OpaqueEffect())
+    dps_b = CallDPSOp("k.silu", CalleeKind.kernel, (create_a.results[0],), create_b.results[0], OpaqueEffect())
     # Manufacture two more ops so a and b don't overlap
     create_c = TensorCreateOp("c", TensorCreateKind.empty, shape1, "float16", "cuda")
     dps_c = CallDPSOp("k.relu", CalleeKind.kernel, (create_b.results[0],), create_c.results[0], OpaqueEffect())
     create_d = TensorCreateOp("d", TensorCreateKind.empty, shape2, "float16", "cuda")
-    dps_d = CallDPSOp("k.layernorm", CalleeKind.kernel, (create_c.results[0],), create_d.results[0], OpaqueEffect())
+    dps_d = CallDPSOp("k.silu", CalleeKind.kernel, (create_c.results[0],), create_d.results[0], OpaqueEffect())
     ret = ReturnOp((create_d.results[0],))
 
     block = Block(args=(x,), ops=(

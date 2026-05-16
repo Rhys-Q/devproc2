@@ -17,6 +17,7 @@ from devproc2.ir.nodes import (
 )
 from devproc2.ir.ops import (
     CallDPSOp,
+    CallKind,
     CallOp,
     ForOp,
     IfOp,
@@ -27,6 +28,7 @@ from devproc2.ir.ops import (
     TupleOp,
     YieldOp,
 )
+from devproc2.compiler.op import get_op
 
 _FORBIDDEN_CALLEES = frozenset({"@alloc_storage", "@alloc_tensor"})
 
@@ -160,6 +162,7 @@ class Verifier:
         if isinstance(op, CallOp):
             for v in _value_refs(op.args):
                 chk(v)
+            self._verify_call_op_schema(fn_name, op)
 
         elif isinstance(op, CallDPSOp):
             for v in _value_refs(op.inputs):
@@ -290,6 +293,28 @@ class Verifier:
                 f"In @{fn_name}: {node_name} is forbidden in high-level IR "
                 f"(use TensorCreateOp instead)"
             )
+
+    def _verify_call_op_schema(self, fn_name: str, op: CallOp) -> None:
+        op_def = op.op or get_op(op.callee)
+        if op.call_kind == CallKind.standard:
+            if op_def is None:
+                raise IRVerificationError(
+                    f"In @{fn_name}: unknown standard op {op.callee!r}; "
+                    "mark the call as external for opaque runtime calls"
+                )
+            try:
+                op_def.validate_call(op.args, op.attrs)
+            except (TypeError, ValueError) as err:
+                raise IRVerificationError(f"In @{fn_name}: {err}") from err
+            if op.results and not op_def.outputs:
+                raise IRVerificationError(
+                    f"In @{fn_name}: {op.callee} produces no schema outputs "
+                    f"but CallOp has {len(op.results)} result(s)"
+                )
+        elif op.call_kind == CallKind.external:
+            return
+        else:
+            raise IRVerificationError(f"In @{fn_name}: unknown CallKind {op.call_kind!r}")
 
 
 # ---------------------------------------------------------------------------

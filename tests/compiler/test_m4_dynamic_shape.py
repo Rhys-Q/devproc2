@@ -81,7 +81,7 @@ def test_function_typed_params_struct_info():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     fn = main.lower_module().functions["main"]
@@ -108,7 +108,7 @@ def test_function_typed_params_verifier_passes():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     verify(main.lower_module())
@@ -124,7 +124,7 @@ def test_infer_struct_info_propagates_through_call():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     module = InferStructInfoPass().run(main.lower_module())
@@ -169,7 +169,7 @@ def test_shape_assertion_insert_ops_prepended():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     module = ShapeAssertionInsertPass().run(main.lower_module())
@@ -208,7 +208,7 @@ def test_shape_assertion_insert_printed_ir():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     text = print_module(ShapeAssertionInsertPass().run(main.lower_module()))
@@ -222,7 +222,7 @@ def test_shape_assertion_insert_verifier_passes():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     verify(ShapeAssertionInsertPass().run(main.lower_module()))
@@ -250,7 +250,7 @@ def _make_asserted_module():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     return ShapeAssertionInsertPass().run(main.lower_module())
@@ -307,7 +307,7 @@ def test_full_m4_pipeline():
 
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     module = main.lower_module()
@@ -344,7 +344,7 @@ def test_m3_regression_no_annotations():
         else:
             y = dp.ops.silu(x)
         for i in dp.range(0, n):
-            y = dp.ops.layernorm(y)
+            y = dp.ops.silu(y)
         return y
 
     verify(decode_step.lower_module())

@@ -1,1 +1,52 @@
-from devproc2 import ir  # noqa: F401
+from devproc2 import ir, nn  # noqa: F401
+from devproc2.compiler.op import (
+    add,
+    adarms_norm,
+    call,
+    embedding,
+    gelu,
+    layer_norm,
+    matmul,
+    multiply,
+    permute_dims,
+    relu,
+    rms_norm,
+    silu,
+    transpose,
+)
+from devproc2.frontend.dsl import (
+    Tensor,
+    call_dps_packed,
+    empty,
+    function,
+    kernel,
+    range,
+    reset_module,
+    symbolic_dim,
+)
+
+__all__ = [
+    "Tensor",
+    "add",
+    "adarms_norm",
+    "call",
+    "call_dps_packed",
+    "embedding",
+    "empty",
+    "function",
+    "gelu",
+    "ir",
+    "kernel",
+    "layer_norm",
+    "matmul",
+    "multiply",
+    "nn",
+    "permute_dims",
+    "range",
+    "relu",
+    "reset_module",
+    "rms_norm",
+    "silu",
+    "symbolic_dim",
+    "transpose",
+]

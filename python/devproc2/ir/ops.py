@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
+from typing import Mapping, Optional
 
 from devproc2.ir.nodes import (
     Block,
@@ -46,6 +46,18 @@ class CalleeKind(Enum):
     kernel      = auto()
 
 
+class CallKind(Enum):
+    """High-level call classification.
+
+    ``standard`` calls must resolve to an op registry entry before they enter
+    verified compiler pipelines.  ``external`` calls are opaque escape hatches
+    such as runtime callbacks or effect-only custom calls.
+    """
+
+    standard = auto()
+    external = auto()
+
+
 # ---------------------------------------------------------------------------
 # Compute Ops
 # ---------------------------------------------------------------------------
@@ -62,12 +74,34 @@ class CallOp(Op):
     args:               tuple[Value, ...]
     result_name:        str                  = ""
     result_struct_info: Optional[StructInfo] = None
+    attrs:              Mapping[str, object] = field(default_factory=dict)
+    call_kind:          CallKind             = CallKind.standard
+    op:                 object | None        = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "callee", _normalize_callee(self.callee))
+        if not isinstance(self.call_kind, CallKind):
+            object.__setattr__(self, "call_kind", CallKind[self.call_kind])
+        op_def = _lookup_standard_op(self.callee)
+        if op_def is not None:
+            object.__setattr__(self, "op", op_def)
+            object.__setattr__(
+                self,
+                "attrs",
+                op_def.normalize_attrs(self.attrs, include_defaults=False),
+            )
+        else:
+            object.__setattr__(self, "attrs", dict(self.attrs or {}))
         if self.result_name:
             object.__setattr__(self, "results", (
                 OpResult(op=self, index=0, struct_info=self.result_struct_info),
             ))
+
+    @property
+    def op_name(self) -> str:
+        if self.op is not None:
+            return self.op.name
+        return self.callee.lstrip("@")
 
 
 @dataclass(frozen=True, eq=False)
@@ -82,6 +116,10 @@ class CallDPSOp(Op):
     inputs:      tuple[Value, ...]
     output:      Optional[Value]
     effect:      EffectInfo
+    attrs:       Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "attrs", dict(self.attrs or {}))
 
 
 class TensorCreateKind(Enum):
@@ -244,3 +282,15 @@ class ShapeAssertOp(Op):
     tensor:  Var
     dim_idx: int
     upper:   int
+
+
+def _normalize_callee(callee: str) -> str:
+    return callee if callee.startswith("@") else f"@{callee}"
+
+
+def _lookup_standard_op(callee: str) -> object | None:
+    try:
+        from devproc2.compiler.op.registry import get_op
+    except Exception:
+        return None
+    return get_op(callee)

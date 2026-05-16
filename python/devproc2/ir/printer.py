@@ -12,9 +12,11 @@ from devproc2.ir.nodes import (
     OpaqueEffect,
     Op,
     OpResult,
+    ObjectStructInfo,
     PureEffect,
     ReadOnlyEffect,
     Region,
+    ScalarStructInfo,
     StructInfo,
     TensorStructInfo,
     TerminatorOp,
@@ -157,7 +159,7 @@ class Printer:
 
         elif isinstance(op, CallOp):
             args_str = ", ".join(self._value_str(a) for a in op.args)
-            expr = f"{op.callee}({args_str})"
+            expr = f"{op.callee}({args_str}){self._attrs_str(op.attrs)}"
             if op.results:
                 rname = self._result_names[id(op.results[0])]
                 self._buf.write(f"{indent}%{rname} = {expr}\n")
@@ -225,7 +227,10 @@ class Printer:
         self._buf.write(f"{inner}inputs={inputs_str},\n")
         self._buf.write(f"{inner}output={output_str},\n")
         self._buf.write(f"{inner}callee_kind={op.callee_kind.name},\n")
-        self._buf.write(f"{inner}effect={self._effect_str(op.effect)}\n")
+        self._buf.write(f"{inner}effect={self._effect_str(op.effect)}")
+        if op.attrs:
+            self._buf.write(f",\n{inner}attrs={self._attrs_str(op.attrs)}")
+        self._buf.write("\n")
         self._buf.write(f"{indent})\n")
 
     # ------------------------------------------------------------------
@@ -307,10 +312,37 @@ class Printer:
             return repr(v.value)
         return repr(v)
 
+    def _attrs_str(self, attrs: object) -> str:
+        if not attrs:
+            return ""
+        parts = [f"{key}={self._attr_value_str(attrs[key])}" for key in sorted(attrs)]
+        return " {" + ", ".join(parts) + "}"
+
+    def _attr_value_str(self, value: object) -> str:
+        if isinstance(value, str):
+            return repr(value)
+        if isinstance(value, tuple):
+            return "[" + ", ".join(self._attr_value_str(v) for v in value) + "]"
+        if isinstance(value, list):
+            return "[" + ", ".join(self._attr_value_str(v) for v in value) + "]"
+        if isinstance(value, dict):
+            parts = [
+                f"{self._attr_value_str(k)}: {self._attr_value_str(value[k])}"
+                for k in sorted(value)
+            ]
+            return "{" + ", ".join(parts) + "}"
+        return repr(value)
+
     def print_struct_info(self, si: StructInfo) -> str:
         if isinstance(si, TensorStructInfo):
             shape_str = ", ".join(self.print_prim_expr(s) for s in si.shape)
             return f"Tensor[({shape_str}), {si.dtype}, {si.device}]"
+        if isinstance(si, ScalarStructInfo):
+            return f"Scalar[{si.dtype}]"
+        if isinstance(si, ObjectStructInfo):
+            if si.role is not None:
+                return f"Object[{si.type_key}, role={si.role}]"
+            return f"Object[{si.type_key}]"
         raise NotImplementedError(f"No printer for StructInfo type: {type(si).__name__}")
 
     def print_prim_expr(self, e: PrimExpr) -> str:
