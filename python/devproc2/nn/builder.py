@@ -26,6 +26,7 @@ from devproc2.ir.nodes import (
 from devproc2.ir.ops import (
     CallDPSOp,
     CallOp,
+    CudaCallOp,
     ReturnOp,
     TensorCreateKind,
     TensorCreateOp,
@@ -33,6 +34,7 @@ from devproc2.ir.ops import (
     TupleOp,
     make_call_op,
 )
+from devproc2.kernel.registry import KernelLaunchSpec
 
 from devproc2.nn.module import Module
 from devproc2.nn.specs import ObjectSpec, Parameter, ScalarSpec, TensorSpec
@@ -43,6 +45,7 @@ class GraphBuilder:
         self._ops: list[Op] = []
         self._counter = 0
         self._param_values: dict[int, TraceValue] = {}
+        self._uninitialized_empty_values: set[int] = set()
 
     def build(
         self,
@@ -52,6 +55,7 @@ class GraphBuilder:
         self._ops = []
         self._counter = 0
         self._param_values = {}
+        self._uninitialized_empty_values = set()
 
         root = getattr(model_method, "__self__", None)
         if isinstance(root, Module):
@@ -262,6 +266,40 @@ class GraphBuilder:
         self._ops.append(dps)
         return TraceValue(create.results[0], self)
 
+    def emit_cuda_call(
+        self,
+        source_symbol: str,
+        *,
+        args: object | None = None,
+        attrs: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        source_path, symbol = _parse_cuda_source_symbol(source_symbol)
+        metadata = dict(metadata or {})
+        ir_args = tuple(_unwrap_trace_value(arg) for arg in _as_sequence(args))
+        output_indices = _resolve_cuda_output_indices(
+            ir_args,
+            metadata,
+            self._uninitialized_empty_values,
+        )
+        for idx in output_indices:
+            self._uninitialized_empty_values.discard(id(ir_args[idx]))
+        op = CudaCallOp(
+            source_path=source_path,
+            symbol=symbol,
+            args=ir_args,
+            output_indices=output_indices,
+            launch=_resolve_cuda_launch(metadata),
+            attrs=attrs or {},
+            sm_arches=tuple(int(v) for v in _metadata_tuple(metadata.get("sm_arches", ()))),
+            include_dirs=tuple(str(v) for v in _metadata_tuple(metadata.get("include_dirs", ()))),
+            extra_nvcc_flags=tuple(str(v) for v in _metadata_tuple(metadata.get("extra_nvcc_flags", ()))),
+            compile_options=dict(metadata.get("compile_options", {})),
+            kernel_name=metadata.get("kernel_name"),
+            effect=_cuda_call_effect(metadata, tuple(ir_args[i] for i in output_indices), symbol),
+        )
+        self._ops.append(op)
+
     def emit_empty(
         self,
         shape: object,
@@ -279,6 +317,7 @@ class GraphBuilder:
             device=device,
         )
         self._ops.append(create)
+        self._uninitialized_empty_values.add(id(create.results[0]))
         return TraceValue(create.results[0], self)
 
     def emit_tensor_view(
@@ -468,6 +507,79 @@ def _dps_effect(effect: str, outputs: tuple[Value, ...], target: str) -> EffectS
     if effect == "pure":
         return EffectSummary.write(*outputs)
     return EffectSummary(writes=outputs, opaque=True, external_state=target)
+
+
+def _parse_cuda_source_symbol(source_symbol: str) -> tuple[str, str]:
+    if not isinstance(source_symbol, str) or "::" not in source_symbol:
+        raise ValueError("cuda_call source_symbol must be 'path/to/file.cu::symbol'")
+    source_path, symbol = source_symbol.rsplit("::", 1)
+    if not source_path or not symbol:
+        raise ValueError("cuda_call source_symbol must include both source path and symbol")
+    return source_path, symbol
+
+
+def _resolve_cuda_output_indices(
+    ir_args: tuple[Value, ...],
+    metadata: dict[str, object],
+    uninitialized_empty_values: set[int],
+) -> tuple[int, ...]:
+    explicit = metadata.pop("output_indices", metadata.pop("outputs", None))
+    if explicit is not None:
+        if isinstance(explicit, int):
+            indices = (explicit,)
+        else:
+            indices = tuple(int(v) for v in explicit)
+        for idx in indices:
+            if idx < 0 or idx >= len(ir_args):
+                raise ValueError(f"cuda_call output index {idx} is out of range")
+        return indices
+    return tuple(
+        idx
+        for idx, value in enumerate(ir_args)
+        if id(value) in uninitialized_empty_values
+    )
+
+
+def _resolve_cuda_launch(metadata: dict[str, object]) -> KernelLaunchSpec:
+    launch = metadata.get("launch")
+    if isinstance(launch, KernelLaunchSpec):
+        return launch
+    grid = metadata.get("grid", (1, 1, 1))
+    block = metadata.get("block", (256, 1, 1))
+    if not isinstance(grid, (tuple, list)):
+        grid = (grid, 1, 1)
+    elif len(grid) == 1:
+        grid = (grid[0], 1, 1)
+    if not isinstance(block, (tuple, list)):
+        block = (block, 1, 1)
+    elif len(block) == 1:
+        block = (block[0], 1, 1)
+    return KernelLaunchSpec(
+        grid=tuple(grid),
+        block=tuple(block),
+        shared_memory_bytes=int(metadata.get("shared_memory_bytes", 0)),
+    )
+
+
+def _cuda_call_effect(
+    metadata: dict[str, object],
+    outputs: tuple[Value, ...],
+    symbol: str,
+) -> EffectSummary:
+    effect = str(metadata.get("effect", "opaque"))
+    if effect == "pure":
+        return EffectSummary.write(*outputs)
+    return EffectSummary(writes=outputs, opaque=True, external_state=symbol)
+
+
+def _metadata_tuple(value: object) -> tuple:
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    return (value,)
 
 
 _CURRENT_BUILDER: Optional[GraphBuilder] = None

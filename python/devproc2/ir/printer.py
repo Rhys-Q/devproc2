@@ -27,6 +27,7 @@ from devproc2.ir.ops import (
     AllocTensorOp,
     CallDPSOp,
     CallOp,
+    CudaCallOp,
     ForOp,
     IfOp,
     ReturnOp,
@@ -166,6 +167,9 @@ class Printer:
         elif isinstance(op, CallDPSOp):
             self._print_calldps(op, indent)
 
+        elif isinstance(op, CudaCallOp):
+            self._print_cuda_call(op, indent)
+
         elif isinstance(op, TensorCreateOp):
             rname = self._result_names[id(op.results[0])]
             self._buf.write(f"{indent}%{rname} = {self._tensor_create_str(op)}\n")
@@ -238,6 +242,18 @@ class Printer:
             self._buf.write(f",\n{inner}attrs={self._attrs_str(op.attrs)}")
         self._buf.write("\n")
         self._buf.write(f"{indent})\n")
+
+    def _print_cuda_call(self, op: CudaCallOp, indent: str) -> None:
+        args_str = "[" + ", ".join(self._value_str(a) for a in op.args) + "]"
+        outputs_str = "[" + ", ".join(str(i) for i in op.output_indices) + "]"
+        source_symbol = f"{op.source_path}::{op.symbol}"
+        self._buf.write(
+            f"{indent}cuda_call({source_symbol!r}, args={args_str}, "
+            f"outputs={outputs_str}, launch={op.launch!r}"
+        )
+        if op.attrs:
+            self._buf.write(f", attrs={self._attrs_str(op.attrs)}")
+        self._buf.write(")\n")
 
     # ------------------------------------------------------------------
     # IfOp

@@ -281,6 +281,90 @@ class CallDPSOp(Op):
         )
 
 
+@dataclass(frozen=True, eq=False)
+class CudaCallOp(Op):
+    """Unregistered CUDA source-symbol custom call.
+
+    ``args`` preserve the exact CUDA kernel ABI order written in Python.
+    ``output_indices`` identifies which args are destinations for effect and
+    alias analysis, without moving them to the end of the VM argument list.
+    Lowering turns this op into ``CallDPSOp(KernelRef(KernelSpec(...)))``.
+    """
+
+    dialect: ClassVar[DialectKind] = DialectKind.runtime
+    source_path: str
+    symbol: str
+    args: tuple[Value, ...]
+    output_indices: tuple[int, ...] = ()
+    launch: object | None = None
+    attrs: AttrDict | Mapping[str, object] = field(default_factory=AttrDict.empty)
+    sm_arches: tuple[int, ...] = ()
+    include_dirs: tuple[str, ...] = ()
+    extra_nvcc_flags: tuple[str, ...] = ()
+    compile_options: Mapping[str, object] = field(default_factory=dict)
+    kernel_name: str | None = None
+    effect: EffectSummary | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attrs, AttrDict):
+            object.__setattr__(self, "attrs", AttrDict.from_python(self.attrs))
+        object.__setattr__(self, "args", tuple(self.args))
+        object.__setattr__(self, "output_indices", tuple(int(i) for i in self.output_indices))
+        object.__setattr__(self, "sm_arches", tuple(int(v) for v in self.sm_arches))
+        object.__setattr__(self, "include_dirs", tuple(self.include_dirs))
+        object.__setattr__(self, "extra_nvcc_flags", tuple(self.extra_nvcc_flags))
+        object.__setattr__(self, "compile_options", dict(self.compile_options))
+        n_args = len(self.args)
+        bad = [i for i in self.output_indices if i < 0 or i >= n_args]
+        if bad:
+            raise ValueError(f"CudaCallOp output_indices out of range: {bad}")
+        if self.effect is None:
+            object.__setattr__(
+                self,
+                "effect",
+                EffectSummary(
+                    writes=tuple(self.args[i] for i in self.output_indices),
+                    opaque=True,
+                    external_state=self.symbol,
+                ),
+            )
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return self.args
+
+    @property
+    def effects(self) -> EffectSummary:
+        assert self.effect is not None
+        return self.effect
+
+    @property
+    def outputs(self) -> tuple[Value, ...]:
+        return tuple(self.args[i] for i in self.output_indices)
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "CudaCallOp":
+        return CudaCallOp(
+            source_path=self.source_path,
+            symbol=self.symbol,
+            args=operands,
+            output_indices=self.output_indices,
+            launch=self.launch,
+            attrs=self.attrs,
+            sm_arches=self.sm_arches,
+            include_dirs=self.include_dirs,
+            extra_nvcc_flags=self.extra_nvcc_flags,
+            compile_options=self.compile_options,
+            kernel_name=self.kernel_name,
+            effect=effects if effects is not None else self.effect,
+        )
+
+
 class TensorCreateKind(Enum):
     empty      = auto()
     zeros      = auto()

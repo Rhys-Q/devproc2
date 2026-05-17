@@ -17,6 +17,7 @@ from devproc2.ir.op_ref import BuiltinOpRef, ExternalFuncRef, KernelRef, PackedF
 from devproc2.ir.ops import (
     CallDPSOp,
     CallOp,
+    CudaCallOp,
     ForOp,
     IfOp,
     AllocStorageOp,
@@ -188,6 +189,9 @@ class Verifier:
         elif isinstance(op, CallDPSOp):
             self._verify_dps_target(fn_name, op)
 
+        elif isinstance(op, CudaCallOp):
+            self._verify_cuda_call(fn_name, op)
+
         elif isinstance(op, IfOp):
             self._verify_if_op(fn_name, op, defined_names, defined_results)
 
@@ -300,6 +304,10 @@ class Verifier:
                         "has result without struct_info"
                     )
         if self.stage == IRStage.dps:
+            if isinstance(op, CudaCallOp):
+                raise IRVerificationError(
+                    f"In @{fn_name}: CudaCallOp must be lowered before {self.stage.value}"
+                )
             if isinstance(op, (AllocStorageOp, AllocTensorOp)):
                 raise IRVerificationError(
                     f"In @{fn_name}: {type(op).__name__} is forbidden before MemoryIR"
@@ -321,6 +329,10 @@ class Verifier:
                 raise IRVerificationError(
                     f"In @{fn_name}: CallOp {op.op_ref.display_name()} "
                     f"is not allowed in {self.stage.value}"
+                )
+            if isinstance(op, CudaCallOp):
+                raise IRVerificationError(
+                    f"In @{fn_name}: CudaCallOp is not allowed in {self.stage.value}"
                 )
 
     def _verify_call_op_schema(self, fn_name: str, op: CallOp) -> None:
@@ -358,6 +370,17 @@ class Verifier:
             raise IRVerificationError(
                 f"In @{fn_name}: CallDPSOp outputs must be listed in write effect"
             )
+
+    def _verify_cuda_call(self, fn_name: str, op: CudaCallOp) -> None:
+        if not op.source_path:
+            raise IRVerificationError(f"In @{fn_name}: CudaCallOp requires source_path")
+        if not op.symbol:
+            raise IRVerificationError(f"In @{fn_name}: CudaCallOp requires symbol")
+        for idx in op.output_indices:
+            if idx < 0 or idx >= len(op.args):
+                raise IRVerificationError(
+                    f"In @{fn_name}: CudaCallOp output index {idx} is out of range"
+                )
 
 
 # ---------------------------------------------------------------------------

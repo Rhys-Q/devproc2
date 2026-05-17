@@ -185,6 +185,26 @@ def call_dps_kernel(
     return None
 
 
+def cuda_call(
+    source_symbol: str,
+    *args,
+    attrs: dict | None = None,
+    metadata: dict | None = None,
+):
+    """Runtime stub for unregistered CUDA source-symbol custom calls."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_cuda_call"):
+        return emitter.emit_cuda_call(
+            source_symbol,
+            args=args,
+            attrs=attrs,
+            metadata=metadata,
+        )
+    return None
+
+
 def tensor_view(
     base,
     byte_offset,

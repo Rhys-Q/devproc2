@@ -154,23 +154,50 @@ class KernelParamSpec:
 
 
 def derive_kernel_params(inputs: tuple, outputs: tuple) -> tuple[KernelParamSpec, ...]:
-    """Derive the conservative tensor-only ABI for a CallDPSOp."""
+    """Derive a conservative ABI for a CallDPSOp.
+
+    Tensor values become tensor pointer params. Scalar constants and values
+    with ScalarStructInfo become by-value scalar params. Unknown values keep
+    the historical tensor fallback for compatibility.
+    """
     params = []
     for i, value in enumerate(inputs):
+        kind, dtype = _param_kind_dtype(value)
         params.append(KernelParamSpec(
             name=getattr(value, "name", f"input{i}"),
-            kind="tensor",
+            kind=kind,
+            dtype=dtype,
             source="input",
             index=i,
         ))
     for i, value in enumerate(outputs):
+        kind, dtype = _param_kind_dtype(value)
         params.append(KernelParamSpec(
             name=getattr(value, "name", f"output{i}"),
-            kind="tensor",
+            kind=kind,
+            dtype=dtype,
             source="output",
             index=i,
         ))
     return tuple(params)
+
+
+def _param_kind_dtype(value: object) -> tuple[str, str | None]:
+    from devproc2.ir.nodes import Constant, ScalarStructInfo, TensorStructInfo
+
+    si = getattr(value, "struct_info", None)
+    if isinstance(si, TensorStructInfo):
+        return "tensor", si.dtype
+    if isinstance(si, ScalarStructInfo):
+        return "scalar", si.dtype
+    if isinstance(value, Constant):
+        if isinstance(value.value, bool):
+            return "scalar", "bool"
+        if isinstance(value.value, int):
+            return "scalar", "int64"
+        if isinstance(value.value, float):
+            return "scalar", "float64"
+    return "tensor", None
 
 
 @dataclass(frozen=True)

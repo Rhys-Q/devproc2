@@ -87,6 +87,7 @@ PyTorch 侧 `sample_actions` 的核心流程：
 - [04_weight_artifact_quant.md](04_weight_artifact_quant.md)：编译前 `convert_weight`、devproc2 权重包、artifact 扩展、FP8 权重量化状态。
 - [05_runtime_accuracy_milestones.md](05_runtime_accuracy_milestones.md)：C++ runtime、精度对齐流程、分阶段 milestone。
 - [06_performance_snapshot.md](06_performance_snapshot.md)：当前性能快照、已采用优化、未采用结论和下一阶段设计债务。
+- [07_frontend_dsl_refactor.md](07_frontend_dsl_refactor.md)：`forward_fast()` 一等接口和 CUDA 自定义算子无注册接入重构。
 
 ## Milestones
 

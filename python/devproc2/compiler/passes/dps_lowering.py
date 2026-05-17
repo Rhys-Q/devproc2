@@ -16,6 +16,9 @@ for calls whose behavior cannot be modeled more precisely.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from typing import Optional
 
 from devproc2.ir.nodes import (
@@ -29,15 +32,19 @@ from devproc2.ir.op_ref import KernelRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
     CallOp,
+    CudaCallOp,
     TensorCreateKind,
     TensorCreateOp,
 )
 from devproc2.compiler.op import LoweringKind
 from devproc2.kernel.registry import (
     KernelMatchKey,
+    KernelLaunchSpec,
+    KernelParamSpec,
     KernelRegistry,
     KernelSpec,
     build_input_dtypes,
+    prim_expr_to_json_obj,
 )
 from devproc2.compiler.passes._rewriter import IRRewriter
 
@@ -64,6 +71,10 @@ class DPSLoweringPass(IRRewriter):
     def rewrite_block(self, block: Block) -> Block:
         new_ops = []
         for op in block.ops:
+            if isinstance(op, CudaCallOp):
+                dps_op = self._lower_cuda_call(op)
+                new_ops.append(dps_op)
+                continue
             if isinstance(op, CallOp) and op.results:
                 op_def = op.op_def if isinstance(op.op_ref, StandardOpRef) else None
                 if op_def is None:
@@ -107,6 +118,38 @@ class DPSLoweringPass(IRRewriter):
             new_ops.append(new_op)
         return Block(block.args, tuple(new_ops))
 
+    def _lower_cuda_call(self, op: CudaCallOp) -> CallDPSOp:
+        op = self._subst_op(op)
+        assert isinstance(op, CudaCallOp)
+        spec = self._cuda_kernel_spec(op)
+        return CallDPSOp(
+            target_ref=KernelRef(spec.kernel_name, spec),
+            inputs=op.args,
+            outputs=(),
+            effect=op.effect,
+            attrs=op.attrs,
+        )
+
+    def _cuda_kernel_spec(self, op: CudaCallOp) -> KernelSpec:
+        kernel_name = op.kernel_name or _auto_cuda_kernel_name(op)
+        launch = op.launch if isinstance(op.launch, KernelLaunchSpec) else KernelLaunchSpec()
+        sm_arches = op.sm_arches or ((self._sm_arch,) if self._sm_arch is not None else ())
+        return KernelSpec(
+            op_name=f"cuda.{op.symbol}",
+            device=_cuda_call_device(op),
+            input_dtypes=build_input_dtypes(op.args),
+            kernel_name=kernel_name,
+            backend="cuda",
+            symbol=op.symbol,
+            sm_arches=sm_arches,
+            launch=launch,
+            params=_cuda_call_params(op),
+            source_path=op.source_path,
+            include_dirs=op.include_dirs,
+            extra_nvcc_flags=op.extra_nvcc_flags,
+            compile_options=op.compile_options,
+        )
+
     def _lookup(self, op: CallOp, si: object) -> KernelSpec | None:
         if not isinstance(si, TensorStructInfo):
             return None
@@ -116,3 +159,75 @@ class DPSLoweringPass(IRRewriter):
             input_dtypes=build_input_dtypes(op.args),
         )
         return self._registry.lookup(key, self._sm_arch, op)
+
+
+def _auto_cuda_kernel_name(op: CudaCallOp) -> str:
+    payload = {
+        "source_path": op.source_path,
+        "symbol": op.symbol,
+        "launch": (
+            op.launch.to_json_obj()
+            if isinstance(op.launch, KernelLaunchSpec)
+            else repr(op.launch)
+        ),
+        "attrs": op.attrs.to_python_dict(),
+        "sm_arches": list(op.sm_arches),
+        "include_dirs": list(op.include_dirs),
+        "extra_nvcc_flags": list(op.extra_nvcc_flags),
+        "compile_options": prim_expr_to_json_obj(dict(op.compile_options)),
+        "input_dtypes": list(build_input_dtypes(op.args)),
+        "output_indices": list(op.output_indices),
+    }
+    blob = json.dumps(
+        prim_expr_to_json_obj(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=repr,
+    ).encode("utf-8")
+    digest = hashlib.sha1(blob).hexdigest()[:12]
+    safe_symbol = re.sub(r"[^0-9A-Za-z_]+", "_", op.symbol).strip("_") or "cuda"
+    return f"kernel.cuda.{safe_symbol}.{digest}"
+
+
+def _cuda_call_device(op: CudaCallOp) -> str:
+    for value in op.outputs + op.args:
+        si = getattr(value, "struct_info", None)
+        device = getattr(si, "device", None)
+        if device is not None:
+            return str(device)
+    return "cuda"
+
+
+def _cuda_call_params(op: CudaCallOp) -> tuple[KernelParamSpec, ...]:
+    params: list[KernelParamSpec] = []
+    outputs = set(op.output_indices)
+    for i, value in enumerate(op.args):
+        kind, dtype = _param_kind_dtype(value)
+        params.append(
+            KernelParamSpec(
+                name=getattr(value, "name", f"arg{i}"),
+                kind=kind,
+                dtype=dtype,
+                source="output" if i in outputs else "input",
+                index=i,
+            )
+        )
+    return tuple(params)
+
+
+def _param_kind_dtype(value: object) -> tuple[str, str | None]:
+    from devproc2.ir.nodes import Constant, ScalarStructInfo
+
+    si = getattr(value, "struct_info", None)
+    if isinstance(si, TensorStructInfo):
+        return "tensor", si.dtype
+    if isinstance(si, ScalarStructInfo):
+        return "scalar", si.dtype
+    if isinstance(value, Constant):
+        if isinstance(value.value, bool):
+            return "scalar", "bool"
+        if isinstance(value.value, int):
+            return "scalar", "int64"
+        if isinstance(value.value, float):
+            return "scalar", "float64"
+    return "tensor", None
