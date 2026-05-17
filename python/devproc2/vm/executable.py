@@ -65,6 +65,7 @@ class FunctionEntry:
     num_regs:     int          # total registers for this function
     num_args:     int          # first num_args registers receive call args
     const_inits:  list[ConstInit] = field(default_factory=list)
+    param_names:  list[str] = field(default_factory=list)
 
 
 @dataclass

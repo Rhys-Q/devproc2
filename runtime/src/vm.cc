@@ -1,6 +1,8 @@
 #include <devproc2/runtime/vm.h>
+#include <devproc2/runtime/cuda_gemm.h>
 #include <devproc2/runtime/packed_func.h>
 #include <devproc2/runtime/stream.h>
+#include <devproc2/runtime/tokenizer.h>
 #ifdef DEVPROC2_WITH_CUDA
 #include <devproc2/runtime/cuda_kernel_registry.h>
 // Forward declaration for CUDAKernelLauncher_Launch (defined in cuda_kernel.cc)
@@ -19,8 +21,11 @@ namespace devproc2 {
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace devproc2 {
+
+void RegisterCoreBuiltins();
 
 // ── Binary deserialization helpers ────────────────────────────────────────────
 
@@ -58,7 +63,7 @@ struct ByteReader {
 };
 
 static constexpr uint8_t _MAGIC[4] = {'D', 'V', '2', 'E'};
-static constexpr uint32_t _VERSION  = 2;
+static constexpr uint32_t _VERSION  = 3;
 static constexpr uint8_t _TAG_NULL  = 0;
 static constexpr uint8_t _TAG_INT   = 1;
 static constexpr uint8_t _TAG_FLOAT = 2;
@@ -176,6 +181,7 @@ static void load_kernel_table_into_cuda_registry(const std::string& artifact_dir
 // ── Executable::Deserialize ───────────────────────────────────────────────────
 
 std::shared_ptr<Executable> Executable::Deserialize(const uint8_t* data, size_t size) {
+    RegisterCoreBuiltins();
     ByteReader r{data, size};
 
     // Magic
@@ -210,6 +216,11 @@ std::shared_ptr<Executable> Executable::Deserialize(const uint8_t* data, size_t 
         for (uint32_t j = 0; j < n_ci; ++j) {
             fe.const_inits[j].reg_idx   = r.read<int32_t>();
             fe.const_inits[j].const_idx = r.read<int32_t>();
+        }
+        uint32_t n_param_names = r.read<uint32_t>();
+        fe.param_names.resize(n_param_names);
+        for (uint32_t j = 0; j < n_param_names; ++j) {
+            fe.param_names[j] = r.read_string();
         }
     }
 
@@ -293,6 +304,11 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
     }
 
     // 4. PackedFunc dependency check
+    if (file_exists(artifact_dir + "/resources/tokenizer.model")) {
+        SetPaligemmaTokenizerModelPath(artifact_dir + "/resources/tokenizer.model");
+    }
+    RegisterTokenizerPackedFuncs();
+    RegisterCUDAPackedFuncs();
     for (const auto& name : abi.value("required_packed_funcs",
                                        nlohmann::json::array())) {
         std::string fn = name.get<std::string>();
@@ -300,6 +316,11 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
             throw std::runtime_error(
                 "PackedFunc '" + fn + "' is required but not registered.");
         }
+    }
+
+    if (file_exists(artifact_dir + "/weights/weights.index.json") ||
+        file_exists(artifact_dir + "/weights.index.json")) {
+        exe->weights = WeightStore::Load(artifact_dir);
     }
 
 #ifdef DEVPROC2_WITH_CUDA
@@ -319,7 +340,9 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
 }
 
 VMState::VMState(std::shared_ptr<Executable> exec)
-    : exec_(std::move(exec)) {}
+    : exec_(std::move(exec)) {
+    RegisterCoreBuiltins();
+}
 
 void* VMState::GetDefaultStream(const Device& dev) {
     if (dev.device_type == kDLCPU) return nullptr;
@@ -342,6 +365,40 @@ void* VMState::GetDefaultStream(const Device& dev) {
 
 VMValue VMState::Invoke(const std::string& func_name, std::vector<VMValue> args) {
     int32_t func_idx = exec_->GetFuncIndex(func_name);
+    const FunctionEntry& fe = exec_->function_table[static_cast<size_t>(func_idx)];
+    if (fe.kind != VMCalleeKind::kVMFunc) {
+        throw std::runtime_error("Invoke target is not a VM function: " + func_name);
+    }
+    if (static_cast<int32_t>(args.size()) > fe.num_args) {
+        throw std::runtime_error("Invoke got too many arguments for '" + func_name + "'");
+    }
+    if (static_cast<int32_t>(args.size()) < fe.num_args) {
+        if (!exec_->weights) {
+            throw std::runtime_error(
+                "Invoke missing arguments for '" + func_name +
+                "' and executable has no WeightStore");
+        }
+        if (fe.param_names.size() != static_cast<size_t>(fe.num_args)) {
+            throw std::runtime_error(
+                "Invoke cannot bind missing weights for '" + func_name +
+                "': bytecode has no complete parameter name table");
+        }
+#ifdef DEVPROC2_WITH_CUDA
+        DLDevice weight_device{kDLCUDA, 0};
+#else
+        DLDevice weight_device{kDLCPU, 0};
+#endif
+        while (static_cast<int32_t>(args.size()) < fe.num_args) {
+            const std::string& name = fe.param_names[args.size()];
+            if (!exec_->weights->Has(name)) {
+                throw std::runtime_error(
+                    "Invoke missing argument '" + name +
+                    "' and no matching artifact weight was found");
+            }
+            args.push_back(VMValue::ObjRef(
+                exec_->weights->GetTensorOnDevice(name, weight_device)));
+        }
+    }
     regs_.clear();
     frames_.clear();
     PushFrame(func_idx, args, /*caller_dst_reg=*/-1, /*caller_reg_base=*/-1);
@@ -470,7 +527,28 @@ VMValue VMState::DispatchExternal(
                 "PackedFunc '" + callee.name + "' not registered");
         }
         PackedArgs pa(args);
+#ifdef DEVPROC2_WITH_CUDA
+        void* previous_cuda_stream = nullptr;
+        bool scoped_cuda_stream = callee.name.rfind("runtime.cuda.", 0) == 0;
+        if (scoped_cuda_stream) {
+            Device cuda_dev{kDLCUDA, 0};
+            previous_cuda_stream = CurrentCUDAPackedFuncStream();
+            SetCUDAPackedFuncStream(GetDefaultStream(cuda_dev));
+        }
+        try {
+            pf->Call(pa);
+        } catch (...) {
+            if (scoped_cuda_stream) {
+                SetCUDAPackedFuncStream(previous_cuda_stream);
+            }
+            throw;
+        }
+        if (scoped_cuda_stream) {
+            SetCUDAPackedFuncStream(previous_cuda_stream);
+        }
+#else
         pf->Call(pa);
+#endif
         // Return convention: PackedFunc body writes its result into args[0].
         // A void PackedFunc (no dst_reg caller) is called with an empty args
         // vector, so guard before accessing.
@@ -496,6 +574,21 @@ VMValue VMState::DispatchExternal(
         throw std::runtime_error(
             "DispatchExternal: unexpected callee kind for " + callee.name);
     }
+}
+
+ModelSession::ModelSession(std::shared_ptr<Executable> exec)
+    : exec_(std::move(exec)), vm_(exec_) {}
+
+ModelSession ModelSession::LoadArtifact(const std::string& artifact_dir) {
+    return ModelSession(Executable::Load(artifact_dir));
+}
+
+VMValue ModelSession::Invoke(const std::string& func_name, std::vector<VMValue> args) {
+    return vm_.Invoke(func_name, std::move(args));
+}
+
+void* ModelSession::GetDefaultStream(const Device& dev) {
+    return vm_.GetDefaultStream(dev);
 }
 
 }  // namespace devproc2

@@ -29,6 +29,9 @@ from devproc2.ir.ops import (
     IfOp,
     IterArg,
     Range,
+    TensorCreateKind,
+    TensorCreateOp,
+    TensorViewOp,
     TupleOp,
     TupleGetItemOp,
 )
@@ -284,6 +287,59 @@ def test_codegen_alloc_storage_and_tensor():
     # alloc_tensor CALL, RET
     assert f_entry.instr_count >= 4
 
+
+def test_codegen_tensor_view_emits_builtin_and_offset_math():
+    x = Var("x", TensorStructInfo((16,), "float16", "cpu"))
+    view = TensorViewOp(
+        result_name="view",
+        base=x,
+        byte_offset=Constant(3),
+        shape=(IntImm(4),),
+        byte_stride=2,
+        base_offset=8,
+    )
+    block = Block(args=(x,), ops=(view, ReturnOp((view.results[0],))))
+    module = IRModule({"f": Function(Region((block,)))})
+    exe = VMCodegenPass().run(module)
+    names = [fe.name for fe in exe.function_table]
+    assert "vm.builtin.mul_i64" in names
+    assert "vm.builtin.add_i64" in names
+    assert "vm.builtin.make_shape" in names
+    assert "vm.builtin.tensor_view" in names
+
+
+def test_tensor_view_keeps_base_storage_live_when_returned():
+    base = TensorCreateOp(
+        result_name="base",
+        kind=TensorCreateKind.empty,
+        shape=(IntImm(8),),
+        dtype="float16",
+        device="cpu",
+    )
+    view = TensorViewOp(
+        result_name="view",
+        base=base.results[0],
+        byte_offset=Constant(4),
+        shape=(IntImm(4),),
+    )
+    scratch = TensorCreateOp(
+        result_name="scratch",
+        kind=TensorCreateKind.empty,
+        shape=(IntImm(8),),
+        dtype="float16",
+        device="cpu",
+    )
+    block = Block(args=(), ops=(
+        base,
+        view,
+        scratch,
+        ReturnOp((view.results[0],)),
+    ))
+    module = IRModule({"f": Function(Region((block,)))})
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+    assert plan.tensor_to_storage["base"] != plan.tensor_to_storage["scratch"]
 
 def test_codegen_return_value():
     """ReturnOp emits RET with the correct src_reg."""
@@ -621,6 +677,7 @@ def test_serializer_roundtrip_preserves_structure():
         assert fe1.name == fe2.name
         assert fe1.kind == fe2.kind
         assert fe1.num_args == fe2.num_args
+        assert fe1.param_names == fe2.param_names
         assert len(fe1.const_inits) == len(fe2.const_inits)
 
     assert len(exe2.instructions) == len(exe.instructions)

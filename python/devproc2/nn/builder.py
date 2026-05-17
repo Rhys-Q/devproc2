@@ -9,19 +9,30 @@ from devproc2.compiler.op import (
     get_op,
     set_current_emitter,
 )
-from devproc2.ir.op_ref import ExternalFuncRef, StandardOpRef
+from devproc2.ir.op_ref import ExternalFuncRef, KernelRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.nodes import (
     Block,
     Constant,
+    EffectSummary,
     Function,
     IRModule,
+    Op,
     Region,
     StructInfo,
     TensorStructInfo,
     Value,
     Var,
 )
-from devproc2.ir.ops import CallOp, ReturnOp, make_call_op
+from devproc2.ir.ops import (
+    CallDPSOp,
+    CallOp,
+    ReturnOp,
+    TensorCreateKind,
+    TensorCreateOp,
+    TensorViewOp,
+    TupleOp,
+    make_call_op,
+)
 
 from devproc2.nn.module import Module
 from devproc2.nn.specs import ObjectSpec, Parameter, ScalarSpec, TensorSpec
@@ -29,7 +40,7 @@ from devproc2.nn.specs import ObjectSpec, Parameter, ScalarSpec, TensorSpec
 
 class GraphBuilder:
     def __init__(self) -> None:
-        self._ops: list[CallOp] = []
+        self._ops: list[Op] = []
         self._counter = 0
         self._param_values: dict[int, TraceValue] = {}
 
@@ -56,7 +67,7 @@ class GraphBuilder:
             if isinstance(root, Module):
                 root._set_tracing_recursive(False)
 
-        ret = _unwrap_trace_value(result)
+        ret = self._materialize_return_value(result)
         block = Block(
             args=tuple(params) + tuple(self._parameter_vars()),
             ops=tuple(self._ops) + (ReturnOp((ret,)),),
@@ -102,6 +113,210 @@ class GraphBuilder:
         )
         self._ops.append(call)
         return TraceValue(call.results[0], self)
+
+    def emit_dps_kernel(
+        self,
+        name: str,
+        *,
+        inputs: object | None = None,
+        launch: object | None = None,
+        output_like: object | None = None,
+        output_shape: object | None = None,
+        output_dtype: str | None = None,
+        output_device: str | None = None,
+        output_spec: object | None = None,
+        output_specs: object | None = None,
+        effect: str = "opaque",
+    ) -> TraceValue | tuple[TraceValue, ...]:
+        ir_inputs = tuple(_unwrap_trace_value(arg) for arg in _as_sequence(inputs))
+        if output_specs is not None:
+            if any(v is not None for v in (output_like, output_shape, output_dtype, output_device, output_spec)):
+                raise ValueError("output_specs cannot be combined with single-output overrides")
+            sis = tuple(
+                _resolve_output_struct_info(
+                    ir_inputs,
+                    output_like=None,
+                    output_shape=None,
+                    output_dtype=None,
+                    output_device=None,
+                    output_spec=spec,
+                )
+                for spec in _as_sequence(output_specs)
+            )
+            if not sis:
+                raise ValueError("output_specs must contain at least one output spec")
+        else:
+            has_output = (
+                output_like is not None
+                or output_shape is not None
+                or output_dtype is not None
+                or output_device is not None
+                or output_spec is not None
+            )
+            kernel_name = name if name.startswith("kernel.") else f"kernel.{name}"
+            from devproc2.frontend.dsl import get_kernel_registry
+
+            spec = get_kernel_registry().get_by_kernel_name(kernel_name)
+            if spec is not None and launch is not None:
+                spec = spec.with_launch(launch)
+            if not has_output:
+                self._ops.append(
+                    CallDPSOp(
+                        target_ref=KernelRef(kernel_name, spec),
+                        inputs=ir_inputs,
+                        outputs=(),
+                        effect=EffectSummary.opaque_call(kernel_name),
+                    )
+                )
+                return None
+            sis = (
+                _resolve_output_struct_info(
+                    ir_inputs,
+                    output_like=output_like,
+                    output_shape=output_shape,
+                    output_dtype=output_dtype,
+                    output_device=output_device,
+                    output_spec=output_spec,
+                ),
+            )
+
+        kernel_name = name if name.startswith("kernel.") else f"kernel.{name}"
+        from devproc2.frontend.dsl import get_kernel_registry
+
+        spec = get_kernel_registry().get_by_kernel_name(kernel_name)
+        if spec is not None and launch is not None:
+            spec = spec.with_launch(launch)
+        creates = tuple(
+            TensorCreateOp(
+                result_name=self._fresh(name.replace(".", "_")),
+                kind=TensorCreateKind.empty,
+                shape=si.shape,
+                dtype=si.dtype,
+                device=si.device,
+            )
+            for si in sis
+        )
+        dps = CallDPSOp(
+            target_ref=KernelRef(kernel_name, spec),
+            inputs=ir_inputs,
+            outputs=tuple(create.results[0] for create in creates),
+            effect=_dps_effect(effect, tuple(create.results[0] for create in creates), kernel_name),
+        )
+        self._ops.extend(creates)
+        self._ops.append(dps)
+        values = tuple(TraceValue(create.results[0], self) for create in creates)
+        return values[0] if len(values) == 1 else values
+
+    def emit_dps_packed(
+        self,
+        name: str,
+        *,
+        inputs: object | None = None,
+        output_like: object | None = None,
+        output_shape: object | None = None,
+        output_dtype: str | None = None,
+        output_device: str | None = None,
+        output_spec: object | None = None,
+        effect: str = "opaque",
+    ):
+        ir_inputs = tuple(_unwrap_trace_value(arg) for arg in _as_sequence(inputs))
+        has_output = (
+            output_like is not None
+            or output_shape is not None
+            or output_dtype is not None
+            or output_device is not None
+            or output_spec is not None
+        )
+        if not has_output:
+            dps = CallDPSOp(
+                target_ref=PackedFuncRef(name),
+                inputs=ir_inputs,
+                outputs=(),
+                effect=EffectSummary.opaque_call(name),
+            )
+            self._ops.append(dps)
+            return None
+
+        si = _resolve_output_struct_info(
+            ir_inputs,
+            output_like=output_like,
+            output_shape=output_shape,
+            output_dtype=output_dtype,
+            output_device=output_device,
+            output_spec=output_spec,
+        )
+        create = TensorCreateOp(
+            result_name=self._fresh(name.replace(".", "_")),
+            kind=TensorCreateKind.empty,
+            shape=si.shape,
+            dtype=si.dtype,
+            device=si.device,
+        )
+        dps = CallDPSOp(
+            target_ref=PackedFuncRef(name),
+            inputs=ir_inputs,
+            outputs=(create.results[0],),
+            effect=_dps_effect(effect, (create.results[0],), name),
+        )
+        self._ops.append(create)
+        self._ops.append(dps)
+        return TraceValue(create.results[0], self)
+
+    def emit_empty(
+        self,
+        shape: object,
+        *,
+        dtype: str = "float32",
+        device: str = "cpu",
+    ) -> TraceValue:
+        if not isinstance(shape, tuple):
+            shape = tuple(shape) if isinstance(shape, list) else (shape,)
+        create = TensorCreateOp(
+            result_name=self._fresh("empty"),
+            kind=TensorCreateKind.empty,
+            shape=tuple(shape),
+            dtype=dtype,
+            device=device,
+        )
+        self._ops.append(create)
+        return TraceValue(create.results[0], self)
+
+    def emit_tensor_view(
+        self,
+        base: object,
+        byte_offset: object,
+        shape: object,
+        *,
+        dtype: str | None = None,
+        device: str | None = None,
+        byte_stride: int = 1,
+        base_offset: int = 0,
+    ) -> TraceValue:
+        ir_base = _unwrap_trace_value(base)
+        ir_offset = _unwrap_trace_value(byte_offset)
+        if not isinstance(shape, tuple):
+            shape = tuple(shape) if isinstance(shape, list) else (shape,)
+        base_si = _tensor_struct_info(ir_base)
+        view = TensorViewOp(
+            result_name=self._fresh("view"),
+            base=ir_base,
+            byte_offset=ir_offset,
+            shape=tuple(shape),
+            dtype=dtype or (base_si.dtype if base_si is not None else None),
+            device=device or (base_si.device if base_si is not None else None),
+            byte_stride=byte_stride,
+            base_offset=base_offset,
+        )
+        self._ops.append(view)
+        return TraceValue(view.results[0], self)
+
+    def _materialize_return_value(self, result: object) -> Value:
+        if isinstance(result, (tuple, list)):
+            elems = tuple(self._materialize_return_value(item) for item in result)
+            tuple_op = TupleOp(result_name=self._fresh("tuple"), elems=elems)
+            self._ops.append(tuple_op)
+            return tuple_op.results[0]
+        return _unwrap_trace_value(result)
 
     def parameter_value(self, parameter: Parameter) -> TraceValue:
         if parameter.name is None:
@@ -203,6 +418,56 @@ def _spec_struct_info(spec: object) -> Optional[StructInfo]:
 def _tensor_struct_info(value: Value) -> Optional[TensorStructInfo]:
     si = getattr(value, "struct_info", None)
     return si if isinstance(si, TensorStructInfo) else None
+
+
+def _as_sequence(value: object | None) -> tuple[object, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    return (value,)
+
+
+def _resolve_output_struct_info(
+    ir_inputs: tuple[Value, ...],
+    *,
+    output_like: object | None,
+    output_shape: object | None,
+    output_dtype: str | None,
+    output_device: str | None,
+    output_spec: object | None,
+) -> TensorStructInfo:
+    if output_spec is not None:
+        if isinstance(output_spec, TensorStructInfo):
+            return output_spec
+        spec_si = getattr(output_spec, "struct_info", None)
+        if isinstance(spec_si, TensorStructInfo):
+            return spec_si
+        raise TypeError("output_spec must be TensorSpec or TensorStructInfo")
+
+    like_value = _unwrap_trace_value(output_like) if output_like is not None else None
+    if like_value is None:
+        if not ir_inputs:
+            raise ValueError("DPS calls with outputs require inputs, output_like, or output_spec")
+        like_value = ir_inputs[0]
+    like_si = _tensor_struct_info(like_value)
+    if like_si is None:
+        raise TypeError("DPS output_like must have TensorStructInfo")
+
+    shape = output_shape if output_shape is not None else like_si.shape
+    if not isinstance(shape, tuple):
+        shape = tuple(shape) if isinstance(shape, list) else (shape,)
+    return TensorStructInfo(
+        tuple(shape),
+        output_dtype or like_si.dtype,
+        output_device or like_si.device,
+    )
+
+
+def _dps_effect(effect: str, outputs: tuple[Value, ...], target: str) -> EffectSummary:
+    if effect == "pure":
+        return EffectSummary.write(*outputs)
+    return EffectSummary(writes=outputs, opaque=True, external_state=target)
 
 
 _CURRENT_BUILDER: Optional[GraphBuilder] = None

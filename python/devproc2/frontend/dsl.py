@@ -19,7 +19,7 @@ from devproc2.ir.nodes import (
     Value,
     Var,
 )
-from devproc2.ir.op_ref import ExternalFuncRef, PackedFuncRef, StandardOpRef
+from devproc2.ir.op_ref import ExternalFuncRef, KernelRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
     ForOp,
@@ -29,6 +29,7 @@ from devproc2.ir.ops import (
     ReturnOp,
     TensorCreateKind,
     TensorCreateOp,
+    TensorViewOp,
     TupleOp,
     YieldOp,
     make_call_op,
@@ -114,12 +115,101 @@ ops = _OpsStub()
 
 def empty(shape, dtype: str = "float32", device: str = "cpu"):
     """Runtime stub — real tensor creation happens via DSL AST compilation."""
-    pass
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_empty"):
+        return emitter.emit_empty(shape, dtype=dtype, device=device)
+    return None
 
 
-def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque"):
+def call_dps_packed(
+    name: str,
+    inputs=None,
+    output=None,
+    effect: str = "opaque",
+    output_like=None,
+    output_shape=None,
+    output_dtype: str | None = None,
+    output_device: str | None = None,
+    output_spec=None,
+):
     """Runtime stub — real op emission happens via DSL AST compilation."""
-    pass
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_dps_packed"):
+        return emitter.emit_dps_packed(
+            name,
+            inputs=inputs,
+            output_like=output_like if output_like is not None else output,
+            output_shape=output_shape,
+            output_dtype=output_dtype,
+            output_device=output_device,
+            output_spec=output_spec,
+            effect=effect,
+        )
+    return None
+
+
+def call_dps_kernel(
+    name: str,
+    inputs=None,
+    output=None,
+    effect: str = "opaque",
+    launch: KernelLaunchSpec | None = None,
+    output_like=None,
+    output_shape=None,
+    output_dtype: str | None = None,
+    output_device: str | None = None,
+    output_spec=None,
+    output_specs=None,
+):
+    """Runtime stub — real kernel DPS emission happens via DSL AST compilation."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_dps_kernel"):
+        return emitter.emit_dps_kernel(
+            name,
+            inputs=inputs,
+            launch=launch,
+            output_like=output_like if output_like is not None else output,
+            output_shape=output_shape,
+            output_dtype=output_dtype,
+            output_device=output_device,
+            output_spec=output_spec,
+            output_specs=output_specs,
+            effect=effect,
+        )
+    return None
+
+
+def tensor_view(
+    base,
+    byte_offset,
+    shape,
+    *,
+    dtype: str | None = None,
+    device: str | None = None,
+    byte_stride: int = 1,
+    base_offset: int = 0,
+):
+    """Runtime stub — emits a no-copy tensor view inside tracing/DSL builds."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_view"):
+        return emitter.emit_tensor_view(
+            base,
+            byte_offset,
+            shape,
+            dtype=dtype,
+            device=device,
+            byte_stride=byte_stride,
+            base_offset=base_offset,
+        )
+    return None
 
 
 def kernel(
@@ -140,6 +230,9 @@ def kernel(
     params: tuple[KernelParamSpec, ...] = (),
     cubin_path: str | None = None,
     ptx_path: str | None = None,
+    source_path: str | None = None,
+    include_dirs=(),
+    extra_nvcc_flags=(),
     compile_options: dict | None = None,
 ):
     """Decorator to register a kernel implementation.
@@ -215,6 +308,9 @@ def kernel(
             params=tuple(params),
             cubin_path=cubin_path,
             ptx_path=ptx_path,
+            source_path=source_path,
+            include_dirs=tuple(include_dirs),
+            extra_nvcc_flags=tuple(extra_nvcc_flags),
             compile_options=compile_options or {},
         )
         _kernel_registry.register(spec)
@@ -323,6 +419,11 @@ class DSLBuilder:
                     create_op = self._build_empty(val_expr, result_name)
                     self.scope.define(name, create_op.results[0])
                     return [create_op]
+                if callee_str in ("dp.tensor_view", "tensor_view"):
+                    result_name = self._pick_name(name)
+                    view_op = self._build_tensor_view(val_expr, result_name)
+                    self.scope.define(name, view_op.results[0])
+                    return [view_op]
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 result_name = self._pick_name(name)
@@ -352,6 +453,8 @@ class DSLBuilder:
                 callee_str = ast.unparse(val_expr.func)
                 if "call_dps_packed" in callee_str:
                     return [self._build_call_dps_packed(val_expr)]
+                if "call_dps_kernel" in callee_str:
+                    return [self._build_call_dps_kernel(val_expr)]
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 return pre_ops + [
@@ -503,11 +606,35 @@ class DSLBuilder:
     # ------------------------------------------------------------------
 
     def _build_call_dps_packed(self, node: ast.Call) -> CallDPSOp:
+        callee, inputs, output = self._parse_dps_call(node, "call_dps_packed")
+        return CallDPSOp(
+            target_ref=PackedFuncRef(callee),
+            inputs=inputs,
+            outputs=() if output is None else (output,),
+            effect=EffectSummary.opaque_call(),
+        )
+
+    def _build_call_dps_kernel(self, node: ast.Call) -> CallDPSOp:
+        callee, inputs, output = self._parse_dps_call(node, "call_dps_kernel")
+        kernel_name = callee if callee.startswith("kernel.") else f"kernel.{callee}"
+        spec = _kernel_registry.get_by_kernel_name(kernel_name)
+        return CallDPSOp(
+            target_ref=KernelRef(kernel_name, spec),
+            inputs=inputs,
+            outputs=() if output is None else (output,),
+            effect=EffectSummary.opaque_call(),
+        )
+
+    def _parse_dps_call(
+        self,
+        node: ast.Call,
+        api_name: str,
+    ) -> tuple[str, tuple[Value, ...], Optional[Value]]:
         if not node.args:
-            raise DSLError("call_dps_packed requires function name as first arg")
+            raise DSLError(f"{api_name} requires function name as first arg")
         name_expr = node.args[0]
         if not isinstance(name_expr, ast.Constant) or not isinstance(name_expr.value, str):
-            raise DSLError("call_dps_packed: first arg must be a string literal")
+            raise DSLError(f"{api_name}: first arg must be a string literal")
         callee = name_expr.value
         kwargs = {kw.arg: kw.value for kw in node.keywords}
         inputs: tuple[Value, ...] = ()
@@ -521,12 +648,7 @@ class DSLBuilder:
             if not (isinstance(out_node, ast.Constant) and out_node.value is None):
                 out_val = self._build_value(kwargs["output"])
                 output = out_val
-        return CallDPSOp(
-            target_ref=PackedFuncRef(callee),
-            inputs=inputs,
-            outputs=() if output is None else (output,),
-            effect=EffectSummary.opaque_call(),
-        )
+        return callee, inputs, output
 
     # ------------------------------------------------------------------
     # dp.empty()
@@ -549,6 +671,48 @@ class DSLBuilder:
             shape=shape,
             dtype=dtype,
             device=device,
+        )
+
+    def _build_tensor_view(self, node: ast.Call, result_name: str) -> TensorViewOp:
+        if len(node.args) < 3:
+            raise DSLError("dp.tensor_view requires base, byte_offset, and shape")
+        base = self._build_value(node.args[0])
+        byte_offset = self._build_value(node.args[1])
+        shape_node = node.args[2]
+        if isinstance(shape_node, ast.Tuple):
+            shape = tuple(self._build_prim_expr(e) for e in shape_node.elts)
+        else:
+            shape = (self._build_prim_expr(shape_node),)
+        kwargs = {kw.arg: kw.value for kw in node.keywords}
+        dtype = (
+            kwargs["dtype"].value
+            if "dtype" in kwargs and isinstance(kwargs["dtype"], ast.Constant)
+            else None
+        )
+        device = (
+            kwargs["device"].value
+            if "device" in kwargs and isinstance(kwargs["device"], ast.Constant)
+            else None
+        )
+        byte_stride = (
+            int(kwargs["byte_stride"].value)
+            if "byte_stride" in kwargs and isinstance(kwargs["byte_stride"], ast.Constant)
+            else 1
+        )
+        base_offset = (
+            int(kwargs["base_offset"].value)
+            if "base_offset" in kwargs and isinstance(kwargs["base_offset"], ast.Constant)
+            else 0
+        )
+        return TensorViewOp(
+            result_name=result_name,
+            base=base,
+            byte_offset=byte_offset,
+            shape=shape,
+            dtype=dtype,
+            device=device,
+            byte_stride=byte_stride,
+            base_offset=base_offset,
         )
 
     def _build_prim_expr(self, node: ast.expr) -> PrimExpr:
@@ -585,6 +749,11 @@ class DSLBuilder:
         if isinstance(node, ast.Constant):
             return [], Constant(node.value)
         if isinstance(node, ast.Call):
+            callee_str = ast.unparse(node.func)
+            if callee_str in ("dp.tensor_view", "tensor_view"):
+                tmp_name = self._fresh("view")
+                view_op = self._build_tensor_view(node, tmp_name)
+                return [view_op], view_op.results[0]
             callee = self._extract_callee(node.func)
             pre_ops, args = self._materialize_args(node.args)
             tmp_name = self._fresh("tmp")

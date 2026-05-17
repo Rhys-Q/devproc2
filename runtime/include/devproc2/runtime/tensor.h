@@ -21,6 +21,7 @@ public:
     DLTensor dl_tensor{};
 
     Storage storage;
+    ObjectRef base;
     void*   manager_ctx{nullptr};
 
     DLTensor*       dl()       { return &dl_tensor; }
@@ -54,6 +55,12 @@ public:
                               int64_t byte_offset,
                               const std::vector<int64_t>& shape,
                               DLDataType dtype);
+
+    // Create a tensor view over another tensor. The view keeps the base tensor
+    // alive, so it is safe for externally-owned DLPack buffers as well.
+    static Tensor View(Tensor base,
+                       int64_t byte_offset,
+                       const std::vector<int64_t>& shape);
 
     static Tensor FromDLPack(DLManagedTensor* managed);
 

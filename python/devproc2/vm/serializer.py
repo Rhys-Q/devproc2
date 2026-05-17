@@ -12,7 +12,7 @@ from .executable import (
 )
 
 _MAGIC = b"DV2E"
-_VERSION = 2
+_VERSION = 3
 
 _TAG_NULL  = 0
 _TAG_INT   = 1
@@ -35,6 +35,10 @@ def serialize(exe: Executable) -> bytes:
                            fe.num_args, len(fe.const_inits))
         for ci in fe.const_inits:
             buf += struct.pack("<ii", ci.reg_idx, ci.const_idx)
+        buf += struct.pack("<I", len(fe.param_names))
+        for param_name in fe.param_names:
+            param_b = param_name.encode()
+            buf += struct.pack("<I", len(param_b)) + param_b
 
     for instr in exe.instructions:
         buf += struct.pack(
@@ -93,11 +97,18 @@ def deserialize(data: bytes) -> Executable:
         name = data[pos:pos+nlen].decode(); pos += nlen
         (kind_b, ioff, icnt, nregs, nargs, n_ci) = read("<Biiiii")
         const_inits = [ConstInit(*read("<ii")) for _ in range(n_ci)]
+        (n_param_names,) = read("<I")
+        param_names = []
+        for _ in range(n_param_names):
+            (plen,) = read("<I")
+            param_names.append(data[pos:pos+plen].decode())
+            pos += plen
         function_table.append(FunctionEntry(
             name=name, kind=CalleeKind(kind_b),
             instr_offset=ioff, instr_count=icnt,
             num_regs=nregs, num_args=nargs,
             const_inits=const_inits,
+            param_names=param_names,
         ))
 
     instructions = []

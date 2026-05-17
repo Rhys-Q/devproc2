@@ -42,6 +42,29 @@ def test_nested_module_named_parameters_are_stable():
     ]
 
 
+def test_explicit_parameter_name_is_preserved_for_artifact_binding():
+    class Projection(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(
+                (4, 8),
+                "bfloat16",
+                name="fp8.encoder_ffn_gate_up_w_0.weight",
+            )
+
+        def forward(self, x):
+            return dp.matmul(x, self.weight)
+
+    model = Projection()
+    module = nn.GraphBuilder().build(
+        model.forward,
+        {"x": nn.TensorSpec((1, 4), "bfloat16")},
+    )
+    params = module.functions["forward"].params
+    assert params[1].name == "fp8.encoder_ffn_gate_up_w_0.weight"
+    assert list(model.state_dict()) == ["weight"]
+
+
 def test_linear_silu_linear_builds_standard_ops():
     class MLP(nn.Module):
         def __init__(self):

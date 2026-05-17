@@ -96,6 +96,54 @@ def test_decorator_registers_backend_neutral_spec():
     assert relu_kernel._kernel_spec is spec
 
 
+def test_decorator_records_cuda_source_metadata(tmp_path):
+    src = tmp_path / "relu.cu"
+    src.write_text('extern "C" __global__ void relu_cuda() {}\n')
+
+    @dp.kernel(
+        op="relu",
+        backend="cuda",
+        device="cuda",
+        dtype="float16",
+        symbol="relu_cuda",
+        sm_arches=(89,),
+        source_path=str(src),
+        include_dirs=(str(tmp_path),),
+        extra_nvcc_flags=("--use_fast_math",),
+    )
+    def relu_cuda(x, out):
+        pass
+
+    spec = dp.get_kernel_registry().lookup(
+        KernelMatchKey("relu", "cuda", ("float16",)),
+        sm_arch=89,
+    )
+    assert spec is not None
+    assert spec.source_path == str(src)
+    assert spec.include_dirs == (str(tmp_path),)
+    assert spec.extra_nvcc_flags == ("--use_fast_math",)
+    assert relu_cuda._kernel_spec is spec
+
+
+def test_call_dps_kernel_ast_emits_kernel_ref():
+    @dp.kernel(op="pi05.ffn", backend="cuda", device="cuda", dtype="float16")
+    def pi05_ffn(x, out):
+        pass
+
+    @dp.function
+    def f(x: dp.Tensor[(4,), "float16", "cuda"]):
+        out = dp.empty((4,), dtype="float16", device="cuda")
+        dp.call_dps_kernel("pi05_ffn", inputs=[x], output=out)
+        return out
+
+    fn = f.lower_module().functions["f"]
+    dps_ops = [op for op in fn.body.blocks[0].ops if isinstance(op, CallDPSOp)]
+    assert len(dps_ops) == 1
+    assert isinstance(dps_ops[0].target_ref, KernelRef)
+    assert dps_ops[0].target_ref.name == "kernel.pi05_ffn"
+    assert dps_ops[0].target_ref.spec is not None
+
+
 def test_kernel_provider_registry_is_backend_keyed():
     class FakeCudaProvider:
         backend = "cuda"
@@ -126,6 +174,46 @@ def test_kernel_provider_registry_is_backend_keyed():
     assert result.backend == "cuda"
     assert result.symbol == "relu_cuda"
     assert result.metadata == {"sm_arch": 90}
+
+
+def test_cuda_source_provider_invokes_nvcc(tmp_path):
+    from devproc2.kernel.provider import CudaSourceProvider
+
+    src = tmp_path / "relu.cu"
+    src.write_text('extern "C" __global__ void relu_cuda() {}\n')
+    cubin = tmp_path / "kernels" / "relu_cuda.cubin"
+
+    spec = KernelSpec(
+        op_name="relu",
+        device="cuda",
+        input_dtypes=("float16",),
+        kernel_name="kernel.relu_cuda",
+        backend="cuda",
+        source_path=str(src),
+        include_dirs=(str(tmp_path),),
+        extra_nvcc_flags=("--use_fast_math",),
+        compile_options={"nvcc": "nvcc"},
+    )
+
+    def fake_run(cmd, check, stdout, stderr):
+        assert cmd[:3] == ["nvcc", "--cubin", "-arch=sm_89"]
+        assert str(src) in cmd
+        assert "-I" in cmd and str(tmp_path) in cmd
+        assert "--use_fast_math" in cmd
+        cubin.parent.mkdir(parents=True, exist_ok=True)
+        cubin.write_bytes(b"CUBIN")
+        return MagicMock(stdout=b"", stderr=b"")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = CudaSourceProvider().compile(
+            spec,
+            object(),
+            output_dir=str(tmp_path),
+            sm_arch=89,
+        )
+
+    assert result.data == b"CUBIN"
+    assert result.metadata["sm_arch"] == 89
 
 
 def test_registry_filters_attrs_layout_sm_and_priority():

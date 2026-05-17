@@ -13,6 +13,7 @@ from devproc2.ir.nodes import (
     ObjectStructInfo,
     ScalarStructInfo,
     TensorStructInfo,
+    TupleStructInfo,
 )
 from devproc2.ir.prim_expr import (
     Add, CeilDiv, FloorDiv, IntImm, Max, Min, Mul, PrimVar, Sub,
@@ -80,6 +81,7 @@ def _function_entry_to_dict(fe) -> dict[str, Any]:
         "instr_count": fe.instr_count,
         "num_regs": fe.num_regs,
         "num_args": fe.num_args,
+        "param_names": list(getattr(fe, "param_names", [])),
     }
 
 
@@ -175,6 +177,11 @@ class EmitABIPass:
         if isinstance(ret, TensorStructInfo):
             outputs_json.append(_tensor_struct_info_to_dict(ret))
             shape_constraints.update(self._constraints_from_struct_info(ret))
+        elif isinstance(ret, TupleStructInfo):
+            for field in ret.fields:
+                if isinstance(field, TensorStructInfo):
+                    outputs_json.append(_tensor_struct_info_to_dict(field))
+                    shape_constraints.update(self._constraints_from_struct_info(field))
 
         return inputs_json, outputs_json, shape_constraints
 

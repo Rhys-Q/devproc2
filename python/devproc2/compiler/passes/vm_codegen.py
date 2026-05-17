@@ -20,6 +20,7 @@ from devproc2.ir.ops import (
     IfOp,
     ReturnOp,
     ShapeAssertOp,
+    TensorViewOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
@@ -212,6 +213,7 @@ class VMCodegenPass:
             num_regs=ctx.next_reg,
             num_args=len(fn.params),
             const_inits=ctx.const_inits,
+            param_names=[param.name for param in fn.params],
         )
         exec_.function_table.append(fe)
         exec_.instructions.extend(ctx.instrs)
@@ -229,6 +231,8 @@ class VMCodegenPass:
             self._lower_alloc_storage(op, ctx)
         elif isinstance(op, AllocTensorOp):
             self._lower_alloc_tensor(op, ctx)
+        elif isinstance(op, TensorViewOp):
+            self._lower_tensor_view(op, ctx)
         elif isinstance(op, CallDPSOp):
             self._lower_calldps(op, ctx)
         elif isinstance(op, ShapeAssertOp):
@@ -313,6 +317,64 @@ class VMCodegenPass:
             func_idx=ctx.builtin("vm.builtin.alloc_tensor"),
             arg_regs=[storage_reg, offset_reg, shape_reg,
                       code_reg, bits_reg, lanes_reg],
+        ))
+
+    # ---- TensorViewOp ------------------------------------------------------
+
+    def _lower_tensor_view(self, op: TensorViewOp, ctx: _FnCtx) -> None:
+        base_reg = ctx.reg_of(op.base)
+        offset_reg = ctx.reg_of(op.byte_offset)
+        if op.byte_stride != 1:
+            stride_reg = ctx.reg_for_int(op.byte_stride)
+            scaled_reg = ctx.alloc_reg()
+            ctx.emit(Instruction(
+                opcode=Opcode.CALL,
+                dst_reg=scaled_reg,
+                func_idx=ctx.builtin("vm.builtin.mul_i64"),
+                arg_regs=[offset_reg, stride_reg],
+            ))
+            offset_reg = scaled_reg
+        if op.base_offset != 0:
+            base_offset_reg = ctx.reg_for_int(op.base_offset)
+            adjusted_reg = ctx.alloc_reg()
+            ctx.emit(Instruction(
+                opcode=Opcode.CALL,
+                dst_reg=adjusted_reg,
+                func_idx=ctx.builtin("vm.builtin.add_i64"),
+                arg_regs=[offset_reg, base_offset_reg],
+            ))
+            offset_reg = adjusted_reg
+
+        shape_regs: list[int] = []
+        for dim in op.shape:
+            if isinstance(dim, IntImm):
+                shape_regs.append(ctx.reg_for_int(dim.value))
+            elif isinstance(dim, PrimVar):
+                reg = ctx._value_reg.get(id(dim))
+                if reg is None:
+                    raise RuntimeError(
+                        f"PrimVar shape dim '{dim.name}' not in register; "
+                        "ensure ShapeExprLoweringPass.setup_fn ran first."
+                    )
+                shape_regs.append(reg)
+            else:
+                shape_regs.append(ctx.prim_lowerer.materialize(dim))
+
+        shape_reg = ctx.alloc_reg()
+        ctx.emit(Instruction(
+            opcode=Opcode.CALL,
+            dst_reg=shape_reg,
+            func_idx=ctx.builtin("vm.builtin.make_shape"),
+            arg_regs=shape_regs,
+        ))
+
+        result_reg = ctx.alloc_reg()
+        ctx.bind(op.results[0], result_reg)
+        ctx.emit(Instruction(
+            opcode=Opcode.CALL,
+            dst_reg=result_reg,
+            func_idx=ctx.builtin("vm.builtin.tensor_view"),
+            arg_regs=[base_reg, offset_reg, shape_reg],
         ))
 
     # ---- CallDPSOp ---------------------------------------------------------

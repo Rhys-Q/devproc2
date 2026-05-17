@@ -202,6 +202,9 @@ class KernelSpec:
     params: tuple[KernelParamSpec, ...] = ()
     cubin_path: str | None = None
     ptx_path: str | None = None
+    source_path: str | None = None
+    include_dirs: tuple[str, ...] = ()
+    extra_nvcc_flags: tuple[str, ...] = ()
     compile_options: Mapping[str, object] = field(default_factory=dict)
     match: Optional[Callable[["CallOp"], bool]] = None
 
@@ -212,6 +215,8 @@ class KernelSpec:
         object.__setattr__(self, "layout_constraints", tuple(self.layout_constraints))
         object.__setattr__(self, "shape_constraints", tuple(self.shape_constraints))
         object.__setattr__(self, "params", tuple(self.params))
+        object.__setattr__(self, "include_dirs", tuple(self.include_dirs))
+        object.__setattr__(self, "extra_nvcc_flags", tuple(self.extra_nvcc_flags))
         object.__setattr__(self, "compile_options", dict(self.compile_options))
         if self.symbol is None:
             object.__setattr__(self, "symbol", self.kernel_name.removeprefix("kernel."))
@@ -237,6 +242,34 @@ class KernelSpec:
             params=params,
             cubin_path=self.cubin_path,
             ptx_path=self.ptx_path,
+            source_path=self.source_path,
+            include_dirs=self.include_dirs,
+            extra_nvcc_flags=self.extra_nvcc_flags,
+            compile_options=self.compile_options,
+            match=self.match,
+        )
+
+    def with_launch(self, launch: KernelLaunchSpec) -> "KernelSpec":
+        return KernelSpec(
+            op_name=self.op_name,
+            device=self.device,
+            input_dtypes=self.input_dtypes,
+            kernel_name=self.kernel_name,
+            backend=self.backend,
+            output_dtype=self.output_dtype,
+            symbol=self.symbol,
+            sm_arches=self.sm_arches,
+            priority=self.priority,
+            attr_constraints=self.attr_constraints,
+            layout_constraints=self.layout_constraints,
+            shape_constraints=self.shape_constraints,
+            launch=launch,
+            params=self.params,
+            cubin_path=self.cubin_path,
+            ptx_path=self.ptx_path,
+            source_path=self.source_path,
+            include_dirs=self.include_dirs,
+            extra_nvcc_flags=self.extra_nvcc_flags,
             compile_options=self.compile_options,
             match=self.match,
         )
@@ -269,6 +302,8 @@ class KernelSpec:
             payload["cubin"] = self.cubin_path
         if self.ptx_path is not None:
             payload["ptx"] = self.ptx_path
+        if self.source_path is not None:
+            payload["source"] = self.source_path
         return payload
 
 
@@ -314,6 +349,13 @@ class KernelRegistry:
                 if spec.match is not None and not spec.match(call_op):
                     continue
             return spec
+        return None
+
+    def get_by_kernel_name(self, kernel_name: str) -> Optional[KernelSpec]:
+        for bucket in self._specs.values():
+            for spec in bucket:
+                if spec.kernel_name == kernel_name:
+                    return spec
         return None
 
 

@@ -18,6 +18,7 @@ from devproc2.compiler.op import (
 )
 from devproc2.frontend.dsl import (
     Tensor,
+    call_dps_kernel,
     call_dps_packed,
     empty,
     function,
@@ -25,6 +26,7 @@ from devproc2.frontend.dsl import (
     range,
     reset_module,
     symbolic_dim,
+    tensor_view,
 )
 from devproc2.kernel import (
     AttrConstraint,
@@ -38,6 +40,7 @@ __all__ = [
     "add",
     "adarms_norm",
     "call",
+    "call_dps_kernel",
     "call_dps_packed",
     "cat",
     "embedding",
@@ -60,5 +63,6 @@ __all__ = [
     "rms_norm",
     "silu",
     "symbolic_dim",
+    "tensor_view",
     "transpose",
 ]

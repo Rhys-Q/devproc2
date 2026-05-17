@@ -10,6 +10,8 @@
 
 namespace devproc2 {
 
+void RegisterCoreBuiltins() {}
+
 // ── vm.builtin.alloc_storage ──────────────────────────────────────────────────
 // args: [size_bytes: Int, alignment: Int, device_type: Int, device_id: Int]
 // → Storage
@@ -57,6 +59,19 @@ DEVPROC2_REGISTER_BUILTIN("vm.builtin.alloc_tensor")
 
         return VMValue::ObjRef(
             Tensor::FromStorage(storage, offset, shobj->dims, dtype));
+    });
+
+// ── vm.builtin.tensor_view ───────────────────────────────────────────────────
+// args: [base: Tensor, byte_offset: Int, shape: ShapeTuple] → Tensor
+DEVPROC2_REGISTER_BUILTIN("vm.builtin.tensor_view")
+    .set_body([](std::vector<VMValue>& args) -> VMValue {
+        auto* base_obj = args[0].AsObjectAs<TensorObj>();
+        DEVPROC2_DCHECK(base_obj);
+        auto offset = args[1].AsInt();
+        auto* shobj = args[2].AsObjectAs<ShapeTupleObj>();
+        DEVPROC2_DCHECK(shobj);
+        return VMValue::ObjRef(
+            Tensor::View(Tensor(ObjectRef(base_obj)), offset, shobj->dims));
     });
 
 // ── vm.builtin.make_shape ─────────────────────────────────────────────────────

@@ -101,7 +101,9 @@ void CUDAKernelLauncher_Launch(
     // Collect kernel argument pointers.
     // Tensor args → data pointer; Int args → int64_t value.
     std::vector<void*> raw_args;
+    std::vector<void*> ptr_storage;    // stable storage for tensor data pointers
     std::vector<int64_t> int_storage;  // stable storage for int args
+    ptr_storage.reserve(args.size());
     int_storage.reserve(args.size());
     raw_args.reserve(args.size());
 
@@ -114,7 +116,8 @@ void CUDAKernelLauncher_Launch(
                     "CUDAKernelLauncher: expected TensorObj arg at index " +
                     std::to_string(i));
             }
-            raw_args.push_back(tobj->data());
+            ptr_storage.push_back(tobj->data());
+            raw_args.push_back(&ptr_storage.back());
         } else if (v.IsInt()) {
             int_storage.push_back(v.AsInt());
             raw_args.push_back(&int_storage.back());
@@ -123,12 +126,6 @@ void CUDAKernelLauncher_Launch(
                 "CUDAKernelLauncher: unsupported VMValue type at index " +
                 std::to_string(i));
         }
-    }
-
-    // Build params array (array of pointers to args).
-    std::vector<void*> params(raw_args.size());
-    for (size_t i = 0; i < raw_args.size(); ++i) {
-        params[i] = raw_args[i];
     }
 
     // Load (or retrieve from cache) the CUfunction.
@@ -142,7 +139,7 @@ void CUDAKernelLauncher_Launch(
         block_x, block_y, block_z,
         static_cast<unsigned int>(shared_memory_bytes),
         cu_stream,
-        params.empty() ? nullptr : params.data(),
+        raw_args.empty() ? nullptr : raw_args.data(),
         nullptr      // extra
     ));
 }

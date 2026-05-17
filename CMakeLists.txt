@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(DEVPROC2_WITH_CUDA          "Build CUDA backend"             OFF)
+option(DEVPROC2_WITH_CUTLASS       "Build optional CUTLASS CUDA kernels" OFF)
+option(DEVPROC2_WITH_TOKENIZERS    "Build tokenizers-cpp runtime hooks" OFF)
 option(DEVPROC2_BUILD_PYTHON_BINDING "Build Python pybind11 binding" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -31,5 +33,14 @@ endif()
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/json/single_include)
+
+if(DEVPROC2_WITH_TOKENIZERS)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tokenizers-cpp/include/tokenizers_cpp.h")
+    message(FATAL_ERROR
+      "tokenizers-cpp submodule not found. Run:\n"
+      "  git submodule update --init --recursive")
+  endif()
+  add_subdirectory(3rdparty/tokenizers-cpp EXCLUDE_FROM_ALL)
+endif()
 
 add_subdirectory(runtime)

@@ -21,6 +21,10 @@ def set_current_emitter(emitter: Emitter | None) -> Emitter | None:
     return prev
 
 
+def get_current_emitter() -> Emitter | None:
+    return _CURRENT_EMITTER
+
+
 def emit(op_func, *args, **attrs):
     emitter = _CURRENT_EMITTER
     if emitter is None:
@@ -40,5 +44,6 @@ __all__ = [
     "Emitter",
     "call",
     "emit",
+    "get_current_emitter",
     "set_current_emitter",
 ]

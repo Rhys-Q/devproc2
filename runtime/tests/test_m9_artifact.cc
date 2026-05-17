@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "devproc2/runtime/packed_func.h"
+#include "devproc2/runtime/shape_tuple.h"
+#include "devproc2/runtime/tensor.h"
 #include "devproc2/runtime/vm.h"
 
 namespace {
@@ -65,14 +67,65 @@ static std::vector<uint8_t> make_minimal_vm_bytes() {
     std::vector<uint8_t> buf;
     // Magic
     buf.insert(buf.end(), {'D', 'V', '2', 'E'});
-    // version=2, num_funcs=0, num_instrs=0 (3 x uint32 LE)
-    uint32_t v[4] = {2, 0, 0, 0};  // version, funcs, instrs, consts
+    // version=3, num_funcs=0, num_instrs=0 (3 x uint32 LE)
+    uint32_t v[4] = {3, 0, 0, 0};  // version, funcs, instrs, consts
     for (uint32_t x : v) {
         buf.push_back(x & 0xFF);
         buf.push_back((x >> 8) & 0xFF);
         buf.push_back((x >> 16) & 0xFF);
         buf.push_back((x >> 24) & 0xFF);
     }
+    return buf;
+}
+
+static void push_u8(std::vector<uint8_t>& buf, uint8_t x) {
+    buf.push_back(x);
+}
+
+static void push_u32(std::vector<uint8_t>& buf, uint32_t x) {
+    buf.push_back(x & 0xFF);
+    buf.push_back((x >> 8) & 0xFF);
+    buf.push_back((x >> 16) & 0xFF);
+    buf.push_back((x >> 24) & 0xFF);
+}
+
+static void push_i32(std::vector<uint8_t>& buf, int32_t x) {
+    push_u32(buf, static_cast<uint32_t>(x));
+}
+
+static void push_string(std::vector<uint8_t>& buf, const std::string& s) {
+    push_u32(buf, static_cast<uint32_t>(s.size()));
+    buf.insert(buf.end(), s.begin(), s.end());
+}
+
+static std::vector<uint8_t> make_weight_return_vm_bytes() {
+    std::vector<uint8_t> buf;
+    buf.insert(buf.end(), {'D', 'V', '2', 'E'});
+    push_u32(buf, 3);  // bytecode version
+    push_u32(buf, 1);  // function table entries
+    push_u32(buf, 1);  // instructions
+    push_u32(buf, 0);  // constants
+
+    push_string(buf, "main");
+    push_u8(buf, 0);   // VMCalleeKind::kVMFunc
+    push_i32(buf, 0);  // instr_offset
+    push_i32(buf, 1);  // instr_count
+    push_i32(buf, 1);  // num_regs
+    push_i32(buf, 1);  // num_args
+    push_i32(buf, 0);  // const_inits
+    push_u32(buf, 1);  // param_names
+    push_string(buf, "tiny.weight");
+
+    push_u8(buf, 1);    // Opcode::RET
+    push_i32(buf, -1);  // dst_reg
+    push_i32(buf, 0);   // func_idx
+    push_i32(buf, 0);   // src_reg
+    push_i32(buf, 0);   // cond_reg
+    push_i32(buf, 0);   // true_offset
+    push_i32(buf, 0);   // false_offset
+    push_i32(buf, 0);   // offset
+    push_u32(buf, 0);   // arg_regs
+    push_u32(buf, 0);   // launch_regs
     return buf;
 }
 
@@ -156,6 +209,67 @@ void test_load_missing_executable_vm() {
     CHECK_THROWS_MSG(Executable::Load(dir), "Cannot open file");
 }
 
+void test_invoke_binds_missing_weight_from_artifact() {
+    std::string dir = "/tmp/devproc2_m9_test_bind_weight_" + std::to_string(getpid());
+    std::filesystem::create_directories(dir + "/weights");
+    write_binary(dir + "/executable.vm", make_weight_return_vm_bytes());
+    write_file(dir + "/abi.json",
+               "{\"devproc_abi_version\": \"0.1\", \"required_packed_funcs\": []}");
+    write_binary(dir + "/weights/weights.bin", {7, 8, 9, 10});
+    write_file(dir + "/weights/weights.index.json",
+        "{\n"
+        "  \"format_version\": 1,\n"
+        "  \"data_file\": \"weights.bin\",\n"
+        "  \"entries\": [\n"
+        "    {\"name\":\"tiny.weight\",\"offset\":0,\"nbytes\":4,"
+        "     \"shape\":[4],\"dtype\":\"uint8\",\"alignment\":1}\n"
+        "  ]\n"
+        "}\n");
+
+    auto exe = Executable::Load(dir);
+    VMState vm(exe);
+    VMValue result = vm.Invoke("main", {});
+    CHECK(result.IsObjectRef());
+    auto* tensor = result.AsObjectAs<TensorObj>();
+    CHECK(tensor != nullptr);
+#ifdef DEVPROC2_WITH_CUDA
+    CHECK(tensor->device().device_type == kDLCUDA);
+#else
+    CHECK(tensor->device().device_type == kDLCPU);
+    auto* bytes = static_cast<uint8_t*>(tensor->data());
+    CHECK(bytes[0] == 7);
+    CHECK(bytes[3] == 10);
+#endif
+}
+
+void test_tensor_view_builtin_aliases_base() {
+    uint8_t bytes[16];
+    for (int i = 0; i < 16; ++i) bytes[i] = static_cast<uint8_t>(i);
+    DLDataType u8{kDLUInt, 8, 1};
+    Tensor base = Tensor::FromExternalBuffer(
+        bytes, DLDevice{kDLCPU, 0}, {16}, u8);
+    auto shape = ShapeTuple::Make({4});
+
+    auto fn = BuiltinRegistry::Global().Get("vm.builtin.tensor_view");
+    CHECK(static_cast<bool>(fn));
+    std::vector<VMValue> args = {
+        VMValue::ObjRef(base),
+        VMValue::Int(5),
+        VMValue::ObjRef(shape),
+    };
+    VMValue result = fn(args);
+    CHECK(result.IsObjectRef());
+    auto* view = result.AsObjectAs<TensorObj>();
+    CHECK(view != nullptr);
+    CHECK(view->data() == static_cast<void*>(bytes + 5));
+    CHECK(view->shape()[0] == 4);
+    CHECK(view->dtype().code == kDLUInt);
+    CHECK(view->base.defined());
+    auto* view_bytes = static_cast<uint8_t*>(view->data());
+    CHECK(view_bytes[0] == 5);
+    CHECK(view_bytes[3] == 8);
+}
+
 }  // namespace
 
 int main() {
@@ -165,6 +279,8 @@ int main() {
     RUN(test_load_abi_version_mismatch);
     RUN(test_load_missing_packed_func);
     RUN(test_load_missing_executable_vm);
+    RUN(test_invoke_binds_missing_weight_from_artifact);
+    RUN(test_tensor_view_builtin_aliases_base);
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail ? 1 : 0;

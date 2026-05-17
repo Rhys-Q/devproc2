@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 
 from devproc2.ir.nodes import Op, OpResult, Region, Value
-from devproc2.ir.ops import ForOp, IfOp, TupleGetItemOp, TupleOp, YieldOp
+from devproc2.ir.ops import ForOp, IfOp, TensorViewOp, TupleGetItemOp, TupleOp, YieldOp
 
 
 def iter_ops(region: Region) -> Iterator[Op]:
@@ -50,6 +50,9 @@ class AliasAnalysis:
         for op in ops:
             if isinstance(op, TupleOp):
                 self.forward_edges[op.results[0]] = op.elems
+
+            elif isinstance(op, TensorViewOp):
+                self.forward_edges[op.results[0]] = (op.base,)
 
             elif isinstance(op, TupleGetItemOp):
                 self.forward_edges[op.results[0]] = self._project_tuple_item(

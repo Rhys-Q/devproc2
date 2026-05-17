@@ -15,6 +15,7 @@ from devproc2.ir.nodes import (
     OpResult,
     Region,
     StructInfo,
+    TensorStructInfo,
     TerminatorOp,
     Value,
     Var,
@@ -312,7 +313,11 @@ class TensorCreateOp(Op):
         else:
             if self.like is not None:
                 raise ValueError(f"TensorCreateOp({self.kind.name}) must not specify 'like'")
-        object.__setattr__(self, "results", (OpResult(op=self, index=0),))
+        if self.kind == TensorCreateKind.empty_like:
+            si = getattr(self.like, "struct_info", None)
+        else:
+            si = TensorStructInfo(self.shape, self.dtype, self.device)
+        object.__setattr__(self, "results", (OpResult(op=self, index=0, struct_info=si),))
 
     @property
     def operands(self) -> tuple[Value, ...]:
@@ -334,6 +339,72 @@ class TensorCreateOp(Op):
             device=self.device,
             fill_value=self.fill_value,
             like=like,
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class TensorViewOp(Op):
+    """Create a tensor view over an existing tensor without allocating storage.
+
+    ``byte_offset`` is a scalar byte index.  ``byte_stride`` and
+    ``base_offset`` let loops pass an index value while codegen materializes
+    ``base_offset + byte_offset * byte_stride`` before calling the VM builtin.
+    """
+    dialect:     ClassVar[DialectKind] = DialectKind.memory
+    result_name: str
+    base:        Value
+    byte_offset: Value
+    shape:       tuple[PrimExpr, ...]
+    dtype:       Optional[str] = None
+    device:      Optional[str] = None
+    byte_stride: int = 1
+    base_offset: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "shape",
+            tuple(IntImm(s) if isinstance(s, int) else s for s in self.shape),
+        )
+        dtype = self.dtype
+        device = self.device
+        base_si = getattr(self.base, "struct_info", None)
+        if isinstance(base_si, TensorStructInfo):
+            dtype = dtype or base_si.dtype
+            device = device or base_si.device
+        si = (
+            TensorStructInfo(self.shape, dtype, device)
+            if dtype is not None and device is not None
+            else None
+        )
+        object.__setattr__(self, "results", (OpResult(op=self, index=0, struct_info=si),))
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        return (self.base, self.byte_offset)
+
+    @property
+    def effects(self) -> EffectSummary:
+        return EffectSummary(
+            reads=(self.base,),
+            alias=AliasInfo(AliasKind.view_of, source=self.base),
+        )
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple[Region, ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "TensorViewOp":
+        return TensorViewOp(
+            result_name=self.result_name,
+            base=operands[0],
+            byte_offset=operands[1],
+            shape=self.shape,
+            dtype=self.dtype,
+            device=self.device,
+            byte_stride=self.byte_stride,
+            base_offset=self.base_offset,
         )
 
 

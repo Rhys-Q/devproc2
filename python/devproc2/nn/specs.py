@@ -67,7 +67,8 @@ class Parameter:
 
 
 def with_parameter_name(parameter: Parameter, name: str) -> Parameter:
-    if parameter.name == name:
+    resolved_name = parameter.name or name
+    if parameter.name == resolved_name:
         return parameter
     return Parameter(
         shape=parameter.shape,
@@ -75,7 +76,7 @@ def with_parameter_name(parameter: Parameter, name: str) -> Parameter:
         device=parameter.device,
         layout=parameter.layout,
         role=parameter.role,
-        name=name,
+        name=resolved_name,
     )
 
 

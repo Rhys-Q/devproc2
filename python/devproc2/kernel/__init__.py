@@ -1,4 +1,5 @@
 from devproc2.kernel.provider import (
+    CudaSourceProvider,
     KernelCompileResult,
     KernelProvider,
     KernelProviderRegistry,
@@ -15,6 +16,7 @@ from devproc2.kernel.registry import (
 
 __all__ = [
     "AttrConstraint",
+    "CudaSourceProvider",
     "KernelCompileResult",
     "KernelLaunchSpec",
     "KernelMatchKey",

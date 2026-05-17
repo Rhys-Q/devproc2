@@ -33,6 +33,7 @@ from devproc2.ir.ops import (
     ShapeAssertOp,
     TensorCreateKind,
     TensorCreateOp,
+    TensorViewOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
@@ -59,7 +60,7 @@ from devproc2.ir.prim_expr import (
 def _op_result_name(op: Op, index: int) -> Optional[str]:
     """Return the user-given name for result[index], or None for auto-numbering."""
     if isinstance(op, (CallOp, TensorCreateOp, TupleOp, TupleGetItemOp,
-                       AllocStorageOp, AllocTensorOp)):
+                       AllocStorageOp, AllocTensorOp, TensorViewOp)):
         name = op.result_name
         return name if name else None
     if isinstance(op, (IfOp, ForOp)):
@@ -168,6 +169,16 @@ class Printer:
         elif isinstance(op, TensorCreateOp):
             rname = self._result_names[id(op.results[0])]
             self._buf.write(f"{indent}%{rname} = {self._tensor_create_str(op)}\n")
+
+        elif isinstance(op, TensorViewOp):
+            rname = self._result_names[id(op.results[0])]
+            shape_str = "(" + ", ".join(self.print_prim_expr(s) for s in op.shape) + ")"
+            self._buf.write(
+                f"{indent}%{rname} = tensor_view("
+                f"{self._value_str(op.base)}, offset={self._value_str(op.byte_offset)}, "
+                f"shape={shape_str}, stride={op.byte_stride}, "
+                f"base_offset={op.base_offset})\n"
+            )
 
         elif isinstance(op, TupleOp):
             rname = self._result_names[id(op.results[0])]
