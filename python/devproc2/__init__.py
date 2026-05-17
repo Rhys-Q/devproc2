@@ -1,4 +1,4 @@
-from devproc2 import ir, nn  # noqa: F401
+from devproc2 import ir, models, nn  # noqa: F401
 from devproc2.compiler.op import (
     add,
     adarms_norm,
@@ -55,6 +55,7 @@ __all__ = [
     "KernelParamSpec",
     "layer_norm",
     "matmul",
+    "models",
     "multiply",
     "nn",
     "permute_dims",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import devproc2.frontend.dsl as dp
 from devproc2.kernel import KernelMatchKey
-from devproc2.pi05.kernels import PI05_KERNELS, register_pi05_kernels
+from devproc2.models.pi05.kernels import PI05_KERNELS, register_pi05_kernels
 
 
 def test_register_pi05_kernels_populates_cuda_specs():

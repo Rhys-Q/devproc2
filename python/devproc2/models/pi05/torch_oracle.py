@@ -171,7 +171,7 @@ def dump_torch_denoise_oracle(
             time = time + dt
 
         metadata = {
-            "format": "devproc2.pi05.torch_denoise_oracle",
+            "format": "devproc2.models.pi05.torch_denoise_oracle",
             "format_version": 1,
             "openpi_root": str(openpi_root),
             "ckpt_dir": str(ckpt_dir),

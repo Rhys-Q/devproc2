@@ -28,7 +28,7 @@ FlashRT PR #19 的 `~21ms` 口径已经验证为不可直接复现：公开 PR h
 **Frontend / IR / DSL**
 
 - 标准 `forward()` 仍保留标准 IR op 结构，便于阅读、分析和后续重构。
-- 性能路径放在 `forward_fast()` / `forward_fast_dynamic()`，通过 `dp.call_dps_kernel(...)` 和 `dp.call_dps_packed(...)` 接入 CUDA kernel 和 packed runtime func。
+- 性能路径放在 `forward_fast()` / `forward_fast_dynamic()`，CUDA source kernel 通过 Pi0.5 helper 展开为 `dp.cuda_call(...)` 无注册接入，cuBLASLt/FA2/CUTLASS runtime func 继续通过 `dp.call_dps_packed(...)` 接入。
 - `TensorViewOp` / `dp.tensor_view(...)` 已用于 fast path 中零拷贝切分 per-layer KV cache 与 per-step style table。
 - Pi0.5 CUDA kernel catalog 当前包含 41 个 SM89 CUDA source kernels，覆盖 image normalize、embedding gather、patch im2col、norm、RoPE、QKV split、KV cache、GeGLU、AdaRMSNorm、static/dynamic FP8 quant、Euler update 和 attention correctness fallback。
 

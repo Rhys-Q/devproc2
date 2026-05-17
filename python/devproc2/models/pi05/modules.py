@@ -7,8 +7,8 @@ import devproc2 as dp
 import devproc2.nn as nn
 
 from devproc2.ir.prim_expr import PrimExpr, ceildiv
+from devproc2.models.pi05.kernels import call_pi05_cuda_kernel as _pi05_cuda_kernel
 from devproc2.nn.specs import Parameter
-from devproc2.pi05.kernels import register_pi05_kernels
 
 
 class PI05Linear(nn.Module):
@@ -47,7 +47,6 @@ class PI05Linear(nn.Module):
         return out
 
     def forward_fast(self, x):
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(x, 0)
         out = dp.call_dps_packed(
             "runtime.cuda.bf16_nn_bf16",
@@ -63,7 +62,7 @@ class PI05Linear(nn.Module):
             output_device="cuda",
         )
         if self.bias is not None:
-            dp.call_dps_kernel(
+            _pi05_cuda_kernel(
                 "pi05_bias_add_bf16",
                 inputs=[out, self.bias, rows, self.out_features],
                 launch=_grid_1d(rows * self.out_features),
@@ -136,10 +135,9 @@ class PI05VisionPatchEmbedding(nn.Module):
         return out
 
     def forward_fast(self, images_u8):
-        register_pi05_kernels(sm_arch=89)
         image_elems = self.num_views * self.image_size * self.image_size * self.in_channels
         rows = self.num_views * self.num_patches
-        image_bf16 = dp.call_dps_kernel(
+        image_bf16 = _pi05_cuda_kernel(
             "pi05_image_u8_to_bf16_norm",
             inputs=[images_u8, image_elems],
             launch=_grid_1d(image_elems),
@@ -147,7 +145,7 @@ class PI05VisionPatchEmbedding(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        patches = dp.call_dps_kernel(
+        patches = _pi05_cuda_kernel(
             "pi05_patch_im2col_bf16",
             inputs=[image_bf16, self.num_views],
             launch=_grid_1d(rows * self.patch_dim),
@@ -168,12 +166,12 @@ class PI05VisionPatchEmbedding(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        dp.call_dps_kernel(
+        _pi05_cuda_kernel(
             "pi05_bias_add_bf16",
             inputs=[out, self.patch_bias, rows, self.vision_width],
             launch=_grid_1d(rows * self.vision_width),
         )
-        dp.call_dps_kernel(
+        _pi05_cuda_kernel(
             "pi05_position_add_bf16",
             inputs=[out, self.position_embedding, rows, self.num_patches, self.vision_width],
             launch=_grid_1d(rows * self.vision_width),
@@ -207,9 +205,8 @@ class PI05LanguageEmbedding(nn.Module):
         return dp.multiply(emb, self.hidden_size ** 0.5)
 
     def forward_fast(self, token_ids):
-        register_pi05_kernels(sm_arch=89)
         num_tokens = _static_dim(token_ids, 0)
-        return dp.call_dps_kernel(
+        return _pi05_cuda_kernel(
             "pi05_embedding_gather_bf16",
             inputs=[token_ids, self.embedding, num_tokens, self.hidden_size],
             launch=_grid_1d(num_tokens * self.hidden_size),
@@ -242,10 +239,9 @@ class PI05Attention(nn.Module):
         self.scale = float(scale if scale is not None else self.head_dim ** -0.5)
 
     def forward_fast(self, q, k, v):
-        register_pi05_kernels(sm_arch=89)
         rows_q = _static_dim(q, 0)
         rows_k = _static_dim(k, 0)
-        return dp.call_dps_kernel(
+        return _pi05_cuda_kernel(
             "pi05_attention_bf16",
             inputs=[
                 q,
@@ -437,7 +433,6 @@ class PI05VisionEncoderLayer(nn.Module):
         )
 
     def forward_fast_dynamic(self, hidden):
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(hidden, 0)
         eps_bits = _f32_to_i64_bits(self.eps)
         norm_w = _view_bf16_row(self.pre_attn_norm_w, self.layer_idx, self.hidden_size)
@@ -473,7 +468,7 @@ class PI05VisionEncoderLayer(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        q, k, v = dp.call_dps_kernel(
+        q, k, v = _pi05_cuda_kernel(
             "pi05_qkv_bias_split_bf16",
             inputs=[
                 qkv,
@@ -533,7 +528,7 @@ class PI05VisionEncoderLayer(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        dp.call_dps_kernel(
+        _pi05_cuda_kernel(
             "pi05_bias_residual_bf16",
             inputs=[hidden, attn_out, o_b, rows, self.hidden_size],
             launch=_grid_1d(rows * self.hidden_size),
@@ -564,7 +559,7 @@ class PI05VisionEncoderLayer(nn.Module):
             output_device="cuda",
         )
         if self.use_static_act_scales:
-            ffn_hidden_fp8 = dp.call_dps_kernel(
+            ffn_hidden_fp8 = _pi05_cuda_kernel(
                 "pi05_bias_gelu_to_fp8_bf16",
                 inputs=[ffn_hidden, up_b, self.down_act_scale, rows, self.intermediate_size],
                 launch=_grid_1d(rows * self.intermediate_size),
@@ -574,12 +569,12 @@ class PI05VisionEncoderLayer(nn.Module):
             )
             ffn_hidden_scale = self.down_act_scale
         else:
-            dp.call_dps_kernel(
+            _pi05_cuda_kernel(
                 "pi05_bias_add_bf16",
                 inputs=[ffn_hidden, up_b, rows, self.intermediate_size],
                 launch=_grid_1d(rows * self.intermediate_size),
             )
-            dp.call_dps_kernel(
+            _pi05_cuda_kernel(
                 "pi05_gelu_inplace_bf16",
                 inputs=[ffn_hidden, rows * self.intermediate_size],
                 launch=_grid_1d(rows * self.intermediate_size),
@@ -605,7 +600,7 @@ class PI05VisionEncoderLayer(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        dp.call_dps_kernel(
+        _pi05_cuda_kernel(
             "pi05_bias_residual_bf16",
             inputs=[hidden, ffn_out, down_b, rows, self.hidden_size],
             launch=_grid_1d(rows * self.hidden_size),
@@ -705,7 +700,6 @@ class PI05VisionEncoder(nn.Module):
         )
 
     def forward_fast_dynamic(self, images_u8):
-        register_pi05_kernels(sm_arch=89)
         hidden = self.patch.forward_fast(images_u8)
         rows = _static_dim(hidden, 0)
         for layer in self.layers:
@@ -734,7 +728,7 @@ class PI05VisionEncoder(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        dp.call_dps_kernel(
+        _pi05_cuda_kernel(
             "pi05_bias_add_bf16",
             inputs=[out, self.projector_b, rows, self.output_size],
             launch=_grid_1d(rows * self.output_size),
@@ -833,7 +827,6 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
         prefix_valid_rows=None,
         skip_post_kv: bool = False,
     ):
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(hidden, 0)
         eps_bits = _f32_to_i64_bits(self.eps)
         normed_fp8, normed_scale = _rms_norm_unit_fp8_maybe_static(
@@ -864,7 +857,7 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
             prefix_rows = _static_dim(k_cache, 1)
             prefix_layer_bytes = prefix_rows * self.num_kv_heads * self.head_dim * 2
         if k_cache is not None and v_cache is not None:
-            q = dp.call_dps_kernel(
+            q = _pi05_cuda_kernel(
                 "pi05_qkv_split_rope_cache_bf16",
                 inputs=[
                     qkv,
@@ -899,7 +892,7 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
             if skip_post_kv:
                 return hidden
         else:
-            q, k, v = dp.call_dps_kernel(
+            q, k, v = _pi05_cuda_kernel(
                 "pi05_qkv_split_rope_bf16",
                 inputs=[
                     qkv,
@@ -918,7 +911,7 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
                 ],
             )
         if prefix_valid_rows is None:
-            attn = dp.call_dps_kernel(
+            attn = _pi05_cuda_kernel(
                 "pi05_attention_bf16",
                 inputs=[
                     q,
@@ -1248,13 +1241,12 @@ class PI05SampleActionsFromTokens(nn.Module):
         prefix_rope_interleaved,
         suffix_rope_interleaved,
     ):
-        register_pi05_kernels(sm_arch=89)
         image_embs = self.vision.forward_fast_dynamic(images_u8)
         lang_embs = self.language.forward_fast(token_ids)
         image_rows = _static_dim(image_embs, 0)
         lang_rows = _static_dim(lang_embs, 0)
         prefix_rows = image_rows + lang_rows
-        prefix_embs = dp.call_dps_kernel(
+        prefix_embs = _pi05_cuda_kernel(
             "pi05_prefix_concat_bf16",
             inputs=[
                 image_embs,
@@ -1358,9 +1350,8 @@ class PI05FFN(nn.Module):
         return self.down_proj(hidden)
 
     def forward_fast(self, x):
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(x, 0)
-        x_fp8 = dp.call_dps_kernel(
+        x_fp8 = _pi05_cuda_kernel(
             "pi05_quantize_fp8_static_bf16",
             inputs=[
                 x,
@@ -1387,7 +1378,7 @@ class PI05FFN(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        hidden_fp8 = dp.call_dps_kernel(
+        hidden_fp8 = _pi05_cuda_kernel(
             "pi05_geglu_to_fp8_bf16",
             inputs=[
                 gate_up,
@@ -1416,8 +1407,6 @@ class PI05FFN(nn.Module):
 
     def forward_fast_from_fp8(self, x_fp8, act0_scale, rows: int):
         """FFN fast path when caller already produced FP8 normalized input."""
-
-        register_pi05_kernels(sm_arch=89)
         gate_up = dp.call_dps_packed(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
@@ -1433,7 +1422,7 @@ class PI05FFN(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        hidden = dp.call_dps_kernel(
+        hidden = _pi05_cuda_kernel(
             "pi05_geglu_bf16",
             inputs=[
                 gate_up,
@@ -1468,8 +1457,6 @@ class PI05FFN(nn.Module):
 
     def forward_fast_from_fp8_accum(self, x_fp8, act0_scale, rows: int, residual):
         """FFN fast path with the down projection accumulated into residual."""
-
-        register_pi05_kernels(sm_arch=89)
         gate_up = dp.call_dps_packed(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
@@ -1485,7 +1472,7 @@ class PI05FFN(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        hidden = dp.call_dps_kernel(
+        hidden = _pi05_cuda_kernel(
             "pi05_geglu_bf16",
             inputs=[
                 gate_up,
@@ -1519,8 +1506,6 @@ class PI05FFN(nn.Module):
 
     def forward_fast_from_fp8_static(self, x_fp8, act0_scale, rows: int):
         """FFN fast path with caller-provided input FP8 and calibrated GeGLU scale."""
-
-        register_pi05_kernels(sm_arch=89)
         gate_up = dp.call_dps_packed(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
@@ -1536,7 +1521,7 @@ class PI05FFN(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        hidden_fp8 = dp.call_dps_kernel(
+        hidden_fp8 = _pi05_cuda_kernel(
             "pi05_geglu_to_fp8_bf16",
             inputs=[
                 gate_up,
@@ -1567,8 +1552,6 @@ class PI05FFN(nn.Module):
 
     def forward_fast_from_fp8_static_accum(self, x_fp8, act0_scale, rows: int, residual):
         """Static-scale FFN fast path with down projection accumulated in-place."""
-
-        register_pi05_kernels(sm_arch=89)
         gate_up = dp.call_dps_packed(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
@@ -1584,7 +1567,7 @@ class PI05FFN(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        hidden_fp8 = dp.call_dps_kernel(
+        hidden_fp8 = _pi05_cuda_kernel(
             "pi05_geglu_to_fp8_bf16",
             inputs=[
                 gate_up,
@@ -1614,8 +1597,6 @@ class PI05FFN(nn.Module):
 
     def forward_fast_dynamic(self, x):
         """Dynamic-activation FP8 path for calibration/correctness fallback."""
-
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(x, 0)
         x_fp8, act0_scale = _quantize_fp8_dynamic_parallel(
             x,
@@ -1637,7 +1618,7 @@ class PI05FFN(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        hidden = dp.call_dps_kernel(
+        hidden = _pi05_cuda_kernel(
             "pi05_geglu_bf16",
             inputs=[
                 gate_up,
@@ -1782,7 +1763,6 @@ class PI05DecoderLayer(nn.Module):
         style_ffn_table,
         step,
     ):
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(hidden, 0)
         prefix_rows = _static_dim(prefix_k_cache, 1)
         eps_bits = _f32_to_i64_bits(self.eps)
@@ -1819,7 +1799,7 @@ class PI05DecoderLayer(nn.Module):
         )
 
         if self.use_static_act_scales:
-            normed_fp8, gate_attn = dp.call_dps_kernel(
+            normed_fp8, gate_attn = _pi05_cuda_kernel(
                 "pi05_ada_rms_norm_style_to_fp8_bf16",
                 inputs=[
                     hidden,
@@ -1838,7 +1818,7 @@ class PI05DecoderLayer(nn.Module):
             )
             normed_scale = self.qkv_act_scale
         else:
-            normed, gate_attn = dp.call_dps_kernel(
+            normed, gate_attn = _pi05_cuda_kernel(
                 "pi05_ada_rms_norm_style_bf16",
                 inputs=[
                     hidden,
@@ -1874,7 +1854,7 @@ class PI05DecoderLayer(nn.Module):
             output_dtype="bfloat16",
             output_device="cuda",
         )
-        q, full_k, full_v = dp.call_dps_kernel(
+        q, full_k, full_v = _pi05_cuda_kernel(
             "pi05_qkv_split_rope_concat_bf16",
             inputs=[
                 qkv,
@@ -1941,7 +1921,7 @@ class PI05DecoderLayer(nn.Module):
             output_device="cuda",
         )
         if self.use_static_act_scales:
-            ffn_norm_fp8, gate_ffn = dp.call_dps_kernel(
+            ffn_norm_fp8, gate_ffn = _pi05_cuda_kernel(
                 "pi05_gate_residual_ada_norm_to_fp8_bf16",
                 inputs=[
                     hidden,
@@ -1963,13 +1943,13 @@ class PI05DecoderLayer(nn.Module):
             ffn_norm_scale = self.ffn.act0_scale
             ffn_out = self.ffn.forward_fast_from_fp8_static(ffn_norm_fp8, ffn_norm_scale, rows)
         else:
-            dp.call_dps_kernel(
+            _pi05_cuda_kernel(
                 "pi05_gate_mul_residual_bf16",
                 inputs=[hidden, attn_out, gate_attn, rows * self.hidden_size],
                 launch=_grid_1d(rows * self.hidden_size),
             )
 
-            ffn_norm, gate_ffn = dp.call_dps_kernel(
+            ffn_norm, gate_ffn = _pi05_cuda_kernel(
                 "pi05_ada_rms_norm_style_bf16",
                 inputs=[
                     hidden,
@@ -1991,7 +1971,7 @@ class PI05DecoderLayer(nn.Module):
                 (rows, self.hidden_size),
             )
             ffn_out = self.ffn.forward_fast_from_fp8(ffn_norm_fp8, ffn_norm_scale, rows)
-        dp.call_dps_kernel(
+        _pi05_cuda_kernel(
             "pi05_gate_mul_residual_bf16",
             inputs=[hidden, ffn_out, gate_ffn, rows * self.hidden_size],
             launch=_grid_1d(rows * self.hidden_size),
@@ -2108,9 +2088,8 @@ class PI05DenoiseStep(nn.Module):
         rope_interleaved,
         step,
     ):
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(actions_f32, 0)
-        actions_bf16 = dp.call_dps_kernel(
+        actions_bf16 = _pi05_cuda_kernel(
             "pi05_cast_f32_to_bf16",
             inputs=[actions_f32, rows * self.action_dim],
             launch=_grid_1d(rows * self.action_dim),
@@ -2138,7 +2117,7 @@ class PI05DenoiseStep(nn.Module):
             (rows, 3 * self.hidden_size),
             byte_stride=style_step_bytes,
         )
-        hidden, _gate_unused = dp.call_dps_kernel(
+        hidden, _gate_unused = _pi05_cuda_kernel(
             "pi05_ada_rms_norm_style_bf16",
             inputs=[
                 hidden,
@@ -2157,9 +2136,8 @@ class PI05DenoiseStep(nn.Module):
         return self.action_out.forward_fast(hidden)
 
     def apply_delta_fast(self, actions_f32, delta_bf16):
-        register_pi05_kernels(sm_arch=89)
         rows = _static_dim(actions_f32, 0)
-        dp.call_dps_kernel(
+        _pi05_cuda_kernel(
             "pi05_euler_update_bf16",
             inputs=[
                 actions_f32,
@@ -2258,7 +2236,7 @@ def _view_bf16_row(table, row: int, width: int):
 def _quantize_fp8_maybe_static(x, n: int, output_shape, scale):
     if scale is None:
         return _quantize_fp8_dynamic_parallel(x, n, output_shape)
-    out = dp.call_dps_kernel(
+    out = _pi05_cuda_kernel(
         "pi05_quantize_fp8_static_bf16",
         inputs=[x, scale, n],
         launch=_grid_1d(n),
@@ -2271,7 +2249,7 @@ def _quantize_fp8_maybe_static(x, n: int, output_shape, scale):
 
 def _layer_norm_fp8_maybe_static(x, weight, bias, rows: int, cols: int, eps_bits: int, scale):
     if scale is None:
-        normed = dp.call_dps_kernel(
+        normed = _pi05_cuda_kernel(
             "pi05_layer_norm_bf16",
             inputs=[x, weight, bias, rows, cols, eps_bits],
             launch=dp.KernelLaunchSpec(grid=(rows, 1, 1), block=(256, 1, 1)),
@@ -2280,7 +2258,7 @@ def _layer_norm_fp8_maybe_static(x, weight, bias, rows: int, cols: int, eps_bits
             output_device="cuda",
         )
         return _quantize_fp8_dynamic_parallel(normed, rows * cols, (rows, cols))
-    out = dp.call_dps_kernel(
+    out = _pi05_cuda_kernel(
         "pi05_layer_norm_to_fp8_bf16",
         inputs=[x, weight, bias, scale, rows, cols, eps_bits],
         launch=dp.KernelLaunchSpec(grid=(rows, 1, 1), block=(256, 1, 1)),
@@ -2293,7 +2271,7 @@ def _layer_norm_fp8_maybe_static(x, weight, bias, rows: int, cols: int, eps_bits
 
 def _rms_norm_unit_fp8_maybe_static(x, rows: int, cols: int, eps_bits: int, scale):
     if scale is None:
-        normed = dp.call_dps_kernel(
+        normed = _pi05_cuda_kernel(
             "pi05_rms_norm_unit_bf16",
             inputs=[x, rows, cols, eps_bits],
             launch=dp.KernelLaunchSpec(grid=(rows, 1, 1), block=(256, 1, 1)),
@@ -2302,7 +2280,7 @@ def _rms_norm_unit_fp8_maybe_static(x, rows: int, cols: int, eps_bits: int, scal
             output_device="cuda",
         )
         return _quantize_fp8_dynamic_parallel(normed, rows * cols, (rows, cols))
-    out = dp.call_dps_kernel(
+    out = _pi05_cuda_kernel(
         "pi05_rms_norm_unit_to_fp8_bf16",
         inputs=[x, scale, rows, cols, eps_bits],
         launch=dp.KernelLaunchSpec(grid=(rows, 1, 1), block=(256, 1, 1)),
@@ -2315,7 +2293,7 @@ def _rms_norm_unit_fp8_maybe_static(x, rows: int, cols: int, eps_bits: int, scal
 
 def _quantize_fp8_dynamic_parallel(x, n: int, output_shape):
     if n <= 4096:
-        out, scale = dp.call_dps_kernel(
+        out, scale = _pi05_cuda_kernel(
             "pi05_quantize_fp8_dynamic_bf16",
             inputs=[x, n],
             launch=dp.KernelLaunchSpec(grid=(1, 1, 1), block=(256, 1, 1)),
@@ -2327,7 +2305,7 @@ def _quantize_fp8_dynamic_parallel(x, n: int, output_shape):
         return out, scale
 
     partial_blocks = 128
-    partial_amax = dp.call_dps_kernel(
+    partial_amax = _pi05_cuda_kernel(
         "pi05_reduce_amax_bf16",
         inputs=[x, n],
         launch=dp.KernelLaunchSpec(grid=(partial_blocks, 1, 1), block=(256, 1, 1)),
@@ -2335,7 +2313,7 @@ def _quantize_fp8_dynamic_parallel(x, n: int, output_shape):
         output_dtype="float32",
         output_device="cuda",
     )
-    scale = dp.call_dps_kernel(
+    scale = _pi05_cuda_kernel(
         "pi05_amax_to_scale",
         inputs=[partial_amax, partial_blocks],
         launch=dp.KernelLaunchSpec(grid=(1, 1, 1), block=(256, 1, 1)),
@@ -2343,7 +2321,7 @@ def _quantize_fp8_dynamic_parallel(x, n: int, output_shape):
         output_dtype="float32",
         output_device="cuda",
     )
-    out = dp.call_dps_kernel(
+    out = _pi05_cuda_kernel(
         "pi05_quantize_fp8_static_bf16",
         inputs=[x, scale, n],
         launch=_grid_1d(n),

@@ -2,8 +2,8 @@ import json
 
 import numpy as np
 
-from devproc2.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact, pi05_kernel_specs
-from devproc2.pi05.weights import QuantSpec, WeightPackageWriter
+from devproc2.models.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact, pi05_kernel_specs
+from devproc2.models.pi05.weights import QuantSpec, WeightPackageWriter
 
 
 def test_pi05_kernel_specs_are_concrete_cuda_specs():

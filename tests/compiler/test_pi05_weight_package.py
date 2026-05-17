@@ -4,7 +4,7 @@ import json
 
 import numpy as np
 
-from devproc2.pi05.weights import (
+from devproc2.models.pi05.weights import (
     BF16,
     FP8_E4M3,
     QuantSpec,

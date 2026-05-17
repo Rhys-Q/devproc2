@@ -137,9 +137,10 @@ class DPSLoweringPass(IRRewriter):
         return KernelSpec(
             op_name=f"cuda.{op.symbol}",
             device=_cuda_call_device(op),
-            input_dtypes=build_input_dtypes(op.args),
+            input_dtypes=op.input_dtypes or build_input_dtypes(op.args),
             kernel_name=kernel_name,
             backend="cuda",
+            output_dtype=op.output_dtype,
             symbol=op.symbol,
             sm_arches=sm_arches,
             launch=launch,
@@ -176,7 +177,13 @@ def _auto_cuda_kernel_name(op: CudaCallOp) -> str:
         "extra_nvcc_flags": list(op.extra_nvcc_flags),
         "compile_options": prim_expr_to_json_obj(dict(op.compile_options)),
         "input_dtypes": list(build_input_dtypes(op.args)),
+        "explicit_input_dtypes": list(op.input_dtypes),
+        "output_dtype": op.output_dtype,
         "output_indices": list(op.output_indices),
+        "params": [
+            p.to_json_obj() if hasattr(p, "to_json_obj") else repr(p)
+            for p in op.params
+        ],
     }
     blob = json.dumps(
         prim_expr_to_json_obj(payload),
@@ -199,6 +206,8 @@ def _cuda_call_device(op: CudaCallOp) -> str:
 
 
 def _cuda_call_params(op: CudaCallOp) -> tuple[KernelParamSpec, ...]:
+    if op.params:
+        return tuple(op.params)
     params: list[KernelParamSpec] = []
     outputs = set(op.output_indices)
     for i, value in enumerate(op.args):

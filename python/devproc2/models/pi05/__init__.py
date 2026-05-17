@@ -1,7 +1,7 @@
 """Pi0.5 integration helpers."""
 
-from devproc2.pi05.artifact import Pi05ArtifactSummary, prepare_pi05_artifact
-from devproc2.pi05.export import (
+from devproc2.models.pi05.artifact import Pi05ArtifactSummary, prepare_pi05_artifact
+from devproc2.models.pi05.export import (
     Pi05DenoiseCompileResult,
     Pi05DenoiseExportSummary,
     build_pi05_denoise_loop_module,
@@ -45,8 +45,14 @@ from devproc2.pi05.export import (
     pi05_sample_actions_tokens_input_specs,
     pi05_vision_encoder_input_specs,
 )
-from devproc2.pi05.kernels import PI05_KERNELS, pi05_kernel_specs, register_pi05_kernels
-from devproc2.pi05.modules import (
+from devproc2.models.pi05.kernels import (
+    PI05_KERNELS,
+    call_pi05_cuda_kernel,
+    pi05_cuda_source_path,
+    pi05_kernel_specs,
+    register_pi05_kernels,
+)
+from devproc2.models.pi05.modules import (
     PI05Attention,
     PI05DecoderLayer,
     PI05DenoiseLoop,
@@ -62,7 +68,7 @@ from devproc2.pi05.modules import (
     PI05VisionEncoderLayer,
     PI05VisionPatchEmbedding,
 )
-from devproc2.pi05.weights import (
+from devproc2.models.pi05.weights import (
     QuantSpec,
     WeightEntry,
     WeightPackageWriter,
@@ -100,6 +106,7 @@ __all__ = [
     "build_pi05_sample_actions_precomputed_prefix_module",
     "build_pi05_sample_actions_tokens_module",
     "build_pi05_vision_encoder_module",
+    "call_pi05_cuda_kernel",
     "compile_pi05_denoise_executable",
     "compile_pi05_denoise_loop_executable",
     "compile_pi05_paligemma_prefix_encoder_executable",
@@ -135,6 +142,7 @@ __all__ = [
     "pi05_sample_actions_tokens_input_specs",
     "pi05_vision_encoder_input_specs",
     "pi05_kernel_specs",
+    "pi05_cuda_source_path",
     "register_pi05_kernels",
     "select_fp8_layout",
 ]

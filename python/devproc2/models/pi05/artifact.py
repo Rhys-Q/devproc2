@@ -11,7 +11,7 @@ import shutil
 from typing import Any
 
 from devproc2.kernel.provider import CudaSourceProvider
-from devproc2.pi05.kernels import pi05_kernel_specs
+from devproc2.models.pi05.kernels import pi05_kernel_specs
 
 
 _DEFAULT_TOKENIZER = Path("/root/autodl-tmp/openpi/outputs/pi05_torch_infer/tokenizer.model")
@@ -105,7 +105,7 @@ def prepare_pi05_artifact(
     )
 
     _write_json(metadata_dir / "pi05_artifact.json", {
-        "format": "devproc2.pi05.artifact",
+        "format": "devproc2.models.pi05.artifact",
         "format_version": 1,
         "created_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "model": "openpi0.5",

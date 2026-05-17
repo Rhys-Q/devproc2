@@ -21,8 +21,8 @@ from devproc2.compiler.passes.vm_codegen import VMCodegenPass
 from devproc2.ir.nodes import Function, IRModule
 from devproc2.ir.ops import ReturnOp
 from devproc2.nn import GraphBuilder, ScalarSpec, TensorSpec
-from devproc2.pi05.artifact import Pi05ArtifactSummary, prepare_pi05_artifact
-from devproc2.pi05.modules import (
+from devproc2.models.pi05.artifact import Pi05ArtifactSummary, prepare_pi05_artifact
+from devproc2.models.pi05.modules import (
     PI05DenoiseLoop,
     PI05DenoiseStep,
     PI05PaliGemmaPrefixEncoder,

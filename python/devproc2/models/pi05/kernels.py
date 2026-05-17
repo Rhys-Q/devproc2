@@ -1,14 +1,23 @@
 """Pi0.5 CUDA kernel catalog registered through the devproc2 DSL."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import devproc2.frontend.dsl as dp
+import devproc2.nn as nn
+from devproc2.ir.nodes import TensorStructInfo, shape_values
 from devproc2.kernel import KernelLaunchSpec, KernelParamSpec, KernelSpec
 
 
 _CUDA_SOURCE = Path(__file__).resolve().parent / "cuda" / "pi05_kernels.cu"
+
+
+def pi05_cuda_source_path() -> str:
+    """Return the CUDA source path used by Pi0.5 source-symbol calls."""
+
+    return str(_CUDA_SOURCE)
 
 
 @dataclass(frozen=True)
@@ -717,6 +726,177 @@ PI05_KERNELS: tuple[Pi05KernelDecl, ...] = (
         launch=KernelLaunchSpec(grid=(1, 1, 1), block=(256, 1, 1)),
     ),
 )
+
+
+_KERNELS_BY_NAME: dict[str, Pi05KernelDecl] = {decl.fn_name: decl for decl in PI05_KERNELS}
+
+
+def call_pi05_cuda_kernel(
+    name: str,
+    *,
+    inputs=None,
+    output=None,
+    effect: str = "opaque",
+    launch: KernelLaunchSpec | None = None,
+    output_like=None,
+    output_shape=None,
+    output_dtype: str | None = None,
+    output_device: str | None = None,
+    output_spec=None,
+    output_specs=None,
+):
+    """Emit an unregistered CUDA call using the Pi0.5 kernel catalog.
+
+    This mirrors ``dp.call_dps_kernel`` at the model boundary while emitting a
+    source-symbol ``CudaCallOp`` instead of requiring global kernel
+    registration during tracing.
+    """
+
+    decl = _lookup_kernel(name)
+    input_values = _as_tuple(inputs)
+    output_values = _make_outputs(
+        input_values,
+        output_like=output_like if output_like is not None else output,
+        output_shape=output_shape,
+        output_dtype=output_dtype,
+        output_device=output_device,
+        output_spec=output_spec,
+        output_specs=output_specs,
+    )
+
+    output_indices = tuple(range(len(input_values), len(input_values) + len(output_values)))
+    dp.cuda_call(
+        f"{pi05_cuda_source_path()}::{decl.symbol}",
+        *(input_values + output_values),
+        metadata={
+            "launch": launch or decl.launch,
+            "output_indices": output_indices,
+            "kernel_name": f"kernel.{decl.fn_name}",
+            "params": decl.params,
+            "input_dtypes": decl.dtypes,
+            "output_dtype": decl.output_dtype,
+            "extra_nvcc_flags": ("--std=c++17",),
+            "effect": effect,
+        },
+    )
+
+    if not output_values:
+        return None
+    if len(output_values) == 1:
+        return output_values[0]
+    return output_values
+
+
+def _lookup_kernel(name: str) -> Pi05KernelDecl:
+    key = name.removeprefix("kernel.")
+    try:
+        return _KERNELS_BY_NAME[key]
+    except KeyError as err:
+        known = ", ".join(sorted(_KERNELS_BY_NAME))
+        raise KeyError(f"unknown Pi0.5 CUDA kernel {name!r}; known kernels: {known}") from err
+
+
+def _make_outputs(
+    input_values: tuple,
+    *,
+    output_like,
+    output_shape,
+    output_dtype: str | None,
+    output_device: str | None,
+    output_spec,
+    output_specs,
+) -> tuple:
+    if output_specs is not None:
+        specs = tuple(output_specs)
+        if not specs:
+            raise ValueError("output_specs must contain at least one output spec")
+        return tuple(_empty_from_spec(spec) for spec in specs)
+
+    has_output = (
+        output_like is not None
+        or output_shape is not None
+        or output_dtype is not None
+        or output_device is not None
+        or output_spec is not None
+    )
+    if not has_output:
+        return ()
+
+    return (
+        _empty_from_spec(
+            _resolve_output_spec(
+                input_values,
+                output_like=output_like,
+                output_shape=output_shape,
+                output_dtype=output_dtype,
+                output_device=output_device,
+                output_spec=output_spec,
+            )
+        ),
+    )
+
+
+def _resolve_output_spec(
+    input_values: tuple,
+    *,
+    output_like,
+    output_shape,
+    output_dtype: str | None,
+    output_device: str | None,
+    output_spec,
+) -> nn.TensorSpec | TensorStructInfo:
+    if output_spec is not None:
+        return output_spec
+
+    like_si = _tensor_struct_info(output_like)
+    if like_si is None:
+        if not input_values:
+            raise ValueError("Pi0.5 CUDA call output requires inputs, output_like, or output_spec")
+        like_si = _tensor_struct_info(input_values[0])
+    if like_si is None:
+        raise TypeError("Pi0.5 CUDA call output_like must have TensorStructInfo")
+
+    shape = output_shape if output_shape is not None else shape_values(like_si.shape)
+    return nn.TensorSpec(
+        _shape_tuple(shape),
+        output_dtype or like_si.dtype,
+        device=output_device or like_si.device,
+    )
+
+
+def _empty_from_spec(spec) -> object:
+    si = spec if isinstance(spec, TensorStructInfo) else getattr(spec, "struct_info", None)
+    if not isinstance(si, TensorStructInfo):
+        raise TypeError("output_spec must be TensorSpec or TensorStructInfo")
+    return dp.empty(shape_values(si.shape), dtype=si.dtype, device=si.device)
+
+
+def _tensor_struct_info(value) -> TensorStructInfo | None:
+    if value is None:
+        return None
+    ir_value = getattr(value, "value", value)
+    si = getattr(ir_value, "struct_info", None)
+    return si if isinstance(si, TensorStructInfo) else None
+
+
+def _as_tuple(value) -> tuple:
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    return (value,)
+
+
+def _shape_tuple(shape) -> tuple:
+    if isinstance(shape, tuple):
+        return shape
+    if isinstance(shape, list):
+        return tuple(shape)
+    if isinstance(shape, Sequence) and not isinstance(shape, (str, bytes)):
+        return tuple(shape)
+    return (shape,)
 
 
 def pi05_kernel_specs(*, sm_arch: int = 89, source_path: str | None = None) -> tuple[KernelSpec, ...]:

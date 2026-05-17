@@ -295,6 +295,9 @@ class GraphBuilder:
             include_dirs=tuple(str(v) for v in _metadata_tuple(metadata.get("include_dirs", ()))),
             extra_nvcc_flags=tuple(str(v) for v in _metadata_tuple(metadata.get("extra_nvcc_flags", ()))),
             compile_options=dict(metadata.get("compile_options", {})),
+            params=tuple(_metadata_tuple(metadata.get("params", ()))),
+            input_dtypes=tuple(str(v) for v in _metadata_tuple(metadata.get("input_dtypes", ()))),
+            output_dtype=metadata.get("output_dtype"),
             kernel_name=metadata.get("kernel_name"),
             effect=_cuda_call_effect(metadata, tuple(ir_args[i] for i in output_indices), symbol),
         )

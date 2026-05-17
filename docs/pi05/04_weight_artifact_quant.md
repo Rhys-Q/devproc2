@@ -4,7 +4,7 @@
 
 本阶段已经从“量化预留”推进到可执行的 Pi0.5 FP8 权重包与 artifact 资源装配：
 
-- `devproc2.pi05.convert_pi05_weights(...)` 可将 `/root/autodl-tmp/tools/pi05-pytorch-base/model.safetensors` 转成 devproc2 权重包。
+- `devproc2.models.pi05.convert_pi05_weights(...)` 可将 `/root/autodl-tmp/tools/pi05-pytorch-base/model.safetensors` 转成 devproc2 权重包。
 - RTX 4090 / SM89 使用 FP8 `nk` layout，与 FlashRT 的 4090 cuBLASLt `fp8_nt` 路径一致。
 - 已生成本地包：`build/pi05_fp8.weights/`。
 - 已生成本地 resource artifact：`build/pi05_fp8_artifact/`。
@@ -14,14 +14,14 @@
 - artifact resource install 会优先使用同盘 hardlink 安装 `weights.bin`，避免多个 Pi0.5 executable artifact 重复占用 3.7GB 权重空间；跨文件系统时回退到 copy。
 - VM bytecode v3 已序列化函数参数名；`VMState::Invoke` 在少传参数时可从 artifact `WeightStore` 自动补齐同名权重参数。
 - C++ runtime 已实现 tokenizer packed func，artifact 内 `resources/tokenizer.model` 优先于默认 oracle 路径；`test_pi05_sample_tokens_tokenizer` 已验证 tokenizer 生成 token ids 后可直接驱动 full `sample_tokens` artifact。
-- CUDA source provider 可把 `python/devproc2/pi05/cuda/pi05_kernels.cu` 编译成 SM89 cubin，并写入 artifact `kernels/`。
+- CUDA source provider 可把 `python/devproc2/models/pi05/cuda/pi05_kernels.cu` 编译成 SM89 cubin，并写入 artifact `kernels/`。
 - FlashRT vendored FA2 已通过 packed func `runtime.cuda.pi05_fa2_bf16` / `runtime.cuda.pi05_fa2_bf16_batched` 接入，denoise、prefix encoder 和 vision encoder fast path 默认走 FA2，BF16 attention kernel 仅作为 fallback/debug。runtime 提供 `DEVPROC2_FA2_SPLIT_Q_THRESHOLD` / `DEVPROC2_FA2_NUM_SMS` profile 开关；默认保持 FlashRT 原 split-KV 启发式，因为只对长 Q 禁用 split-KV 在完整 CUDA Graph 中回退。
 - 动态 activation quant 已拆为 parallel amax reduce、scale materialize 和 static quant 三段；当前主性能 artifact 使用离线校准后的静态 activation scales，避免 runtime amax 成为 4090 主瓶颈。
 - cuBLASLt FP8 GEMM 已支持 shape-level autotune、默认 FP8 FAST_ACCUM 性能模式，以及 `runtime.cuda.fp8_nt_bf16_accum` in-place residual accumulate，用于 prefix encoder O projection / FFN down 融合。`beta=1` accum 路径 autotune 已修正为调参前备份 `D`、调参后恢复，避免首次真实 inference residual 被 tune 覆盖。
 - 可选 `DEVPROC2_WITH_CUTLASS=ON` build 已接入 SM89 CUTLASS FP8 NT -> BF16 GEMM prototype，runtime 通过 `DEVPROC2_CUTLASS_FP8_NT` 开关进入 shape-specialized path。当前只默认接管 vision FFN down 的 `m=512/768,n=1152,k=4304,beta=0` 形状，使用现有 device `A_scale/B_scale` 做双 scale epilogue；prefix FFN 的 plain CUTLASS probe 仍慢于或接近 cuBLASLt，所以不替换主路径。
 - artifact 现已包含 action-expert denoise fast 子图、10-step unrolled denoise loop、precomputed-prefix `sample_actions` 后半段、prefix-embeddings 到 actions 的单 artifact，以及直接消费 `images_u8 + token_ids` 的 `sample_tokens` artifact。当前 tokenizer packed func 已可用，但完整 prompt/state 到 token ids 的前处理尚未并入 VM graph。
 - runtime 已提供 `CUDAGraphExec` RAII wrapper；`bench_pi05_denoise` 通过该 API 做 CUDA Graph capture/replay，用于部署形态的 10-step denoise 延迟验证。
-- prefix KV materialization fast path 已新增 `pi05_qkv_split_rope_cache_bf16`，decoder attention fast path 已新增 `pi05_qkv_split_rope_concat_bf16`；二者均在 DSL frontend 中以 `dp.call_dps_kernel(...)` 注入，把 QKV split、Q/K RoPE、K/V cache 写回或 full-KV concat 合到单个 CUDA kernel；默认 `forward()` 仍保留标准 IR op 结构，快速路径放在 `forward_fast_dynamic()`。
+- prefix KV materialization fast path 已新增 `pi05_qkv_split_rope_cache_bf16`，decoder attention fast path 已新增 `pi05_qkv_split_rope_concat_bf16`；二者均在 DSL frontend 中通过 Pi0.5 CUDA helper 注入为 `CudaCallOp`，把 QKV split、Q/K RoPE、K/V cache 写回或 full-KV concat 合到单个 CUDA kernel；默认 `forward()` 仍保留标准 IR op 结构，快速路径放在 `forward_fast_dynamic()`。
 - 已对 `/root/autodl-tmp/realtime-vla` 的 Pi0.5 Triton 实现做对照分析。该项目没有 FP8 量化，4090 上 Pi05 1/2/3-view 参考为 `22.1ms / 29.2ms / 38.9ms`。它的主要收益来自固定形状 Triton GEMM、GEMM tile 内 bias/residual/GELU/gate 融合、QKV+RoPE 写回融合、预计算 denoise style、action_out 融合 Euler `dt`、CUDA Graph capture，以及把 prefix/suffix KV 放入同一缓存布局。
 - realtime-vla 中已经被当前 devproc2 采用的策略包括 CUDA Graph、precomputed denoise style、action_out `-1/num_steps` folding、PaliGemma prefix RMS scale folding、shape-level GEMM autotune、FlashRT FA2、静态 activation scale、FP8 FAST_ACCUM、vision QKV bias+split 小融合、vision FFN bias+GELU+static FP8 quant 小融合，以及 vision FFN down 的 shape-specialized CUTLASS FP8 route。
 - realtime-vla 中已验证但当前不保留的策略包括：full KV cache 布局写 suffix K/V 到 prefix cache 后部（storage 从约 2.6MB 增至约 20.3MB，precomputed-prefix latency 变差）、独立 scalar fusion kernels（launch 数减少但 full path latency 变差）、vision residual 用 cuBLASLt `beta=1` 累加再单独加 bias（2-view 收益不稳定，3-view latency 和误差变差）、cuBLASLt bias epilogue（当前 row-major FP8/BF16 layout 下 heuristic 返回 status 15，不可用）。

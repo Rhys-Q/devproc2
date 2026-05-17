@@ -62,9 +62,9 @@
 - `PI05Linear.forward_fast()` 现在使用 `runtime.cuda.bf16_nn_bf16`，用于 patch/action/output 等 BF16 投影。
 - `PI05Attention.forward_fast()`、`PI05PaliGemmaEncoderLayer.forward_fast_dynamic(..., prefix_valid_rows=...)` 和 decoder attention 的性能路径现在使用 FlashRT vendored FA2 packed func `runtime.cuda.pi05_fa2_bf16`；`pi05_attention_bf16` / `pi05_attention_prefix_bf16` 作为 correctness fallback 和 debug kernel 保留。
 - `PI05FFN.forward_fast()` 现在走显式 fast path：
-  1. `dp.call_dps_kernel("pi05_quantize_fp8_static_bf16", ...)`
+  1. Pi0.5 CUDA helper 注入 `pi05_quantize_fp8_static_bf16`
   2. `dp.call_dps_packed("runtime.cuda.fp8_nt_bf16", ...)`
-  3. `dp.call_dps_kernel("pi05_geglu_to_fp8_bf16", ...)`
+  3. Pi0.5 CUDA helper 注入 `pi05_geglu_to_fp8_bf16`
   4. `dp.call_dps_packed("runtime.cuda.fp8_nt_bf16", ...)`
 - `PI05FFN.forward_fast_dynamic()` 现在走动态 activation scale 路径：`pi05_reduce_amax_bf16` 做 parallel amax、`pi05_amax_to_scale` materialize scale，再复用 static quant kernel，用于校准和没有静态 act scale artifact 时的 correctness fallback。
 - CUDA packed func 已提供 `runtime.cuda.fp8_nt_bf16` / `runtime.cuda.fp8_nn_bf16`，底层为 cuBLASLt FP8 E4M3 -> BF16 GEMM，支持 SM89 `nk` weight layout；当前默认启用 FP8 FAST_ACCUM，可用 `DEVPROC2_CUBLASLT_FP8_FAST_ACCUM=0` 回退严格累积。
@@ -84,7 +84,7 @@
 - `build/pi05_fp8_vision_encoder_executable` 已提供 SigLIP vision encoder prefix slice ABI：输入 `images_u8`，输出 `[768, 2048]` BF16 image embeddings；当前 341 个权重/scale 参数、1702 条 VM 指令。
 - `build/pi05_fp8_paligemma_prefix_encoder_artifact` 已提供 compact PaliGemma prefix transformer slice ABI：输入 `prefix_embs + rope_interleaved`，输出 `[968, 2048]` BF16 prefix hidden states；当前 216 个权重/scale 参数、583 条 VM 指令、90697728 bytes temporary storage。
 - `build/pi05_fp8_paligemma_prefix_kv_encoder_artifact` 已提供 compact PaliGemma prefix KV cache slice ABI：输入 `prefix_embs + prefix_valid_rows + rope_interleaved`，输出 `[18, 968, 1, 256]` BF16 `prefix_k_cache` 和 `prefix_v_cache`；当前 207 个权重/scale 参数、606 条 VM 指令、108044288 bytes temporary storage。
-- `devproc2.pi05.torch_oracle` 可从本地 openpi/PyTorch checkpoint dump denoise/prefix oracle，输出 `prefix_embs`、`prefix_rope_interleaved`、`prefix_k_cache`、`prefix_v_cache`、`prefix_valid_rows`、suffix `rope_interleaved`、`actions_f32` 和 torch target delta。
+- `devproc2.models.pi05.torch_oracle` 可从本地 openpi/PyTorch checkpoint dump denoise/prefix oracle，输出 `prefix_embs`、`prefix_rope_interleaved`、`prefix_k_cache`、`prefix_v_cache`、`prefix_valid_rows`、suffix `rope_interleaved`、`actions_f32` 和 torch target delta。
 - `test_pi05_denoise_oracle` 已可加载真实 `build/pi05_fp8_artifact` / `build/pi05_fp8_loop_artifact` / `build/pi05_fp8_sample_precomputed_prefix_artifact` / `build/pi05_fp8_paligemma_prefix_kv_encoder_artifact` / `build/pi05_fp8_sample_precomputed_prefix_embs_artifact`，用 torch bf16 oracle 调用 VM `main`。当前 strict FP8 accumulation 下 step0 指标为 `abs_max=0.00868897`、`abs_mean=0.00144342`；example0 的 10-step closed-loop 和 VM 内 loop 指标均为 `final_abs_max=0.078042`、`final_abs_mean=0.0104354`；10-example bf16 multi-oracle 指标为 `worst_abs_max=0.149316`、`worst_abs_mean=0.0131491`；runtime-vs-fp16 torch outputs 指标为 `worst_abs_max=0.165487`、`worst_abs_mean=0.0158259`。standalone prefix KV artifact 目前作为 raw-cache smoke；单 artifact prefix-embs 路径为 `final_abs_max=0.199095`、`final_abs_mean=0.024508`。
 - `WeightStore::Load` 已改为按文件 size 一次性读取 `weights.bin`，避免 3.7GB 权重包通过 iterator 读入导致分钟级加载。
 - `bench_pi05_denoise` 已通过 runtime `CUDAGraphExec` 支持完整 10-step CUDA Graph capture/replay。RTX 4090 当前实测：precomputed-prefix 后半段 `13.286ms`（strict/oracle artifact），prefix-embeddings single artifact `25.812ms`，CUTLASS-enabled 3-view full `sample_tokens` `28.548ms`，2-view/P=562 full `sample_tokens` `23.425ms`。

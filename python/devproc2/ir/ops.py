@@ -302,6 +302,9 @@ class CudaCallOp(Op):
     include_dirs: tuple[str, ...] = ()
     extra_nvcc_flags: tuple[str, ...] = ()
     compile_options: Mapping[str, object] = field(default_factory=dict)
+    params: tuple[object, ...] = ()
+    input_dtypes: tuple[str, ...] = ()
+    output_dtype: str | None = None
     kernel_name: str | None = None
     effect: EffectSummary | None = None
 
@@ -314,6 +317,8 @@ class CudaCallOp(Op):
         object.__setattr__(self, "include_dirs", tuple(self.include_dirs))
         object.__setattr__(self, "extra_nvcc_flags", tuple(self.extra_nvcc_flags))
         object.__setattr__(self, "compile_options", dict(self.compile_options))
+        object.__setattr__(self, "params", tuple(self.params))
+        object.__setattr__(self, "input_dtypes", tuple(str(v) for v in self.input_dtypes))
         n_args = len(self.args)
         bad = [i for i in self.output_indices if i < 0 or i >= n_args]
         if bad:
@@ -360,6 +365,9 @@ class CudaCallOp(Op):
             include_dirs=self.include_dirs,
             extra_nvcc_flags=self.extra_nvcc_flags,
             compile_options=self.compile_options,
+            params=self.params,
+            input_dtypes=self.input_dtypes,
+            output_dtype=self.output_dtype,
             kernel_name=self.kernel_name,
             effect=effects if effects is not None else self.effect,
         )
