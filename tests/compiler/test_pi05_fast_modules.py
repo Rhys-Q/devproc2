@@ -62,6 +62,17 @@ from devproc2.nn import Module
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PI05_MODEL_SOURCE = _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "model.py"
+_PI05_MODEL_LAYER_SOURCES = (
+    _PI05_MODEL_SOURCE,
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "layers.py",
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "ffn.py",
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "vision.py",
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "prefix.py",
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "decoder.py",
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "denoise.py",
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "sample.py",
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "graph" / "_helpers.py",
+)
 _PI05_LEGACY_MODULE_SOURCE = (
     _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "modules.py"
 )
@@ -90,15 +101,18 @@ def _lowered_ops(module, fn_name: str):
 
 def test_pi05_model_layer_keeps_backend_ops_behind_ops_facade():
     assert not _PI05_LEGACY_MODULE_SOURCE.exists()
-    source = _PI05_MODEL_SOURCE.read_text()
-    for needle in (
-        "dp.cuda_call",
-        "dp.call_dps_packed",
-        "dp.tensor_view",
-        "tensor_view(",
-        "runtime.cuda.",
-    ):
-        assert needle not in source
+    assert len(_PI05_MODEL_SOURCE.read_text().splitlines()) <= 120
+    for path in _PI05_MODEL_LAYER_SOURCES:
+        assert path.exists(), path
+        source = path.read_text()
+        for needle in (
+            "dp.cuda_call",
+            "dp.call_dps_packed",
+            "dp.tensor_view",
+            "tensor_view(",
+            "runtime.cuda.",
+        ):
+            assert needle not in source, f"{needle} leaked into {path}"
 
 
 def test_pi05_public_imports_use_canonical_modules():
