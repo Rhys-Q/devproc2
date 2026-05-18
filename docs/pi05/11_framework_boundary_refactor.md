@@ -142,19 +142,99 @@ Python 层不是唯一问题。C++ runtime 当前也存在 Pi0.5 业务能力直
 
 这些不一定要马上删除，但长期形态应该是 runtime extension 或 model-owned backend registration。通用 runtime 可以有 tokenizer 和 CUDA packed func registry，但不应该把 Pi0.5 prompt/state 规则当成通用 runtime 规则。
 
+### 7. Pi0.5 前端 DSL 的 CUDA 接入仍然只是 facade
+
+当前 Pi0.5 graph 文件已经不再直接写 `dp.cuda_call(...)`、`dp.call_dps_packed(...)` 和 `runtime.cuda.*`，这是明显进步。但这还不等于前端 DSL 很优雅。
+
+现在的真实形态是：`graph/` 调用 `pi05_ops.call_cuda(...)`，`ops.py` 再把它转成 `dp.cuda_call(source::symbol, metadata=...)`。这只是把裸 backend API 包了一层 facade。模型 fragment 里仍然能看到大量 backend 负担：
+
+- 手写具体 CUDA symbol，例如 `pi05_qkv_split_rope_concat_bf16`、`pi05_gate_residual_ada_norm_to_fp8_bf16`；
+- 手写 kernel 参数顺序；
+- 手写输出 buffer；
+- 手写 launch grid/block/shared memory；
+- 手写 packed func 名称和 ABI 顺序。
+
+这说明当前实现已经“把脏东西集中到一扇门后面”，但还没有真正做到“前端表达模型语义”。优雅的 graph 层应该写：
+
+```python
+q, full_k, full_v = pi05_ops.qkv_split_rope_concat(...)
+attn = pi05_ops.prefix_attention(...)
+hidden = pi05_ops.gated_residual_ada_norm_to_fp8(...)
+```
+
+而不是写：
+
+```python
+pi05_ops.call_cuda(
+    "pi05_qkv_split_rope_concat_bf16",
+    qkv,
+    rope,
+    prefix_k,
+    prefix_v,
+    prefix_rows,
+    rows,
+    q_dim,
+    k_dim,
+    v_dim,
+    head_dim,
+    q,
+    full_k,
+    full_v,
+    launch=...,
+)
+```
+
+也就是说，`ops.py` 的长期职责不应该是一个通用 `call_cuda(name, *args, launch=...)` 入口，而应该是 Pi0.5 语义级 primitive 集合。kernel symbol、launch policy、参数 ABI、output layout、effect summary 都应进入 `ops.py` 内部的 typed kernel catalog 或 backend registry。
+
+### 8. `runtime.cuda.*` packed func 路径不是优雅解
+
+`runtime/src/cuda/cuda_gemm.cc` 及对应 header 当前承担了 Pi0.5 fast path 的核心性能能力：FP8/BF16 GEMM 的 cuBLASLt host runner、CUTLASS FP8 特化、FA2 attention host runner、scratch buffer 管理、stream 继承和 packed func 注册。
+
+从性能角度看，这些能力不能被朴素 CUDA kernel 替代。任何“为了目录干净，把 cuBLASLt/CUTLASS/FA2 换成简单 `__global__` kernel”的做法都不可接受，属于性能回退。
+
+但从框架边界看，它们也不应该作为通用 runtime packed func 注册：
+
+- `runtime.cuda.fp8_nt_bf16` 当前服务的是 Pi0.5 FP8 artifact layout、scale ABI 和固定 shape 性能路径，不是标准 `matmul` lowering 自动选择的通用 kernel。
+- `runtime.cuda.fp8_nt_bf16_accum` 暴露的是 Pi0.5 residual accumulate fusion 约定，不是通用 runtime contract。
+- `runtime.cuda.pi05_fa2_bf16` 和 `runtime.cuda.pi05_fa2_bf16_batched` 名字上已经承认是 Pi0.5 业务 backend，却注册在 runtime core。
+- VM 通过 `callee.name.startswith("runtime.cuda.")` 注入默认 CUDA stream，这把一个命名约定变成了执行语义。
+
+标准 op 的优雅路径应该是：frontend 产生 `dp.matmul`、`dp.attention` 等标准 op，compiler lowering 根据 target、dtype、layout 和 shape 选择提前注册好的 `KernelSpec` 或 backend provider。它不应该依赖 runtime 启动时全局注册一个 `"runtime.cuda.fp8_nt_bf16"` packed func。
+
+显式 CUDA kernel 的优雅路径应该是：前端 DSL 或 `ops.py` 插入 `CudaCallOp`，DPS lowering 生成 `KernelRef`，artifact 写出 kernel table，runtime 只按 artifact 加载 cubin 并 launch。它也不应该走 runtime packed func 注册。
+
+因此，`runtime.cuda.*` packed func 路径应该从 Pi0.5 fast path 中删除。但删除的含义不是降级性能，也不是删除 `call_dps_packed` 这类 DPS host-call ABI，而是把“编译 host backend 并注册 packed funcs”做成 devproc2 的标准通用路径。Pi0.5 只是通过这条标准路径把高性能 host runner 收回到 Pi0.5-owned backend 边界：
+
+```text
+models/pi05/cuda/
+  kernels/              # AOT source-symbol CUDA kernels
+  backends/
+    fp8_gemm/           # cuBLASLt/CUTLASS host runner, Pi0.5-owned
+    fa2/                # FA2 wrapper and scratch policy, Pi0.5-owned
+```
+
+调用边界应该是：
+
+- `pi05_ops` 发出 Pi0.5 semantic op，内部用 `call_dps_packed("pi05.cuda.*", ...)` 表达 host backend 调用；VM 在 artifact 声明驱动下注册 Pi0.5-owned packed funcs。
+- `pi05_ops` 发出显式 source-symbol `CudaCallOp`，仅用于纯 device kernel；cuBLASLt/CUTLASS/FA2 这类 host runner 不伪装成 cubin kernel，而由 Pi0.5 backend provider 负责。
+
+更长期可以新增 `BackendCallRef` / `CallBackendOp`，让 IR 显式区分 packed func 和 host backend；但第一阶段不必阻塞在新 IR。`call_dps_packed` 本身可以成为 host backend 的标准表达，只要注册来源和命名空间是 artifact/recipe 驱动，而不是 runtime core 硬编码。
+
+通用 runtime 不应该在启动时无条件注册 Pi0.5 CUDA packed func。runtime core 只保留通用机制：加载 artifact、加载 cubin、加载 packed backend、调用 backend 注册符号、分发 packed func、传入 stream、管理 tensor/storage。Pi0.5 backend 是否存在、如何初始化、需要哪些 CUDA/C++ source，应由 Pi0.5 配置、recipe 和 artifact manifest 声明。
+
 ## 优雅设计应该长什么样
 
 优雅不是把文件搬个位置，而是依赖方向变干净：
 
 ```text
 devproc2.export        -> 只认识 CompileRecipe / ArtifactRecipe
-devproc2.artifact      -> 只认识通用 ArtifactManifest / ResourceSpec / KernelSpec
+devproc2.artifact      -> 只认识通用 ArtifactManifest / ResourceSpec / KernelSpec / PackedBackendRecipe
 devproc2.weights       -> 只认识通用 weight package schema
 devproc2.quantization  -> 只认识通用 quantization manifest 和 requant helper
 
-devproc2.models.pi05   -> Pi0.5 config / model / ops / weights / recipe
+devproc2.models.pi05   -> Pi0.5 config / model / ops / weights / recipe / CUDA backend
 tools.pi05             -> OpenPI checkpoint conversion / oracle dump / 本机生产工具
-runtime extensions     -> 可选 Pi0.5 tokenizer / FA2 / kernel registration
+runtime core           -> 通用 VM / artifact loader / CUDA kernel launch / backend dispatch
 ```
 
 目标目录建议：
@@ -168,7 +248,7 @@ python/devproc2/export/
 python/devproc2/artifact/
   __init__.py
   builder.py           # generic ArtifactBuilder
-  manifest.py          # generic ArtifactManifest / ResourceSpec
+  manifest.py          # generic ArtifactManifest / ResourceSpec / PackedBackendRecipe
 
 python/devproc2/weights/
   __init__.py
@@ -192,6 +272,8 @@ python/devproc2/models/pi05/
   weights.py           # Pi0.5 logical weight names and deploy manifest
   recipe.py            # Pi0.5 CompileRecipe / entrypoints / artifact resources
   cuda/
+    kernels/           # source-symbol CUDA kernels
+    backends/          # Pi0.5-owned cuBLASLt/CUTLASS/FA2 host runners
 
 tools/pi05/
   convert_weights.py   # OpenPI/HF safetensors -> devproc2 weight package
@@ -345,6 +427,143 @@ metadata/pi05_recipe.json
 
 但通用 loader 只依赖 `metadata/artifact.json`。
 
+### PackedBackendRecipe
+
+CUDA backend 需要区分两类东西：
+
+- device kernel：可以由 `CudaCallOp` 指向 `source::symbol`，AOT 编译成 cubin，进入 `metadata/kernel_table.json`；
+- host backend：需要 cuBLASLt、CUTLASS device adapter、FA2 wrapper、scratch buffer、tuning cache 和 CUDA stream，不应该伪装成一个普通 `__global__` kernel。
+
+host backend 应该走一条通用标准路径：模型 recipe 根据配置声明 backend source，artifact builder 编译这些 source，runtime loader 按 manifest 加载编译产物并调用注册函数，注册函数把 packed funcs 安装到 `PackedFuncRegistry`。这样 `call_dps_packed(...)` 在运行时能正常解析，同时 backend ownership 仍然属于模型。
+
+通用 recipe 形态：
+
+```python
+@dataclass(frozen=True)
+class PackedFuncSpec:
+    name: str                  # "pi05.cuda.fp8_nt_bf16"
+    device: str | None = None  # "cuda" means VM passes default CUDA stream
+    effect: str = "opaque"
+
+@dataclass(frozen=True)
+class PackedBackendRecipe:
+    name: str                         # "pi05.cuda"
+    kind: str                         # "compiled_packed_backend"
+    sources: tuple[str, ...]          # model-owned .cc/.cu sources
+    include_dirs: tuple[str, ...] = ()
+    compile_definitions: tuple[str, ...] = ()
+    compile_options: tuple[str, ...] = ()
+    link_libraries: tuple[str, ...] = ()
+    targets: tuple[str, ...] = ()     # ("sm89",)
+    register_symbol: str = "devproc2_register_packed_backend"
+    packed_funcs: tuple[PackedFuncSpec, ...] = ()
+```
+
+Pi0.5 可以通过 `PI05Config` 或 `recipe.py` 产生这个通用 recipe：
+
+```python
+PackedBackendRecipe(
+    name="pi05.cuda",
+    kind="compiled_packed_backend",
+    sources=(
+        "python/devproc2/models/pi05/cuda/backends/cuda_gemm.cc",
+        "python/devproc2/models/pi05/cuda/backends/cutlass_fp8_gemm_sm89.cu",
+        "python/devproc2/models/pi05/cuda/backends/fa2/fa2_wrapper.cu",
+    ),
+    include_dirs=(...),
+    compile_definitions=("DEVPROC2_WITH_PI05_FA2",),
+    link_libraries=("CUDA::cudart", "CUDA::cublasLt"),
+    targets=("sm89",),
+    register_symbol="devproc2_register_pi05_cuda_backend",
+    packed_funcs=(
+        PackedFuncSpec("pi05.cuda.fp8_nt_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fp8_nt_bf16_accum", device="cuda"),
+        PackedFuncSpec("pi05.cuda.bf16_nn_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fa2_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fa2_bf16_batched", device="cuda"),
+    ),
+)
+```
+
+artifact builder 负责编译 backend 产物，例如：
+
+```text
+artifact/
+  backends/
+    pi05_cuda.so
+  metadata/
+    packed_backend_table.json
+```
+
+对应 artifact manifest 声明：
+
+```json
+{
+  "packed_backends": [
+    {
+      "name": "pi05.cuda",
+      "kind": "compiled_packed_backend",
+      "library": "backends/pi05_cuda.so",
+      "register_symbol": "devproc2_register_pi05_cuda_backend",
+      "target_arch": "sm89",
+      "packed_funcs": [
+        {"name": "pi05.cuda.fp8_nt_bf16", "device": "cuda"},
+        {"name": "pi05.cuda.fp8_nt_bf16_accum", "device": "cuda"},
+        {"name": "pi05.cuda.bf16_nn_bf16", "device": "cuda"},
+        {"name": "pi05.cuda.fa2_bf16", "device": "cuda"},
+        {"name": "pi05.cuda.fa2_bf16_batched", "device": "cuda"}
+      ]
+    }
+  ]
+}
+```
+
+runtime loader 的通用流程：
+
+```text
+Executable::Load(artifact)
+  -> read metadata/packed_backend_table.json
+  -> dlopen artifact/backends/pi05_cuda.so
+  -> dlsym devproc2_register_pi05_cuda_backend
+  -> call register function with PackedFuncRegistry / backend context
+  -> verify abi.required_packed_funcs are registered
+```
+
+Pi0.5 `ops.py` 使用这条通用路径：
+
+```python
+dp.call_dps_packed(
+    "pi05.cuda.fp8_nt_bf16",
+    inputs=[x_fp8, w_fp8, rows, out_features, in_features, x_scale, w_scale, out],
+)
+```
+
+这里 `call_dps_packed` 是标准路径，不是脏路径。脏的是 runtime core 无条件注册业务 packed funcs，以及用 `runtime.cuda.` 名字前缀隐式决定 stream 语义。
+
+VM 仍然可以给 CUDA packed backend 传入 default stream，也仍然可以参与 CUDA graph capture；但 stream 注入必须来自 `PackedFuncSpec(device="cuda")` 或 registry traits，而不是靠字符串前缀判断。
+
+这条路径要作为 devproc2 标准通用能力，而不是 Pi0.5 私有特判。任何模型只要有 host-side 高性能实现，都可以声明自己的 `PackedBackendRecipe`：
+
+```text
+model recipe
+  -> declares PackedBackendRecipe
+  -> export/artifact builder compiles backend sources
+  -> artifact records packed_backend_table.json
+  -> runtime loader dlopen/dlsym/register
+  -> call_dps_packed resolves through PackedFuncRegistry
+```
+
+Pi0.5 的 `cuda_gemm.cc` 迁移后只是这条路径的首个使用者：
+
+```text
+Pi05Config(enable_cuda_backend=True, target="rtx4090_sm89")
+  -> recipe emits PackedBackendRecipe("pi05.cuda")
+  -> artifact builder compiles pi05-owned cuda_gemm.cc / cutlass_fp8_gemm_sm89.cu / fa2 sources
+  -> runtime loads backends/pi05_cuda.so
+  -> devproc2_register_pi05_cuda_backend registers pi05.cuda.* packed funcs
+  -> ops.py call_dps_packed("pi05.cuda.fp8_nt_bf16", ...)
+```
+
 ### WeightPackage
 
 `WeightPackageWriter`、`WeightEntry`、`QuantSpec` 是通用格式，不应该在 Pi0.5 deploy spec 和 Pi0.5 producer integration 里各自定义一遍。
@@ -449,9 +668,10 @@ rg -n "PI05|pi05|openpi|paligemma" python/devproc2/export
 - 通用权重包安装；
 - 通用 resource copy；
 - 通用 kernel table 到 cubin packaging；
+- 通用 packed backend source 编译、动态库安装和 `packed_backend_table.json` 写入；
 - 通用 `metadata/artifact.json` 写入。
 
-Pi0.5 的 tokenizer、model id、resource policy 移到 `models/pi05/recipe.py`。
+Pi0.5 的 tokenizer、model id、resource policy、packed backend recipe 移到 `models/pi05/recipe.py`。
 
 最终删除：
 
@@ -466,7 +686,7 @@ find python/devproc2/artifact -maxdepth 1 -name '*pi05*' -print
 rg -n "openpi|paligemma|pi05" python/devproc2/artifact
 ```
 
-两个命令都应该无输出。
+两个命令都应该无输出。`artifact` 可以包含通用 `PackedBackendRecipe` / `packed_backend_table.json` 处理逻辑，但不能包含 Pi0.5 专用 source 列表、packed func 名称或默认路径。
 
 ### Phase 4：拆 producer conversion
 
@@ -503,15 +723,79 @@ rg -n "convert_pi05_weights|openpi|paligemma" python/devproc2/integrations
 
 应无输出。
 
-### Phase 5：收 runtime 业务注册
+### Phase 5：收回 Pi0.5 CUDA host backend，不允许性能回退
 
-把 runtime 中的 Pi0.5 业务注册收进扩展边界：
+这一阶段的目标不是把高性能路径改成普通 CUDA kernel，而是把 ownership 和调用路径从 runtime core 收回到 Pi0.5。
 
-- tokenizer 通用化为 `runtime.tokenizer.sentencepiece_encode`，Pi0.5 prompt/state formatting 放在模型 recipe 或 runtime model extension。
-- `runtime.cuda.pi05_fa2_bf16` 要么变成通用 attention packed func，要么进入 Pi0.5-owned runtime extension。
-- Pi0.5 benchmark 和 oracle tests 保留在测试目录可以接受，但构建注册路径应明确它们是 model tests，不是 runtime core contract。
+当前 `runtime/src/cuda/cuda_gemm.cc` 和 `runtime/include/devproc2/runtime/cuda_gemm.h` 不应该继续作为 devproc2 标准 runtime API 存在。它们目前包含的是 Pi0.5 fast path 需要的 host backend：
 
-这一步可以晚于 Python 层目录清理，但应该进入重构计划，否则 devproc2 runtime 会继续累积业务模型痕迹。
+- cuBLASLt FP8/BF16 GEMM runner；
+- CUTLASS FP8 shape specialization；
+- FA2 attention host wrapper；
+- Pi0.5 packed func ABI；
+- Pi0.5 stream/scratch/tuning policy。
+
+这些不是 devproc2 标准算子的 kernel registry 结果。标准 op 的 lowering 应该选择提前注册好的 `KernelSpec` / backend provider；显式 CUDA kernel 应该由前端 DSL 插入 `CudaCallOp`，再进入 artifact kernel table。二者都不应该依赖 runtime 启动时注册 `runtime.cuda.*` packed func。
+
+目标目录建议：
+
+```text
+python/devproc2/models/pi05/cuda/
+  kernels/
+    pi05_kernels.cu
+  backends/
+    fp8_gemm/
+      cublaslt_runner.cc
+      cutlass_fp8_gemm_sm89.cu
+    fa2/
+      fa2_wrapper.cu
+      flash_attn_2_src/
+```
+
+目标调用链建议：
+
+```text
+Pi0.5 graph
+  -> pi05_ops semantic primitive
+  -> pi05_ops emits call_dps_packed("pi05.cuda.*", ...)
+  -> compiler records required_packed_funcs
+  -> Pi0.5 recipe emits PackedBackendRecipe from PI05Config
+  -> artifact builder compiles pi05-owned backend sources
+  -> artifact records packed_backend_table.json
+  -> runtime loader registers artifact-declared packed funcs
+  -> VM dispatches PackedFuncRef with default CUDA stream trait
+  -> Pi0.5-owned cuBLASLt/CUTLASS/FA2 host runner
+```
+
+重构要求：
+
+- 删除 Pi0.5 fast path 对 `runtime.cuda.*` packed func 名称的依赖。
+- 删除 runtime core 中无条件 `RegisterCUDAPackedFuncs()` 这类 Pi0.5 CUDA backend 注册路径。
+- 新增通用 `PackedBackendRecipe` / `packed_backend_table.json` 路径，支持任意模型声明“编译这些 host backend sources 并注册这些 packed funcs”。
+- Pi0.5 的 `PI05Config` 决定是否启用 `pi05.cuda` packed backend、目标 arch、CUTLASS/FA2 编译开关和 source 列表。
+- 保留 cuBLASLt autotune、CUTLASS FP8 specialization、FA2 split-KV/scratch policy；不能用朴素 matmul 或朴素 attention kernel 替代。
+- 如果需要 host runner，新增 Pi0.5-owned backend provider 或 artifact-declared extension；不要把 host runner 伪装成 source-symbol cubin kernel。
+- VM 可以提供通用 stream 传入能力，但不能用 `runtime.cuda.` 前缀约定来决定执行语义。
+- Pi0.5 backend 是否存在、需要哪些动态库/cubin/metadata，应由 Pi0.5 recipe 或 artifact manifest 声明。
+
+第一阶段终局：
+
+- `call_dps_packed("pi05.cuda.*", ...)` 是合法标准路径；
+- `runtime` 不再无条件注册 Pi0.5 CUDA backend；
+- `artifact` 根据 `PackedBackendRecipe` 编译并安装 `backends/pi05_cuda.so`；
+- `runtime` 根据 `packed_backend_table.json` 加载该 backend 并调用 `devproc2_register_pi05_cuda_backend`；
+- `abi.required_packed_funcs` 校验 `pi05.cuda.*` 是否已注册。
+
+更长期可以把 `PackedFuncRef` 升级为显式 `BackendCallRef`，但这不是清理 `runtime.cuda.*` 的前置条件。
+
+验收：
+
+```bash
+rg -n "runtime\\.cuda\\." python/devproc2/models/pi05 runtime/src runtime/include
+rg -n "RegisterCUDAPackedFuncs|cuda_gemm" runtime/src runtime/include
+```
+
+最终应无输出。与此同时，Pi0.5 benchmark 和 oracle tests 必须继续通过，性能指标不能因为边界重构回退。
 
 ### Phase 6：删除旧路径，不做长期兼容
 
@@ -551,6 +835,16 @@ rg -n "devproc2\\.(export|artifact|integrations)\\.pi05" \
 最终应无输出。
 
 ## 推荐的新用户入口
+
+## 当前本地资产路径
+
+这些路径只作为当前机器上的执行参数和文档示例使用，不能写入 devproc2 库代码默认值：
+
+- ckpt 路径：`/root/autodl-tmp/tools/pi05-pytorch-base`
+- OpenPI inputs 路径：`/root/autodl-tmp/openpi/outputs/pi05_torch_infer`
+- OpenPI outputs 路径：`/root/autodl-tmp/openpi/outputs/pi05_torch_infer`
+- OpenPI tokenizer 目录：`/root/autodl-tmp/openpi/outputs/pi05_torch_infer`
+- OpenPI tokenizer model：`/root/autodl-tmp/openpi/outputs/pi05_torch_infer/tokenizer.model`
 
 ### 权重转换
 
@@ -616,6 +910,8 @@ summary = export_artifact(
 - `PYTHONPATH=python pytest` 全量通过。
 - C++ runtime oracle、tokenizer、kernel launch、benchmark 继续可跑。
 - 新旧 artifact 的 `abi.json`、权重参数名、kernel table 在迁移阶段可比对，性能不因目录重构回退。
+- Pi0.5 FP8 GEMM、BF16 GEMM、FA2 attention 继续使用 cuBLASLt/CUTLASS/FA2 级别实现；禁止用朴素 CUDA kernel 作为重构替代品。
+- Pi0.5 artifact 通过通用 `packed_backend_table.json` 声明并加载 `pi05.cuda` packed backend，`abi.required_packed_funcs` 中的 `pi05.cuda.*` 能由该 backend 注册满足。
 
 边界验收：
 
@@ -625,10 +921,23 @@ find python/devproc2/export python/devproc2/artifact python/devproc2/integration
 
 rg -n "openpi|paligemma|pi05" \
   python/devproc2/export python/devproc2/artifact python/devproc2/integrations
+
+rg -n "runtime\\.cuda\\.|RegisterCUDAPackedFuncs|cuda_gemm" \
+  python/devproc2/models/pi05 runtime/src runtime/include
 ```
 
-最终两个命令都应该无输出。
+最终这些命令都应该无输出。Pi0.5 CUDA backend 可以存在，但归属必须在 `models/pi05/cuda/`，并通过通用 artifact-declared packed backend 路径注册，不在 runtime core 全局注册路径。
+
+## Goal Mode 执行约束
+
+- 按 Phase 顺序执行，每完成一个 Phase 必须保持 repo 可测试、可 diff、可回滚，不允许一次性跨 Phase 大重构。
+- 精度、性能不能回退；任何会改变数值误差、benchmark 结果、CUDA graph capture 行为或 fast path backend 的改动，都必须先用现有 oracle/benchmark 证明等价。
+- 禁止用朴素 CUDA kernel 替代 cuBLASLt/CUTLASS/FA2 fast path。
+- `PackedBackendRecipe` 通用路径必须先落地，再迁移 Pi0.5 `cuda_gemm.cc` 和相关 backend source。
+- 如果需要改变 artifact ABI、VM ABI、packed func 参数顺序、权重命名、kernel 参数顺序或 measured performance，必须停止并报告，不要猜测性推进。
+- 每阶段至少执行 `PYTHONPATH=python pytest` 和 `git diff --check`。
+- GPU/runtime 阶段必须保留现有 Pi0.5 oracle、benchmark、CUDA graph capture 能力。
 
 ## 一句话评价
 
-当前方案是“功能优先的有效实现”，不是“框架边界优雅的实现”。真正优雅的 devproc2 应该让 Pi0.5 作为 recipe 被框架消费，而不是让框架目录长出 Pi0.5 业务文件。下一轮重构的主线应当是 recipe 化、artifact 通用化、权重包通用化、producer 工具外移，然后直接删除 `export/pi05.py`、`artifact/pi05.py` 和 `integrations/pi05/`。
+当前方案是“功能优先的有效实现”，不是“框架边界优雅的实现”。真正优雅的 devproc2 应该让 Pi0.5 作为 recipe 被框架消费，让 Pi0.5 CUDA fast path 作为模型自有 backend 被 artifact 声明和调用，而不是让框架目录长出 Pi0.5 业务文件，也不是让 runtime core 全局注册 `runtime.cuda.*` 业务函数。下一轮重构的主线应当是 recipe 化、artifact 通用化、权重包通用化、producer 工具外移、Pi0.5 CUDA backend 收归模型包，然后直接删除 `export/pi05.py`、`artifact/pi05.py` 和 `integrations/pi05/`。
