@@ -105,7 +105,9 @@ dp.call_dps_packed(
 - `ops.py` 或 `pi05_ops.py`：Pi0.5 high-level primitives，封装 CUDA source kernel 和 packed func。
 - `layout.py`：QKV、KV cache、style table、FP8 weight layout 的唯一事实来源。
 - `cuda/`：Pi0.5 自有 CUDA source、vendored kernel 子集和本模型专用 backend wrapper 的唯一归属地。
-- `weights.py`：checkpoint conversion、weight package、quantization；只输出 layout/spec，不反向污染模型。
+- `python/devproc2/quantization/`：框架层 quantization manifest schema、通用 requant helper 和 fusion/requant 规则；不依赖业务 PyTorch 模型，不引入 ModelOpt runtime 依赖。
+- `python/devproc2/integrations/modelopt/` 或 `tools/quant/modelopt_export.py`：可选生产端 exporter，从业务侧已经量化好的 PyTorch model / ModelOpt state 导出标准 manifest；不进入 runtime，也不放进 Pi0.5 模型目录。
+- `weights.py`：Pi0.5 checkpoint conversion、deploy fusion mapping、weight package assembly；消费 layout/spec/框架层 quantization manifest，不自研量化算法。
 - `export.py`：构图、compile、artifact export orchestration；不承载模型细节。
 
 目标不是让文件数量变多，而是让依赖方向变干净：
@@ -114,6 +116,7 @@ dp.call_dps_packed(
 model modules -> pi05_ops -> devproc2 DSL/backend
 model modules -> layout
 weights       -> layout
+weights       -> devproc2.quantization
 export        -> model entrypoints
 ```
 
@@ -217,8 +220,8 @@ v = dp.reshape(v_raw, (rows, kv_heads, head_dim))
 例如：
 
 ```python
-prefix_k = dp.index(prefix_k_cache, [layer_idx, :, :, :])
-style = dp.index(style_table, [step, layer_idx, :, :])
+prefix_k = dp.index(prefix_k_cache, [layer_idx, slice(None), slice(None), slice(None)])
+style = dp.index(style_table, [step, layer_idx, slice(None), slice(None)])
 ```
 
 只是语法糖，前端 normalize 后等价于：
@@ -329,7 +332,87 @@ build_pi05_paligemma_prefix_kv_encoder_module(entrypoint="materialize_kv")
 
 这会把“多入口模型”提升为 frontend 能力，而不是 Pi0.5 的私有绕法。
 
-### 7. 权重/layout spec 集中化
+### 7. 用 QuantizationManifest 切开 ModelOpt 和业务 PyTorch 边界
+
+devproc2 不应该继续自研量化算法、校准流程和 activation scale 生成逻辑；但 devproc2 也不应该拥有业务 PyTorch 模型。ModelOpt 只吃 PyTorch，这意味着真正的 PTQ/QAT/calibration 必须发生在业务生产端：那里才知道如何加载 OpenPI/PyTorch model、processor、tokenizer、dataloader、calibration sample 和业务 config。把这些依赖塞进 devproc2，会让 runtime/inference 框架越界成业务训练栈。
+
+正确边界是：devproc2 core 只定义和消费稳定的部署量化协议；ModelOpt adapter 最多作为 optional producer-side exporter 存在。Pi0.5 只声明模型特定的 deploy mapping / fusion spec。
+
+```text
+业务 PyTorch/OpenPI repo
+  -> ModelOpt PTQ/QAT/calibration
+  -> 业务侧已经量化好的 torch module / ModelOpt state
+  -> optional devproc2.integrations.modelopt exporter
+  -> QuantizationManifest artifact
+  -> devproc2 core consumes manifest + FP/BF16 weights
+  -> Pi0.5 deploy fusion spec + framework requant helper
+  -> Pi0.5 weight package
+  -> pi05_ops lowering / runtime ABI
+```
+
+ModelOpt 只作为业务生产端的离线量化前端使用，不进入 devproc2 runtime，不成为 artifact 运行时依赖。正式部署 artifact 仍然只依赖 devproc2 自己的权重包、kernel artifact、CUDA/cuBLASLt 等系统库。
+
+devproc2 core 应提供：
+
+- `QuantizationManifest` / `QuantTensorSpec` / `CalibrationManifest`：与模型无关的中间格式，描述原始 module path、weight/input/output quantizer、amax、scale、axis、block size、dtype。
+- 通用 FP8 requant helper：从 FP/BF16 tensor 或 dequantized tensor 按指定 common scale 重新量化；禁止直接拼接不同 scale 的 FP8 tensor。
+- 通用 fusion manifest 表达：支持“多个 component tensor -> 一个 deploy tensor”的映射和 provenance 记录，但不内置 Pi0.5 的 qkv/gate-up 名字。
+
+可选 ModelOpt exporter 的边界必须更窄：
+
+- 可以读取一个已经由业务代码完成 ModelOpt 量化/校准的 torch module 或 ModelOpt state。
+- 可以抽取 quantizer amax/scale、quant config、algorithm、ModelOpt version 和 calibration metadata，写成 `QuantizationManifest`。
+- 不负责加载 OpenPI，不构造业务 dataloader，不执行 calibration loop，不 import 业务 repo。
+- 不作为 devproc2 core dependency；建议放在 `python/devproc2/integrations/modelopt/` 或 `tools/quant/modelopt_export.py`，并通过 optional extra 安装 `torch + nvidia-modelopt`。
+
+Pi0.5 层只提供模型特定信息：
+
+- 原始 Torch module path 到 devproc2 logical weight name 的映射。
+- QKV、gate-up、action folding、Q/K interleave、`nk/kn` layout 等 deploy transform。
+- 哪些 component 共享一个 fused activation scale。
+- artifact 中 `fp8.*.weight`、`fp8.*.scale`、`act_scale.*` 的命名 spec。
+
+本阶段采用“不改原始 Torch 模型，也不让 devproc2 管 Torch 模型”的方案：允许业务侧 ModelOpt 按 OpenPI 原始 module 粒度量化和校准，例如 `q_proj/k_proj/v_proj`、`gate_proj/up_proj` 各自拥有 weight/input quantizer 统计；producer-side exporter 只把这些统计标准化成 `QuantizationManifest`，再由 Pi0.5 deploy spec 把它们投影到当前 fused ABI。
+
+核心规则是：不要直接拼接 ModelOpt 已经量化好的 FP8 tensor。因为每段 FP8 code 依赖自己的 scale，直接拼接后再传一个 common `B_scale` 是错误语义。framework requant helper 必须从原始 FP/BF16 权重或 dequantized 权重重新量化到 fused weight 的 common scale。
+
+对于 QKV / gate-up 这类 fused projection，Pi0.5 deploy spec 驱动 fusion pass：
+
+```text
+原始权重 + ModelOpt component amax
+  -> 按 devproc2 layout 规则做 transpose/interleave/fold/concat
+  -> common_amax = max(component_amax...)
+  -> common_scale = max(common_amax / 448.0, 1e-12)
+  -> fused_fp8 = quantize_e4m3(fused_fp_weight, common_scale)
+  -> 写入 fp8.*.weight + fp8.*.scale
+```
+
+activation scale 也按 fused op 语义生成。若 `q_proj/k_proj/v_proj` 在 Torch 图中消费同一个 input tensor，deploy fused QKV 只产生一个 `act_scale.decoder_attn_qkv_w_i`；其值来自对应 component input amax 的 conservative merge：
+
+```text
+common_input_amax = max(input_amax_q, input_amax_k, input_amax_v)
+common_input_scale = max(common_input_amax / 448.0, 1e-12)
+```
+
+`gate_proj/up_proj` 同理。这个策略会牺牲一点 per-branch scale 的精细度，但换来三个关键收益：
+
+- 不改 OpenPI Torch 模型，不要求构造 deploy-aligned Torch mirror model，也不要求 devproc2 知道如何加载业务 PyTorch 模型。
+- 不改当前 `runtime.cuda.fp8_nt_bf16` scalar `A_scale/B_scale` ABI。
+- 把量化算法、校准数据和 scale 选择交给业务侧 ModelOpt 流程，把 manifest/requant 能力放到 devproc2 core，把 ModelOpt 读取逻辑限制在 optional producer-side exporter，把 deploy layout、fused weight ABI 和 artifact 映射留在 Pi0.5 spec。
+
+长期可以保留一个更精细的 backend 路线：新增 `pi05_ops.fp8_linear_grouped_scale(...)`，让 fused QKV / gate-up 在同一个 kernel 中按 output slice 使用不同 weight scale。但这需要 CUTLASS/CuTe 或自有 epilogue 支持，不属于第一阶段。第一阶段的硬约束是行为等价于当前 scalar-scale GEMM ABI，先把手写量化和 out-of-band `act_scale.*` 收回到可复现的 manifest-driven 权重生成流程。
+
+框架层 manifest + Pi0.5 deploy manifest 至少记录：
+
+- ModelOpt package version、quant config、algorithm。
+- calibration dataset / sample set / hash。
+- 原始 Torch module path 到 devproc2 logical weight name 的映射。
+- component amax/scale 和 fused common scale。
+- fused scale policy：`max_component_amax`。
+- 是否从 original FP/BF16 weight 重新量化，而不是拼接已量化 FP8。
+- devproc2 target layout：`nk` / `kn`。
+
+### 8. 权重/layout spec 集中化
 
 新增 `layout.py` 或 `weight_spec.py`，集中定义：
 
@@ -349,7 +432,7 @@ self.qkv = PI05WeightSpec.decoder_attn_qkv(layer_idx).parameter(device)
 
 这样 `weights.py` 和模型代码使用同一份 spec。checkpoint conversion 不再通过字符串约定和 Module 隐式对齐。
 
-### 8. 拆分 `modules.py`
+### 9. 拆分 `modules.py`
 
 在 contract 和 facade 建立后，再拆文件。建议顺序：
 
@@ -417,8 +500,14 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 - 将 `forward_kv` 重命名为 `materialize_kv`。
 - 删除 `forward_fast(prefix_embs, rope_or_valid_rows, rope_interleaved=None)` 这种通过参数个数重载语义的写法。
 
-### Phase 4：权重 spec 收口
+### Phase 4：框架层 ModelOpt 量化边界和权重 spec 收口
 
+- 新增框架层 `python/devproc2/quantization/`，提供通用 manifest schema、fusion manifest 表达和 FP8 requant helper；该包不依赖 `torch`、`nvidia-modelopt` 或 OpenPI。
+- 可选新增 `python/devproc2/integrations/modelopt/` 或 `tools/quant/modelopt_export.py`，作为 producer-side exporter；它只从业务侧已经量化好的 torch module / ModelOpt state 导出 `QuantizationManifest`。
+- Pi0.5 目录不放通用 ModelOpt adapter；只新增 Pi0.5 deploy quant mapping/fusion spec，可归入 `layout.py` / `weight_spec.py` / `weights.py`。
+- exporter 不加载 OpenPI，不构造业务 dataloader，不执行 calibration loop，不 import 业务 repo；这些属于业务 PyTorch repo 的生产端职责。
+- 对 QKV、gate-up 等 fused projection 执行 common-scale requantization：Pi0.5 spec 声明 fusion group，框架 helper 从原始 FP/BF16 权重重新量化到 fused scalar scale，禁止直接拼接不同 scale 的 FP8 tensor。
+- 将 `act_scale.*` 生成纳入框架层 calibration manifest + Pi0.5 deploy manifest，禁止依赖 out-of-band 手工注入的性能包资产。
 - 建立 Pi0.5 weight/layout spec。
 - `weights.py` conversion 和 Module parameter creation 共用 spec。
 - 保持 artifact 文件名兼容；只改变代码生成这些名字的位置。
@@ -445,6 +534,12 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 - `forward()` 不包含 fast path、CUDA、packed func 或 storage byte math。
 - fast path 所有 backend 调用都经过 `pi05_ops` facade。
 - 前端和高层 IR 中没有 byte-level view；KV/style/QKV 切片只通过 `select`、`slice`、`index`、`split`、`reshape` 表达。
+- devproc2 不再自研 Pi0.5 量化算法和校准流程；ModelOpt 作为业务生产端离线量化前端，devproc2 core 只消费标准 manifest + FP/BF16 weights。
+- `python/devproc2/quantization/` 不 import `torch`、`nvidia-modelopt`、OpenPI 或业务 repo；ModelOpt 读取逻辑只能存在于 optional producer-side exporter。
+- `act_scale.*`、`fp8.*.scale` 都由可复现的 framework quantization manifest + Pi0.5 deploy manifest 生成；manifest 记录 ModelOpt version/config、calibration source、component scale、fused common scale 和 layout。
+- Pi0.5 模型目录不得私有实现一套 ModelOpt importer/exporter；模型层只能声明 mapping/fusion/layout spec。
+- optional ModelOpt exporter 不拥有业务 PyTorch 模型：不得加载业务 checkpoint、不得构造 dataloader、不得执行 calibration，只能抽取业务侧已经产出的量化状态。
+- QKV / gate-up fused FP8 权重必须从原始 FP/BF16 权重按 common scale 重新量化，不能直接拼接不同 scale 的 ModelOpt FP8 tensor。
 - Pi0.5 正式运行路径不依赖 FlashRT checkout、FlashRT build 目录、FlashRT pybind `.so` 或 `DEVPROC2_FLASHRT_FA2_SO`。
 - Pi0.5 使用的 FA2 kernel source、wrapper、build rule 和 runtime load path 都归属 `python/devproc2/models/pi05/cuda` 或 artifact/package 内的 Pi0.5-owned 产物。
 
@@ -467,6 +562,9 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 
 - 不为了代码洁癖牺牲已经拿到的性能基线。
 - 不为了代码洁癖牺牲已经拿到的性能基线，但 FlashRT FA2 外部依赖必须移除；迁移时可以先保持 ABI 和数值路径，再把 kernel ownership 收回到 Pi0.5。
+- 量化算法、校准和 scale 搜集交给业务侧 ModelOpt 流程；devproc2 不把 ModelOpt 放入 runtime，也不负责加载或校准业务 PyTorch 模型。
+- devproc2 core 的量化边界是标准 manifest + requant helper；ModelOpt 读取逻辑若存在，只能是 optional producer-side exporter，不属于 Pi0.5 模型目录。
+- 第一阶段不改 OpenPI Torch 模型，不改当前 scalar `A_scale/B_scale` GEMM ABI；通过 deploy-side fusion requantization 对齐当前 runtime。
 - 通用 cuBLASLt GEMM packed func 可以继续留在 runtime；Pi0.5 专用 FA2 packed func 应迁移出通用 `cuda_gemm.cc`。
 - `forward_fast()` 保留为 `nn.Module` 的一等接口，并与 `forward()` 放在同一个语义 Module 中；重构目标是让它干净，而不是消灭它或拆成另一套模型。
 - `dp.tensor_view` 的底层能力可以暂时保留给 compiler internal lowering；公开 DSL 和高层 IR 应迁移到 `select`、`slice`、`index`、`split`、`reshape`。
