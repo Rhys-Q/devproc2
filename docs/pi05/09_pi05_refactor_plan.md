@@ -8,6 +8,13 @@
 
 本轮重构目标不是重写所有性能优化，而是在不牺牲现有性能基线的前提下，把 Pi0.5 从“能跑的性能脚本”收敛成“可维护的 devproc2 模型实现”。
 
+## 当前本地资产路径
+
+- ckpt 路径：`/root/autodl-tmp/tools/pi05-pytorch-base`
+- OpenPI inputs 路径：`/root/autodl-tmp/openpi/outputs/pi05_torch_infer`
+- OpenPI outputs 路径：`/root/autodl-tmp/openpi/outputs/pi05_torch_infer`
+- OpenPI tokenizer 路径：`/root/autodl-tmp/openpi/outputs/pi05_torch_infer`
+
 ## 锐评
 
 ### `modules.py` 是失控的聚合体
