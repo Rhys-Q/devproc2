@@ -87,6 +87,7 @@ PyTorch 侧 `sample_actions` 的核心流程：
 - [06_performance_snapshot.md](06_performance_snapshot.md)：当前性能快照、已采用优化、未采用结论和下一阶段设计债务。
 - [07_frontend_dsl_refactor.md](07_frontend_dsl_refactor.md)：`forward_fast()` 一等接口和 CUDA 自定义算子无注册接入重构。
 - [08_build_run_profile.md](08_build_run_profile.md)：面向新手的 Pi0.5 编译、运行和 Nsight profile 操作手册。
+- [09_pi05_refactor_plan.md](09_pi05_refactor_plan.md)：当前 Pi0.5 实现锐评、边界问题和保持性能不回退的重构方案。
 
 ## Milestones
 
