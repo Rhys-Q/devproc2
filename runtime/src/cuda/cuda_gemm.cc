@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -24,6 +23,32 @@
 #include "devproc2/runtime/packed_func.h"
 #include "devproc2/runtime/tensor.h"
 #include "devproc2/runtime/vm_value.h"
+
+#ifdef DEVPROC2_WITH_PI05_FA2
+extern "C" void devproc2_pi05_attention_fa2_fwd_bf16(
+    const void*, const void*, const void*,
+    void*, void*, void*, void*,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    float, int, cudaStream_t);
+#else
+extern "C" void devproc2_pi05_attention_fa2_fwd_bf16(
+    const void*, const void*, const void*,
+    void*, void*, void*, void*,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    int, int, int,
+    float, int, cudaStream_t) {
+    throw std::runtime_error("Pi0.5 FA2 backend was not built into this runtime");
+}
+#endif
 
 namespace devproc2 {
 namespace {
@@ -569,17 +594,6 @@ LtBF16Runner& GlobalBF16Runner() {
     return runner;
 }
 
-using FlashRTFA2BF16Fn = void (*)(
-    const void*, const void*, const void*,
-    void*, void*, void*, void*,
-    int, int, int,
-    int, int, int,
-    int, int, int,
-    int, int, int,
-    int, int, int,
-    int, int, int,
-    float, int, cudaStream_t);
-
 float HostF32FromBitsI64(int64_t bits) {
     uint32_t lo = static_cast<uint32_t>(bits & 0xffffffffull);
     float out = 0.0f;
@@ -587,34 +601,9 @@ float HostF32FromBitsI64(int64_t bits) {
     return out;
 }
 
-class FlashRTFA2Runner {
+class Pi05FA2Runner {
 public:
-    FlashRTFA2Runner() {
-        const char* env_path = std::getenv("DEVPROC2_FLASHRT_FA2_SO");
-        std::string path = env_path && env_path[0] != '\0'
-            ? std::string(env_path)
-            : std::string("/root/autodl-tmp/FlashRT/flash_rt/flash_rt_fa2.cpython-312-x86_64-linux-gnu.so");
-        if (path.find(".cpython") != std::string::npos) {
-            const char* py_env_path = std::getenv("DEVPROC2_LIBPYTHON_SO");
-            std::string py_path = py_env_path && py_env_path[0] != '\0'
-                ? std::string(py_env_path)
-                : std::string("/root/miniconda3/lib/libpython3.12.so");
-            py_handle_ = dlopen(py_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-            if (!py_handle_) {
-                throw std::runtime_error(
-                    "failed to dlopen libpython for FlashRT FA2 at " + py_path + ": " + dlerror());
-            }
-        }
-        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (!handle_) {
-            throw std::runtime_error(
-                "failed to dlopen FlashRT FA2 library at " + path + ": " + dlerror());
-        }
-        fn_ = reinterpret_cast<FlashRTFA2BF16Fn>(
-            dlsym(handle_, "fvk_attention_fa2_fwd_bf16"));
-        if (!fn_) {
-            throw std::runtime_error("FlashRT FA2 library missing fvk_attention_fa2_fwd_bf16");
-        }
+    Pi05FA2Runner() {
         int dev = 0;
         CUDA_RT_CHECK(cudaGetDevice(&dev));
         CUDA_RT_CHECK(cudaDeviceGetAttribute(
@@ -623,12 +612,10 @@ public:
         num_sms_override_ = EnvInt("DEVPROC2_FA2_NUM_SMS", -1, -1, 4096);
     }
 
-    ~FlashRTFA2Runner() {
+    ~Pi05FA2Runner() {
         if (softmax_lse_) cudaFree(softmax_lse_);
         if (softmax_lse_accum_) cudaFree(softmax_lse_accum_);
         if (o_accum_) cudaFree(o_accum_);
-        if (handle_) dlclose(handle_);
-        if (py_handle_) dlclose(py_handle_);
     }
 
     void Run(void* q,
@@ -680,7 +667,7 @@ public:
         int kv_batch_stride = rows_k * num_heads_kv * head_dim;
         int kv_row_stride = num_heads_kv * head_dim;
         int kv_head_stride = head_dim;
-        fn_(
+        devproc2_pi05_attention_fa2_fwd_bf16(
             q, k, v,
             out,
             softmax_lse_,
@@ -753,9 +740,6 @@ private:
     }
 
     std::mutex mu_;
-    void* handle_{nullptr};
-    void* py_handle_{nullptr};
-    FlashRTFA2BF16Fn fn_{nullptr};
     int num_sms_{0};
     int split_q_threshold_{4096};
     int num_sms_override_{-1};
@@ -767,8 +751,8 @@ private:
     size_t o_accum_bytes_{0};
 };
 
-FlashRTFA2Runner& GlobalFA2Runner() {
-    static FlashRTFA2Runner runner;
+Pi05FA2Runner& GlobalFA2Runner() {
+    static Pi05FA2Runner runner;
     return runner;
 }
 

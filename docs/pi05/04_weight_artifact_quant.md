@@ -4,7 +4,7 @@
 
 本阶段已经从“量化预留”推进到可执行的 Pi0.5 FP8 权重包与 artifact 资源装配：
 
-- `devproc2.models.pi05.convert_pi05_weights(...)` 可将 `/root/autodl-tmp/tools/pi05-pytorch-base/model.safetensors` 转成 devproc2 权重包。
+- `devproc2.integrations.pi05.weights.convert_pi05_weights(...)` 可将 `/root/autodl-tmp/tools/pi05-pytorch-base/model.safetensors` 转成 devproc2 权重包。
 - RTX 4090 / SM89 使用 FP8 `nk` layout，与 FlashRT 的 4090 cuBLASLt `fp8_nt` 路径一致。
 - 已生成本地包：`build/pi05_fp8.weights/`。
 - 已生成本地 resource artifact：`build/pi05_fp8_artifact/`。

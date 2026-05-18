@@ -12,6 +12,9 @@ dev = [
     "pytest-xdist>=3.6",
     "ruff>=0.9",
 ]
+modelopt = [
+    "nvidia-modelopt>=0.44.0",
+]
 
 [build-system]
 requires = ["setuptools>=70", "wheel"]

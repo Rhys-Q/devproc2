@@ -17,6 +17,7 @@ from devproc2.ir.nodes import (
     Function,
     IRModule,
     Op,
+    OpResult,
     Region,
     StructInfo,
     TensorStructInfo,
@@ -38,6 +39,7 @@ from devproc2.kernel.registry import KernelLaunchSpec
 
 from devproc2.nn.module import Module
 from devproc2.nn.specs import ObjectSpec, Parameter, ScalarSpec, TensorSpec
+from devproc2.utils.dtype import dtype_itemsize
 
 
 class GraphBuilder:
@@ -108,6 +110,19 @@ class GraphBuilder:
                 attrs_dict = attrs or {}
                 result_si = None
                 op_ref = ExternalFuncRef(op_name)
+        if op_name == "reshape" and len(ir_args) == 1 and _can_emit_alias_reshape(ir_args[0]):
+            if not isinstance(result_si, TensorStructInfo):
+                raise ValueError("reshape alias requires tensor struct info")
+            view = TensorViewOp(
+                result_name=self._fresh("reshape"),
+                base=ir_args[0],
+                byte_offset=Constant(0),
+                shape=result_si.shape,
+                dtype=result_si.dtype,
+                device=result_si.device,
+            )
+            self._ops.append(view)
+            return TraceValue(view.results[0], self)
         call = make_call_op(
             op_ref=op_ref,
             args=ir_args,
@@ -344,6 +359,126 @@ class GraphBuilder:
         self._uninitialized_empty_values.add(id(create.results[0]))
         return TraceValue(create.results[0], self)
 
+    def emit_tensor_select(self, base: object, *, axis: int, index: object) -> TraceValue:
+        ir_base = _unwrap_trace_value(base)
+        ir_index = _unwrap_trace_value(index)
+        base_si = _require_tensor_struct_info(ir_base, "select")
+        shape = _known_shape_tuple(base_si, "select")
+        axis = _normalize_dim(axis, len(shape))
+        itemsize = dtype_itemsize(base_si.dtype)
+        stride_elems = _compact_stride_elems(shape, axis)
+        view_shape = shape[:axis] + shape[axis + 1:]
+        view = TensorViewOp(
+            result_name=self._fresh("select"),
+            base=ir_base,
+            byte_offset=ir_index,
+            shape=view_shape,
+            dtype=base_si.dtype,
+            device=base_si.device,
+            byte_stride=stride_elems * itemsize,
+        )
+        self._ops.append(view)
+        return TraceValue(view.results[0], self)
+
+    def emit_tensor_slice(
+        self,
+        base: object,
+        *,
+        starts: object,
+        sizes: object,
+        strides: object | None = None,
+    ) -> TraceValue:
+        ir_base = _unwrap_trace_value(base)
+        base_si = _require_tensor_struct_info(ir_base, "slice")
+        shape = _known_shape_tuple(base_si, "slice")
+        starts_tuple = _normalize_index_tuple(starts, len(shape), "starts")
+        sizes_tuple = _normalize_index_tuple(sizes, len(shape), "sizes")
+        if strides is None:
+            strides_tuple = (1,) * len(shape)
+        else:
+            strides_tuple = _normalize_index_tuple(strides, len(shape), "strides")
+        if any(_static_int_value(stride, "slice stride") != 1 for stride in strides_tuple):
+            raise ValueError("slice currently supports only stride=1 alias views")
+
+        itemsize = dtype_itemsize(base_si.dtype)
+        static_offset = 0
+        dynamic_offset = None
+        dynamic_stride = 1
+        for axis, start in enumerate(starts_tuple):
+            stride_bytes = _compact_stride_elems(shape, axis) * itemsize
+            if isinstance(start, (int,)):
+                static_offset += int(start) * stride_bytes
+                continue
+            if isinstance(start, Constant) and isinstance(start.value, int):
+                static_offset += int(start.value) * stride_bytes
+                continue
+            if dynamic_offset is not None:
+                raise ValueError("slice supports at most one dynamic start")
+            dynamic_offset = _unwrap_trace_value(start)
+            dynamic_stride = stride_bytes
+        byte_offset = dynamic_offset if dynamic_offset is not None else Constant(0)
+        view = TensorViewOp(
+            result_name=self._fresh("slice"),
+            base=ir_base,
+            byte_offset=byte_offset,
+            shape=tuple(_prim_dim(size) for size in sizes_tuple),
+            dtype=base_si.dtype,
+            device=base_si.device,
+            byte_stride=dynamic_stride,
+            base_offset=static_offset,
+        )
+        self._ops.append(view)
+        return TraceValue(view.results[0], self)
+
+    def emit_tensor_index(self, base: object, selectors: object) -> TraceValue:
+        if not isinstance(selectors, (tuple, list)):
+            raise ValueError("index selectors must be a tuple/list")
+        current = base
+        axis = 0
+        for selector in selectors:
+            current_value = _unwrap_trace_value(current)
+            current_si = _require_tensor_struct_info(current_value, "index")
+            shape = _known_shape_tuple(current_si, "index")
+            if axis >= len(shape):
+                raise ValueError("too many index selectors")
+            if selector is Ellipsis:
+                raise ValueError("ellipsis indexing is not supported")
+            if selector is None:
+                raise ValueError("newaxis indexing is not supported")
+            if isinstance(selector, slice):
+                if selector.step not in (None, 1):
+                    raise ValueError("index slice step must be 1")
+                start = 0 if selector.start is None else selector.start
+                dim = _static_int_value(shape[axis], "slice dimension")
+                stop = dim if selector.stop is None else selector.stop
+                size = int(stop) - int(start)
+                starts = [0] * len(shape)
+                sizes = [_static_int_value(dim_value, "slice dimension") for dim_value in shape]
+                starts[axis] = int(start)
+                sizes[axis] = size
+                current = self.emit_tensor_slice(current, starts=starts, sizes=sizes)
+                axis += 1
+                continue
+            current = self.emit_tensor_select(current, axis=axis, index=selector)
+        return current if isinstance(current, TraceValue) else TraceValue(_unwrap_trace_value(current), self)
+
+    def emit_tensor_split(self, base: object, *, sections: object, axis: int = 0):
+        ir_base = _unwrap_trace_value(base)
+        base_si = _require_tensor_struct_info(ir_base, "split")
+        shape = _known_shape_tuple(base_si, "split")
+        axis = _normalize_dim(axis, len(shape))
+        sections_tuple = _normalize_sections(sections)
+        outputs = []
+        start = 0
+        for section in sections_tuple:
+            sizes = [_static_int_value(dim, "split dimension") for dim in shape]
+            sizes[axis] = section
+            starts = [0] * len(shape)
+            starts[axis] = start
+            outputs.append(self.emit_tensor_slice(base, starts=starts, sizes=sizes))
+            start += section
+        return tuple(outputs)
+
     def emit_tensor_view(
         self,
         base: object,
@@ -459,6 +594,73 @@ def _unwrap_trace_value(value: object) -> Value:
     if isinstance(value, (int, float, bool)) or value is None:
         return Constant(value)
     raise TypeError(f"expected trace value, got {type(value).__name__}")
+
+
+def _can_emit_alias_reshape(value: Value) -> bool:
+    return isinstance(value, OpResult) and isinstance(value.op, (TensorCreateOp, TensorViewOp))
+
+
+def _require_tensor_struct_info(value: Value, op_name: str) -> TensorStructInfo:
+    si = _tensor_struct_info(value)
+    if si is None:
+        raise ValueError(f"{op_name}: expected tensor input with known struct info")
+    return si
+
+
+def _known_shape_tuple(si: TensorStructInfo, op_name: str):
+    try:
+        return tuple(si.shape)
+    except TypeError as exc:
+        raise ValueError(f"{op_name}: expected known-rank tensor shape") from exc
+
+
+def _normalize_dim(dim: int, rank: int) -> int:
+    if not isinstance(dim, int):
+        raise ValueError(f"axis must be int, got {type(dim).__name__}")
+    if dim < 0:
+        dim += rank
+    if not 0 <= dim < rank:
+        raise ValueError(f"axis {dim} is out of range for rank {rank}")
+    return dim
+
+
+def _static_int_value(value: object, name: str) -> int:
+    if isinstance(value, int):
+        return int(value)
+    if hasattr(value, "value") and isinstance(value.value, int):
+        return int(value.value)
+    raise ValueError(f"{name} must be statically known, got {value!r}")
+
+
+def _prim_dim(value: object):
+    if isinstance(value, int):
+        return value
+    if hasattr(value, "value") and isinstance(value.value, int):
+        return int(value.value)
+    return value
+
+
+def _compact_stride_elems(shape: tuple[object, ...], axis: int) -> int:
+    stride = 1
+    for dim in shape[axis + 1:]:
+        stride *= _static_int_value(dim, "view stride dimension")
+    return stride
+
+
+def _normalize_index_tuple(value: object, rank: int, name: str) -> tuple[object, ...]:
+    if not isinstance(value, (tuple, list)):
+        raise ValueError(f"{name} must be a tuple/list")
+    if len(value) != rank:
+        raise ValueError(f"{name} length must equal rank {rank}, got {len(value)}")
+    return tuple(value)
+
+
+def _normalize_sections(sections: object) -> tuple[int, ...]:
+    if isinstance(sections, int):
+        raise ValueError("split sections must be an explicit sequence")
+    if not isinstance(sections, (tuple, list)):
+        raise ValueError("split sections must be a tuple/list")
+    return tuple(int(section) for section in sections)
 
 
 def _struct_info_for_value(value: Value) -> Optional[StructInfo]:

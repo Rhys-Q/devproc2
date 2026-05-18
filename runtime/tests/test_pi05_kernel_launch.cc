@@ -326,7 +326,7 @@ void test_qkv_split_rope_bf16_uses_interleaved_qk_pairs() {
     DeviceAPI* cuda_api = DeviceAPIRegistry::Get(kDLCUDA);
     cuda_api->SetDevice(cuda_dev);
 
-    // Q/K are stored in FlashRT's interleaved RoPE layout:
+    // Q/K are stored in the Pi0.5 interleaved RoPE layout:
     // [lo0, hi0, lo1, hi1]. V is copied without RoPE.
     std::vector<uint16_t> qkv = {
         f32_to_bf16_bits(1.0f), f32_to_bf16_bits(3.0f),

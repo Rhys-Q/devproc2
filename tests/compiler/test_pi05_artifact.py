@@ -2,7 +2,7 @@ import json
 
 import numpy as np
 
-from devproc2.models.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact
+from devproc2.artifact.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact
 from devproc2.models.pi05.weights import QuantSpec, WeightPackageWriter
 
 

@@ -10,6 +10,10 @@ option(DEVPROC2_WITH_CUTLASS       "Build optional CUTLASS CUDA kernels" OFF)
 option(DEVPROC2_WITH_TOKENIZERS    "Build tokenizers-cpp runtime hooks" OFF)
 option(DEVPROC2_BUILD_PYTHON_BINDING "Build Python pybind11 binding" OFF)
 
+if(DEVPROC2_WITH_CUDA AND NOT CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "80;89" CACHE STRING "CUDA architectures to build" FORCE)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
 endif()

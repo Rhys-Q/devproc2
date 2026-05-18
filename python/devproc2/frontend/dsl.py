@@ -232,6 +232,46 @@ def tensor_view(
     return None
 
 
+def select(base, *, axis: int, index):
+    """Runtime stub — emits a semantic single-axis tensor selection."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_select"):
+        return emitter.emit_tensor_select(base, axis=axis, index=index)
+    return None
+
+
+def slice(base, *, starts, sizes, strides=None):
+    """Runtime stub — emits a semantic tensor slice view."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_slice"):
+        return emitter.emit_tensor_slice(base, starts=starts, sizes=sizes, strides=strides)
+    return None
+
+
+def index(base, selectors):
+    """Runtime stub — emits select/slice sugar without advanced indexing."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_index"):
+        return emitter.emit_tensor_index(base, selectors)
+    return None
+
+
+def split(base, sections, *, axis: int = 0):
+    """Runtime stub — emits a tuple of semantic tensor slice views."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_split"):
+        return emitter.emit_tensor_split(base, sections=sections, axis=axis)
+    return None
+
+
 def kernel(
     *,
     op: str,

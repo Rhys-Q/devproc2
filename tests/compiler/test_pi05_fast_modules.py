@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from devproc2.ir.ops import (
     TupleOp,
 )
 from devproc2.nn import GraphBuilder, ScalarSpec, TensorSpec
-from devproc2.models.pi05.modules import (
+from devproc2.models.pi05.model import (
     PI05Attention,
     PI05DecoderLayer,
     PI05DenoiseLoop,
@@ -39,7 +40,7 @@ from devproc2.models.pi05.modules import (
     PI05VisionEncoderLayer,
     PI05VisionPatchEmbedding,
 )
-from devproc2.models.pi05.export import (
+from devproc2.export.pi05 import (
     emit_pi05_denoise_executable,
     emit_pi05_denoise_loop_executable,
     emit_pi05_paligemma_prefix_encoder_executable,
@@ -55,6 +56,14 @@ from devproc2.models.pi05.export import (
     pi05_sample_actions_precomputed_prefix_embs_input_specs,
     pi05_sample_actions_precomputed_prefix_input_specs,
     pi05_vision_encoder_input_specs,
+)
+from devproc2.nn import Module
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_PI05_MODEL_SOURCE = _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "model.py"
+_PI05_LEGACY_MODULE_SOURCE = (
+    _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "modules.py"
 )
 
 
@@ -77,6 +86,103 @@ def _call_names(module):
 def _lowered_ops(module, fn_name: str):
     lowered = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=89).run(module)
     return lowered.functions[fn_name].body.blocks[0].ops
+
+
+def test_pi05_model_layer_keeps_backend_ops_behind_ops_facade():
+    assert not _PI05_LEGACY_MODULE_SOURCE.exists()
+    source = _PI05_MODEL_SOURCE.read_text()
+    for needle in (
+        "dp.cuda_call",
+        "dp.call_dps_packed",
+        "dp.tensor_view",
+        "tensor_view(",
+        "runtime.cuda.",
+    ):
+        assert needle not in source
+
+
+def test_pi05_public_imports_use_canonical_modules():
+    import devproc2.models.pi05 as pkg
+    import devproc2.models.pi05.config as config
+    import devproc2.models.pi05.model as model
+    import devproc2.models.pi05.ops as pi05_ops
+    import devproc2.models.pi05.weights as weights
+    import devproc2.artifact.pi05 as artifact
+    import devproc2.export.pi05 as export
+    import devproc2.integrations.pi05.weights as integration_weights
+
+    cfg = config.PI05Config()
+    assert cfg.precision == "fp8"
+    assert cfg.target == "rtx4090_sm89"
+    assert cfg.shape.num_layers == 18
+    assert cfg.layout.fp8_layout == "nk"
+    assert pi05_ops.cuda_symbol("pi05_attention_bf16").endswith(
+        "pi05_kernels.cu::pi05_attention_bf16",
+    )
+    assert pkg.PI05Config is config.PI05Config
+    assert pkg.PI05DenoiseLoop is model.PI05DenoiseLoop
+    assert pkg.PI05PaliGemmaPrefixEncoder is model.PI05PaliGemmaPrefixEncoder
+    assert weights.WeightPackageWriter is pkg.WeightPackageWriter
+    assert artifact.prepare_pi05_artifact is not None
+    assert export.emit_pi05_denoise_executable is not None
+    assert integration_weights.convert_pi05_weights is not None
+    for legacy_name in (
+        "devproc2.models.pi05.modules",
+        "devproc2.models.pi05.artifact",
+        "devproc2.models.pi05.export",
+        "devproc2.models.pi05.torch_oracle",
+    ):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(legacy_name)
+
+
+def test_pi05_normal_compile_rejects_backend_ops_in_forward():
+    from devproc2.export.pi05 import _build_pi05_graph
+
+    source = _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "cuda" / "pi05_kernels.cu"
+
+    class UnsafeCudaForward(Module):
+        def forward(self, x):
+            out = dp.empty((2, 4), dtype="bfloat16", device="cuda")
+            dp.cuda_call(
+                f"{source}::pi05_bias_add_bf16",
+                x,
+                x,
+                2,
+                4,
+                out,
+                metadata={
+                    "kernel_name": "kernel.pi05_bias_add_bf16",
+                    "output_indices": (4,),
+                },
+            )
+            return out
+
+    class UnsafePackedForward(Module):
+        def forward(self, x):
+            out = dp.empty((2, 4), dtype="bfloat16", device="cuda")
+            dp.call_dps_packed(
+                "runtime.cuda.bf16_nn_bf16",
+                inputs=[x, x, 2, 4, 4, out],
+            )
+            return out
+
+    input_specs = {"x": TensorSpec((2, 4), "bfloat16")}
+    with pytest.raises(RuntimeError, match="normal Pi0.5 path emitted cuda_call"):
+        _build_pi05_graph(
+            UnsafeCudaForward(),
+            input_specs,
+            function_name="main",
+            compile_mode="normal",
+        )
+
+    with pytest.raises(RuntimeError, match="normal Pi0.5 path emitted DPS/packed call"):
+        _build_pi05_graph(
+            UnsafePackedForward(),
+            input_specs,
+            function_name="main",
+            compile_mode="normal",
+        )
 
 
 def test_pi05_ffn_forward_uses_standard_ops():
@@ -506,15 +612,15 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
         head_dim=4,
     )
     module = GraphBuilder().build(
-        encoder.forward_fast,
+        encoder.materialize_kv_fast,
         {
             "prefix_embs": TensorSpec((5, 8), "bfloat16"),
             "prefix_valid_rows": ScalarSpec("int64"),
             "rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    fn = module.functions["forward_fast"]
-    ops = _lowered_ops(module, "forward_fast")
+    fn = module.functions["materialize_kv_fast"]
+    ops = _lowered_ops(module, "materialize_kv_fast")
     creates = [op for op in ops if isinstance(op, TensorCreateOp)]
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
@@ -532,9 +638,9 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
     assert isinstance(ret.values[0].op, TupleOp)
 
     module = InferStructInfoPass().run(module)
-    tuple_si = module.functions["forward_fast"].ret_struct_info
+    tuple_si = module.functions["materialize_kv_fast"].ret_struct_info
     assert tuple_si is None
-    ret_si = module.functions["forward_fast"].body.blocks[0].ops[-1].values[0].struct_info
+    ret_si = module.functions["materialize_kv_fast"].body.blocks[0].ops[-1].values[0].struct_info
     assert ret_si.fields[0].shape[0].value == 2
     assert ret_si.fields[0].shape[1].value == 5
     assert ret_si.fields[1].shape[3].value == 4
@@ -545,7 +651,7 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
     module = LowerTensorCreateToAllocPass(ctx).run(module)
     exe = VMCodegenPass().run(module)
     lowered_names = [entry.name for entry in exe.function_table]
-    assert "forward_fast" in lowered_names
+    assert "materialize_kv_fast" in lowered_names
     assert "kernel.pi05_qkv_split_rope_cache_bf16" in lowered_names
     assert "vm.builtin.make_tuple" in lowered_names
 

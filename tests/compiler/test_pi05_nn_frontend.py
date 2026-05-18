@@ -12,7 +12,7 @@ from devproc2.compiler.op import (
     permute_dims,
     reshape,
 )
-from devproc2.ir.ops import CallOp
+from devproc2.ir.ops import CallOp, TensorViewOp
 from devproc2.ir.prim_expr import IntImm
 
 
@@ -205,6 +205,46 @@ def test_top_level_shape_ops_emit_expected_attrs():
     text = print_module(module)
     assert "@cat(%x, %y) {axis=1}" in text
     assert "@reshape(%cat_0) {shape=[3, 4]}" in text
+
+
+def test_semantic_view_ops_emit_alias_views():
+    class ViewOps(nn.Module):
+        def forward(self, x, row):
+            selected = dp.select(x, axis=0, index=row)
+            sliced = dp.slice(x, starts=(1, 0, 0), sizes=(2, 3, 4))
+            head, tail = dp.split(x, (1, 4), axis=0)
+            indexed = dp.index(x, [1, slice(None), slice(1, 3)])
+            flat = dp.reshape(head, (12,))
+            return dp.reshape(flat, (1, 3, 4))
+
+    module = nn.GraphBuilder().build(
+        ViewOps().forward,
+        {
+            "x": nn.TensorSpec((5, 3, 4), "bfloat16"),
+            "row": nn.ScalarSpec("int64"),
+        },
+    )
+    verify(module)
+    views = [
+        op
+        for op in module.functions["forward"].body.entry_block.ops
+        if isinstance(op, TensorViewOp)
+    ]
+
+    assert len(views) == 9
+    assert views[0].result_name.startswith("select")
+    assert views[0].byte_stride == 3 * 4 * 2
+    assert views[0].results[0].struct_info == TensorStructInfo(
+        (IntImm(3), IntImm(4)),
+        "bfloat16",
+        "cuda",
+    )
+    assert views[1].result_name.startswith("slice")
+    assert views[1].base_offset == 3 * 4 * 2
+    assert views[1].results[0].struct_info.shape == (IntImm(2), IntImm(3), IntImm(4))
+    assert views[-2].result_name.startswith("reshape")
+    assert views[-2].results[0].struct_info.shape == (IntImm(12),)
+    assert views[-1].results[0].struct_info.shape == (IntImm(1), IntImm(3), IntImm(4))
 
 
 def test_basic_modules_emit_expected_attrs_and_paths():

@@ -69,6 +69,58 @@ if(DEVPROC2_WITH_CUDA)
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         )
     endif()
+    option(DEVPROC2_WITH_PI05_FA2 "Build the Pi0.5-owned FA2 attention backend" ON)
+    if(DEVPROC2_WITH_PI05_FA2)
+        set(DEVPROC2_PI05_FA2_ROOT
+            "${CMAKE_CURRENT_SOURCE_DIR}/../python/devproc2/models/pi05/cuda/fa2"
+            CACHE PATH "Path to the Pi0.5 FA2 source subset")
+        set(DEVPROC2_PI05_FA2_SRC_ROOT
+            "${DEVPROC2_PI05_FA2_ROOT}/flash_attn_2_src/flash_attn")
+        set(DEVPROC2_PI05_FA2_SRCS
+            "${DEVPROC2_PI05_FA2_SRC_ROOT}/flash_fwd_hdim96_bf16_sm80.cu"
+            "${DEVPROC2_PI05_FA2_SRC_ROOT}/flash_fwd_split_hdim96_bf16_sm80.cu"
+            "${DEVPROC2_PI05_FA2_SRC_ROOT}/flash_fwd_hdim256_bf16_sm80.cu"
+            "${DEVPROC2_PI05_FA2_SRC_ROOT}/flash_fwd_split_hdim256_bf16_sm80.cu"
+            "${DEVPROC2_PI05_FA2_ROOT}/fa2_wrapper.cu"
+        )
+        foreach(_pi05_fa2_src IN LISTS DEVPROC2_PI05_FA2_SRCS)
+            if(NOT EXISTS "${_pi05_fa2_src}")
+                message(FATAL_ERROR "Missing Pi0.5 FA2 source: ${_pi05_fa2_src}")
+            endif()
+        endforeach()
+        add_library(devproc2_pi05_fa2_obj OBJECT ${DEVPROC2_PI05_FA2_SRCS})
+        set_target_properties(devproc2_pi05_fa2_obj PROPERTIES
+            CUDA_STANDARD 17
+            POSITION_INDEPENDENT_CODE ON
+        )
+        target_include_directories(devproc2_pi05_fa2_obj PRIVATE
+            "${DEVPROC2_PI05_FA2_ROOT}"
+            "${DEVPROC2_PI05_FA2_ROOT}/flash_attn_2_src"
+            "${DEVPROC2_PI05_FA2_SRC_ROOT}"
+            "${DEVPROC2_PI05_FA2_ROOT}/flash_attn_2_src/cutlass/include"
+        )
+        target_compile_definitions(devproc2_pi05_fa2_obj PRIVATE
+            FA2_HAS_HDIM_96=1
+            FA2_HAS_HDIM_256=1
+            FA2_HAS_BF16=1
+            FLASH_NAMESPACE=devproc2_pi05_fa2
+        )
+        target_compile_options(devproc2_pi05_fa2_obj PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:
+                --expt-relaxed-constexpr --expt-extended-lambda
+                -O3 --use_fast_math
+                -U__CUDA_NO_HALF_OPERATORS__
+                -U__CUDA_NO_HALF_CONVERSIONS__
+                -U__CUDA_NO_HALF2_OPERATORS__
+                -U__CUDA_NO_BFLOAT16_CONVERSIONS__
+                $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:SHELL:-Xcompiler -Wno-deprecated-declarations>
+                $<$<CXX_COMPILER_ID:MSVC>:SHELL:-Xcompiler /wd4996>
+                "SHELL:-t 4"
+            >
+        )
+        target_sources(devproc2_runtime PRIVATE $<TARGET_OBJECTS:devproc2_pi05_fa2_obj>)
+        target_compile_definitions(devproc2_runtime PUBLIC DEVPROC2_WITH_PI05_FA2)
+    endif()
 endif()
 
 option(DEVPROC2_BUILD_TESTS "Build C++ unit tests" OFF)
