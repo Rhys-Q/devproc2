@@ -55,7 +55,6 @@
   - `pi05_quantize_fp8_dynamic_bf16`
   - `pi05_attention_bf16`（correctness fallback；性能目标路径已使用 vendored FA2 packed func）
   - `pi05_attention_prefix_bf16`（支持 prefix valid rows 的 correctness fallback）
-  - `pi05_encoder_ffn_fp8_fused`（correctness/reference fallback；性能路径使用 split GEMM）
   - `pi05_euler_update_f32`
   - `pi05_euler_update_bf16`
 - `PI05FFN.forward()` 保持标准 IR op，可读、可分析。

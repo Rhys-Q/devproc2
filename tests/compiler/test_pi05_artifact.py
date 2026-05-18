@@ -2,23 +2,12 @@ import json
 
 import numpy as np
 
-from devproc2.models.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact, pi05_kernel_specs
+from devproc2.models.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact
 from devproc2.models.pi05.weights import QuantSpec, WeightPackageWriter
 
 
-def test_pi05_kernel_specs_are_concrete_cuda_specs():
-    specs = pi05_kernel_specs(sm_arch=89)
-
-    assert specs
-    assert all(spec.backend == "cuda" for spec in specs)
-    assert all(spec.source_path and spec.source_path.endswith("pi05_kernels.cu") for spec in specs)
-    assert all(spec.cubin_path and spec.cubin_path.startswith("kernels/") for spec in specs)
-    assert {spec.sm_arches for spec in specs} == {(89,)}
-
-
-def test_prepare_pi05_artifact_copies_weights_metadata_and_tokenizer(tmp_path):
-    weights_dir = tmp_path / "weights_pkg"
-    writer = WeightPackageWriter(weights_dir, precision="fp8")
+def _write_weight_package(path):
+    writer = WeightPackageWriter(path, precision="fp8")
     writer.add_tensor("fp8.test.scale", np.array([1.0], dtype=np.float32), kind="scale")
     writer.add_tensor(
         "fp8.test.weight",
@@ -33,11 +22,18 @@ def test_prepare_pi05_artifact_copies_weights_metadata_and_tokenizer(tmp_path):
         ),
     )
     writer.write()
-    (weights_dir / "convert_report.json").write_text(json.dumps({"fp8_layout": "nk"}))
+    (path / "convert_report.json").write_text(json.dumps({"fp8_layout": "nk"}))
+    return path
+
+
+def test_prepare_pi05_artifact_copies_weights_metadata_and_tokenizer(tmp_path):
+    weights_dir = _write_weight_package(tmp_path / "weights_pkg")
 
     tokenizer = tmp_path / "tokenizer.model"
     tokenizer.write_bytes(b"fake-tokenizer")
     artifact_dir = tmp_path / "artifact"
+    (artifact_dir / "metadata").mkdir(parents=True)
+    (artifact_dir / "metadata" / "pi05_kernel_catalog.json").write_text("[]")
 
     summary = prepare_pi05_artifact(
         weight_package_dir=weights_dir,
@@ -54,7 +50,7 @@ def test_prepare_pi05_artifact_copies_weights_metadata_and_tokenizer(tmp_path):
     assert (artifact_dir / "weights" / "weights.index.json").exists()
     assert (artifact_dir / "metadata" / "weight_map.json").exists()
     assert (artifact_dir / "metadata" / "quantization.json").exists()
-    assert (artifact_dir / "metadata" / "pi05_kernel_catalog.json").exists()
+    assert not (artifact_dir / "metadata" / "pi05_kernel_catalog.json").exists()
     assert (artifact_dir / "resources" / "tokenizer.model").read_bytes() == b"fake-tokenizer"
     assert not (artifact_dir / "metadata" / "kernel_table.json").exists()
 
@@ -64,3 +60,44 @@ def test_prepare_pi05_artifact_copies_weights_metadata_and_tokenizer(tmp_path):
     assert pi05_manifest["weights"]["fp8_layout"] == "nk"
     assert pi05_manifest["tokenizer"] == "resources/tokenizer.model"
     assert pi05_manifest["kernels"]["compiled"] is False
+    assert pi05_manifest["kernels"]["count"] == 0
+    assert pi05_manifest["kernels"]["table"] is None
+
+
+def test_prepare_pi05_artifact_uses_emitted_kernel_table(tmp_path):
+    weights_dir = _write_weight_package(tmp_path / "weights_pkg")
+    artifact_dir = tmp_path / "artifact"
+    metadata_dir = artifact_dir / "metadata"
+    metadata_dir.mkdir(parents=True)
+    source = tmp_path / "pi05_kernels.cu"
+    source.write_text("__global__ void pi05_noop() {}\n")
+    kernel_table = [
+        {
+            "name": "kernel.pi05_noop",
+            "kind": "kernel",
+            "backend": "cuda",
+            "op": "cuda.pi05_noop",
+            "symbol": "pi05_noop",
+            "source": str(source),
+            "launch": {
+                "grid": [1, 1, 1],
+                "block": [32, 1, 1],
+                "shared_memory_bytes": 0,
+            },
+        },
+    ]
+    (metadata_dir / "kernel_table.json").write_text(json.dumps(kernel_table))
+
+    summary = prepare_pi05_artifact(
+        weight_package_dir=weights_dir,
+        artifact_dir=artifact_dir,
+        tokenizer_model_path=None,
+        sm_arch=89,
+        compile_kernels=False,
+    )
+
+    assert summary.kernels == 1
+    assert json.loads((metadata_dir / "kernel_table.json").read_text()) == kernel_table
+    pi05_manifest = json.loads((metadata_dir / "pi05_artifact.json").read_text())
+    assert pi05_manifest["kernels"]["count"] == 1
+    assert pi05_manifest["kernels"]["table"] == "metadata/kernel_table.json"

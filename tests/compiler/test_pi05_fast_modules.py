@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -23,7 +24,6 @@ from devproc2.ir.ops import (
     TupleOp,
 )
 from devproc2.nn import GraphBuilder, ScalarSpec, TensorSpec
-from devproc2.models.pi05.kernels import pi05_cuda_call_metadata, pi05_cuda_source_symbol
 from devproc2.models.pi05.modules import (
     PI05Attention,
     PI05DecoderLayer,
@@ -47,6 +47,7 @@ from devproc2.models.pi05.export import (
     emit_pi05_sample_actions_precomputed_prefix_embs_executable,
     emit_pi05_sample_actions_precomputed_prefix_executable,
     emit_pi05_vision_encoder_executable,
+    compile_pi05_sample_actions_tokens_executable,
     pi05_denoise_input_specs,
     pi05_denoise_loop_input_specs,
     pi05_paligemma_prefix_encoder_input_specs,
@@ -85,7 +86,7 @@ def test_pi05_ffn_forward_uses_standard_ops():
     assert "matmul" in names
     assert "gelu" in names
     assert "multiply" in names
-    assert "pi05.encoder_ffn_fp8_fused" not in names
+    assert not any(name.startswith("pi05.") for name in names)
 
 
 def test_pi05_ffn_forward_fast_uses_fused_op():
@@ -651,11 +652,12 @@ def test_pi05_attention_forward_fast_uses_cuda_kernel():
 def test_pi05_direct_cuda_call_supports_multiple_outputs_without_registration():
     class SplitModule:
         def forward_fast(self, qkv):
+            source = Path("python/devproc2/models/pi05/cuda/pi05_kernels.cu").resolve()
             q = dp.empty((1, 2), dtype="bfloat16", device="cuda")
             k = dp.empty((1, 2), dtype="bfloat16", device="cuda")
             v = dp.empty((1, 2), dtype="bfloat16", device="cuda")
             dp.cuda_call(
-                pi05_cuda_source_symbol("pi05_qkv_split_bf16"),
+                f"{source}::pi05_qkv_split_bf16",
                 qkv,
                 1,
                 2,
@@ -664,7 +666,10 @@ def test_pi05_direct_cuda_call_supports_multiple_outputs_without_registration():
                 q,
                 k,
                 v,
-                metadata=pi05_cuda_call_metadata("pi05_qkv_split_bf16"),
+                metadata={
+                    "kernel_name": "kernel.pi05_qkv_split_bf16",
+                    "extra_nvcc_flags": ("--std=c++17",),
+                },
             )
             return q
 
@@ -682,7 +687,7 @@ def test_pi05_direct_cuda_call_supports_multiple_outputs_without_registration():
     assert dps.target_ref.name == "kernel.pi05_qkv_split_bf16"
     assert dps.target_ref.spec is not None
     assert dps.target_ref.spec.input_dtypes == ("bfloat16", "", "", "", "")
-    assert [param.name for param in dps.target_ref.spec.params][-3:] == ["q", "k", "v"]
+    assert [param.source for param in dps.target_ref.spec.params][-3:] == ["output", "output", "output"]
     assert len(dps.inputs) == 8
     assert not dps.outputs
     assert len(creates) == 3
@@ -1216,3 +1221,38 @@ def test_pi05_paligemma_prefix_kv_encoder_export_emits_tuple_outputs(tmp_path):
     assert "kernel.pi05_qkv_split_rope_cache_bf16" in fn_names
     assert "vm.builtin.make_tuple" in fn_names
     assert "fp8.encoder_attn_qkv_w_1.weight" in names
+
+
+def test_pi05_sample_tokens_normal_mode_compiles_without_cuda_kernels():
+    result = compile_pi05_sample_actions_tokens_executable(
+        function_name="main",
+        action_horizon=2,
+        action_dim=4,
+        prefix_rows=12,
+        num_steps=2,
+        num_layers=1,
+        num_views=1,
+        image_size=4,
+        patch_size=2,
+        image_channels=3,
+        vision_layers=1,
+        vision_hidden_size=8,
+        vision_intermediate_size=16,
+        vision_heads=2,
+        vocab_size=32,
+        max_prompt_len=8,
+        prefix_hidden_size=8,
+        prefix_intermediate_size=16,
+        decoder_hidden_size=8,
+        decoder_intermediate_size=16,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        compile_mode="normal",
+    )
+
+    fn_names = [entry.name for entry in result.executable.function_table]
+
+    assert "runtime.reference.attention" in fn_names
+    assert "runtime.reference.image_patch_im2col" in fn_names
+    assert not any(name.startswith("kernel.pi05") for name in fn_names)

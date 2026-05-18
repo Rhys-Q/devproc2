@@ -28,7 +28,7 @@ from devproc2.ir.nodes import (
     IRStage,
     TensorStructInfo,
 )
-from devproc2.ir.op_ref import KernelRef, StandardOpRef
+from devproc2.ir.op_ref import KernelRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
     CallOp,
@@ -60,10 +60,17 @@ class DPSLoweringPass(IRRewriter):
     required_analysis: tuple[str, ...] = ()
     preserved_analysis: tuple[str, ...] = ()
 
-    def __init__(self, registry: KernelRegistry, sm_arch: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        registry: KernelRegistry,
+        sm_arch: Optional[int] = None,
+        *,
+        reference_fallback: bool = False,
+    ) -> None:
         super().__init__()
         self._registry = registry
         self._sm_arch = sm_arch
+        self._reference_fallback = bool(reference_fallback)
 
     def run(self, module: IRModule) -> IRModule:
         return self.rewrite_module(module)
@@ -111,6 +118,25 @@ class DPSLoweringPass(IRRewriter):
                     new_ops.append(create_op)
                     new_ops.append(dps_op)
                     continue
+                if self._reference_fallback:
+                    create_op = TensorCreateOp(
+                        result_name=op.result_name,
+                        kind=TensorCreateKind.empty,
+                        shape=si.shape,
+                        dtype=si.dtype,
+                        device=si.device,
+                    )
+                    self._sub[op.results[0]] = create_op.results[0]
+                    dps_op = CallDPSOp(
+                        target_ref=PackedFuncRef(f"runtime.reference.{op.op_ref.name}"),
+                        inputs=self.svs(op.args),
+                        outputs=(create_op.results[0],),
+                        effect=EffectSummary.write(create_op.results[0]),
+                        attrs=op.attrs,
+                    )
+                    new_ops.append(create_op)
+                    new_ops.append(dps_op)
+                    continue
             # Default path: substitute operands, register result mapping.
             new_op = self._subst_op(op)
             for old_r, new_r in zip(op.results, new_op.results):
@@ -137,10 +163,10 @@ class DPSLoweringPass(IRRewriter):
         return KernelSpec(
             op_name=f"cuda.{op.symbol}",
             device=_cuda_call_device(op),
-            input_dtypes=op.input_dtypes or build_input_dtypes(op.args),
+            input_dtypes=op.input_dtypes or _cuda_call_input_dtypes(op),
             kernel_name=kernel_name,
             backend="cuda",
-            output_dtype=op.output_dtype,
+            output_dtype=op.output_dtype or _cuda_call_output_dtype(op),
             symbol=op.symbol,
             sm_arches=sm_arches,
             launch=launch,
@@ -205,6 +231,23 @@ def _cuda_call_device(op: CudaCallOp) -> str:
     return "cuda"
 
 
+def _cuda_call_output_dtype(op: CudaCallOp) -> str | None:
+    if len(op.output_indices) != 1:
+        return None
+    idx = op.output_indices[0]
+    if idx < 0 or idx >= len(op.args):
+        return None
+    si = getattr(op.args[idx], "struct_info", None)
+    return getattr(si, "dtype", None)
+
+
+def _cuda_call_input_dtypes(op: CudaCallOp) -> tuple[str, ...]:
+    outputs = set(op.output_indices)
+    return build_input_dtypes(
+        tuple(value for i, value in enumerate(op.args) if i not in outputs)
+    )
+
+
 def _cuda_call_params(op: CudaCallOp) -> tuple[KernelParamSpec, ...]:
     if op.params:
         return tuple(op.params)
@@ -212,9 +255,10 @@ def _cuda_call_params(op: CudaCallOp) -> tuple[KernelParamSpec, ...]:
     outputs = set(op.output_indices)
     for i, value in enumerate(op.args):
         kind, dtype = _param_kind_dtype(value)
+        name = op.param_names[i] if i < len(op.param_names) else getattr(value, "name", f"arg{i}")
         params.append(
             KernelParamSpec(
-                name=getattr(value, "name", f"arg{i}"),
+                name=name,
                 kind=kind,
                 dtype=dtype,
                 source="output" if i in outputs else "input",

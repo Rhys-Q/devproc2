@@ -232,6 +232,26 @@ class GraphBuilder:
             or output_spec is not None
         )
         if not has_output:
+            output_indices = tuple(
+                idx
+                for idx, value in enumerate(ir_inputs)
+                if id(value) in self._uninitialized_empty_values
+            )
+            if output_indices:
+                first_output = output_indices[0]
+                if output_indices != tuple(range(first_output, len(ir_inputs))):
+                    raise ValueError("call_dps_packed destination tensors must be trailing inputs")
+                outputs = tuple(ir_inputs[idx] for idx in output_indices)
+                for output in outputs:
+                    self._uninitialized_empty_values.discard(id(output))
+                dps = CallDPSOp(
+                    target_ref=PackedFuncRef(name),
+                    inputs=ir_inputs[:first_output],
+                    outputs=outputs,
+                    effect=_dps_effect(effect, outputs, name),
+                )
+                self._ops.append(dps)
+                return None
             dps = CallDPSOp(
                 target_ref=PackedFuncRef(name),
                 inputs=ir_inputs,
@@ -296,6 +316,7 @@ class GraphBuilder:
             extra_nvcc_flags=tuple(str(v) for v in _metadata_tuple(metadata.get("extra_nvcc_flags", ()))),
             compile_options=dict(metadata.get("compile_options", {})),
             params=tuple(_metadata_tuple(metadata.get("params", ()))),
+            param_names=tuple(str(v) for v in _metadata_tuple(metadata.get("param_names", ()))),
             input_dtypes=tuple(str(v) for v in _metadata_tuple(metadata.get("input_dtypes", ()))),
             output_dtype=metadata.get("output_dtype"),
             kernel_name=metadata.get("kernel_name"),

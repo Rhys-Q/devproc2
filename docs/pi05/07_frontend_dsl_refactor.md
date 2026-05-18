@@ -13,7 +13,7 @@ Pi0.5 的 MVP 性能主要来自自定义 CUDA kernel。`nn.Module.forward_fast(
 当前 Pi0.5 fast path 的主要问题不是有 `forward_fast()`，而是 fast path 不够规范：
 
 - Module 里直接调用 `dp.call_dps_kernel()`，导致模型结构、kernel symbol、launch、output spec、effect 和 lowering 细节混在一起。
-- 每个 fast path 都要显式 `register_pi05_kernels(sm_arch=89)`，自定义算子不是无感接入。
+- 每个 fast path 都要显式做静态 kernel 注册，自定义算子不是无感接入。
 - CUDA 参数 ABI 容易被 `inputs + outputs` 重排；而手写 CUDA kernel 的参数顺序必须与源码签名一致。
 - 权重布局、activation scale、byte stride、cache layout 等低层细节大量散落在 Module 中。
 
@@ -66,10 +66,10 @@ trace 阶段生成 `CudaCallOp`，记录：
 Pi0.5 前端模型已迁到独立模型命名空间：
 
 - canonical package 为 `python/devproc2/models/pi05` / `devproc2.models.pi05`；旧 `python/devproc2/pi05` 包已删除，不保留双命名空间。
-- Pi0.5 Module 不再调用 `register_pi05_kernels(sm_arch=89)`。
-- CUDA source kernels 通过 `devproc2.models.pi05.kernels.call_pi05_cuda_kernel(...)` 接入；该 helper 兼容原 `dp.call_dps_kernel` 的输出声明风格，在内部展开为 `dp.empty() + dp.cuda_call(...)`。
+- Pi0.5 Module 不再调用静态 kernel 注册入口。
+- CUDA source kernels 通过模型内的 `dp.cuda_call(...)` 接入；Pi0.5 不再保留独立 kernel catalog/helper 文件。
 - 多输出 kernel 用多个 `dp.empty()` 输出并传入同一个 `cuda_call`，lowering 后输出通过 `effect.writes` 表达，CUDA 参数顺序保持为原始 ABI 顺序。
-- Pi0.5 helper 复用原 kernel catalog 的 `kernel_name`、`symbol`、launch、`params` 和 `--std=c++17` 编译参数，因此 artifact ABI 和 cubin 编译路径保持一致。
+- Pi0.5 fast path 在调用点提供 `kernel_name`、launch 和 `--std=c++17` 编译参数；artifact ABI 以导出阶段生成的 `metadata/kernel_table.json` 为准。
 - cuBLASLt、FA2、CUTLASS packed func 暂时保留现有 `dp.call_dps_packed()` 路径；本轮只处理 `.cu` source kernel。
 - `forward()` 继续保留标准 op reference path，不因 fast path 迁移而降低可读性。
 

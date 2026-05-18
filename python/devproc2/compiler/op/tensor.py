@@ -14,6 +14,24 @@ from devproc2.compiler.op.infer import reshape as infer_reshape
 from devproc2.compiler.op.infer import same_as_first
 from devproc2.compiler.op.registry import register_op
 from devproc2.compiler.op.schema import Attr, AttrType, Input, LoweringPolicy, OpPatternKind
+from devproc2.ir.nodes import TensorStructInfo
+
+
+def _cast_infer(ctx):
+    info = ctx.arg(0)
+    if not isinstance(info, TensorStructInfo):
+        return None
+    return TensorStructInfo(tuple(info.shape), str(ctx.attrs["dtype"]), info.device)
+
+
+def _shape_dtype_infer(ctx):
+    info = ctx.arg(0)
+    if not isinstance(info, TensorStructInfo):
+        return None
+    shape = ctx.attrs["shape"]
+    if not isinstance(shape, tuple):
+        shape = tuple(shape) if isinstance(shape, list) else (shape,)
+    return TensorStructInfo(tuple(shape), str(ctx.attrs["dtype"]), info.device)
 
 
 @register_op(inputs=("x",), pattern=OpPatternKind.elementwise)
@@ -24,6 +42,16 @@ def relu(x):
 @register_op(inputs=("x",), pattern=OpPatternKind.elementwise)
 def silu(x):
     return emit(silu, x)
+
+
+@register_op(
+    inputs=("x",),
+    attrs=(Attr("dtype", AttrType.dtype(), required=True),),
+    infer=_cast_infer,
+    pattern=OpPatternKind.injective,
+)
+def cast(x, dtype: str):
+    return emit(cast, x, dtype=dtype)
 
 
 @register_op(inputs=("lhs", "rhs"), infer=infer_broadcast, pattern=OpPatternKind.broadcast)
@@ -86,6 +114,26 @@ def reshape(x, shape):
     else:
         normalized_shape = (shape,)
     return emit(reshape, x, shape=normalized_shape)
+
+
+@register_op(
+    inputs=("image",),
+    attrs=(
+        Attr("shape", AttrType.shape(), required=True),
+        Attr("patch_size", AttrType.int(), required=True),
+        Attr("dtype", AttrType.dtype(), default="bfloat16"),
+    ),
+    infer=_shape_dtype_infer,
+    pattern=OpPatternKind.injective,
+)
+def image_patch_im2col(image, *, shape, patch_size: int, dtype: str = "bfloat16"):
+    return emit(
+        image_patch_im2col,
+        image,
+        shape=tuple(shape),
+        patch_size=patch_size,
+        dtype=dtype,
+    )
 
 
 @register_op(

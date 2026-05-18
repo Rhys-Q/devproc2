@@ -1045,51 +1045,6 @@ extern "C" __global__ void pi05_attention_prefix_bf16(
     }
 }
 
-extern "C" __global__ void pi05_encoder_ffn_fp8_fused(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_fp8_e4m3* __restrict__ gate_up_w_fp8,
-    const float* __restrict__ gate_up_w_scale,
-    const __nv_fp8_e4m3* __restrict__ down_w_fp8,
-    const float* __restrict__ down_w_scale,
-    const float* __restrict__ act0_scale,
-    const float* __restrict__ act1_scale,
-    long long rows,
-    long long hidden,
-    long long intermediate,
-    __nv_bfloat16* __restrict__ out) {
-    long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    long long total = rows * hidden;
-    if (idx >= total) return;
-    long long r = idx / hidden;
-    long long h = idx - r * hidden;
-
-    float gate_scale = *gate_up_w_scale;
-    float down_scale = *down_w_scale;
-    (void)act0_scale;
-    (void)act1_scale;
-
-    // Correctness-oriented reference fallback. Production Pi0.5 uses the
-    // split FP8 GEMM + GeGLU + FP8 GEMM path; this symbol gives forward_fast
-    // a concrete CUDA kernel ABI while the optimized host GEMM path lands.
-    float acc = 0.0f;
-    for (long long i = 0; i < intermediate; ++i) {
-        float gate = 0.0f;
-        float up = 0.0f;
-        const __nv_fp8_e4m3* gate_w = gate_up_w_fp8 + i * hidden;
-        const __nv_fp8_e4m3* up_w = gate_up_w_fp8 + (intermediate + i) * hidden;
-        const __nv_bfloat16* x_row = x + r * hidden;
-        for (long long k = 0; k < hidden; ++k) {
-            float xv = __bfloat162float(x_row[k]);
-            gate += xv * static_cast<float>(gate_w[k]) * gate_scale;
-            up += xv * static_cast<float>(up_w[k]) * gate_scale;
-        }
-        float act = gelu_tanh_approx(gate) * up;
-        float dw = static_cast<float>(down_w_fp8[h * intermediate + i]) * down_scale;
-        acc += act * dw;
-    }
-    out[idx] = __float2bfloat16(acc);
-}
-
 extern "C" __global__ void pi05_euler_update_f32(
     float* __restrict__ x,
     const float* __restrict__ v,

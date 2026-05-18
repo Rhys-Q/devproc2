@@ -2,16 +2,39 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
 import devproc2 as dp
 import devproc2.nn as nn
 
 from devproc2.ir.prim_expr import PrimExpr, ceildiv
-from devproc2.models.pi05.kernels import (
-    pi05_cuda_call_metadata as _pi05_cuda_metadata,
-    pi05_cuda_source_symbol as _pi05_cuda_symbol,
-)
 from devproc2.nn.specs import Parameter
+
+
+_PI05_CUDA_SOURCE = Path(__file__).resolve().parent / "cuda" / "pi05_kernels.cu"
+
+
+def _pi05_cuda_symbol(name: str) -> str:
+    return f"{_PI05_CUDA_SOURCE}::{name}"
+
+
+def _pi05_cuda_metadata(
+    name: str,
+    *,
+    effect: str = "opaque",
+    launch: dp.KernelLaunchSpec | None = None,
+    output_indices: int | tuple[int, ...] | None = None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "kernel_name": f"kernel.{name}",
+        "extra_nvcc_flags": ("--std=c++17",),
+        "effect": effect,
+    }
+    if launch is not None:
+        metadata["launch"] = launch
+    if output_indices is not None:
+        metadata["output_indices"] = output_indices
+    return metadata
 
 
 class PI05Linear(nn.Module):
@@ -51,7 +74,7 @@ class PI05Linear(nn.Module):
 
     def forward_fast(self, x):
         rows = _static_dim(x, 0)
-        out = dp.call_dps_packed(
+        out = _packed_call(
             "runtime.cuda.bf16_nn_bf16",
             inputs=[
                 x,
@@ -61,8 +84,6 @@ class PI05Linear(nn.Module):
                 self.in_features,
             ],
             output_shape=(rows, self.out_features),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         if self.bias is not None:
             dp.cuda_call(
@@ -143,6 +164,17 @@ class PI05VisionPatchEmbedding(nn.Module):
             return dp.add(out, tiled_position)
         return out
 
+    def forward_images(self, images_u8):
+        rows = self.num_views * self.num_patches
+        image_bf16 = dp.cast(images_u8, dtype="bfloat16")
+        patches = dp.image_patch_im2col(
+            image_bf16,
+            shape=(rows, self.patch_dim),
+            patch_size=self.patch_size,
+            dtype="bfloat16",
+        )
+        return self.forward(patches)
+
     def forward_fast(self, images_u8):
         image_elems = self.num_views * self.image_size * self.image_size * self.in_channels
         rows = self.num_views * self.num_patches
@@ -172,7 +204,7 @@ class PI05VisionPatchEmbedding(nn.Module):
                 launch=_grid_1d(rows * self.patch_dim),
             ),
         )
-        out = dp.call_dps_packed(
+        out = _packed_call(
             "runtime.cuda.bf16_nn_bf16",
             inputs=[
                 patches,
@@ -182,8 +214,6 @@ class PI05VisionPatchEmbedding(nn.Module):
                 self.patch_dim,
             ],
             output_shape=(rows, self.vision_width),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         dp.cuda_call(
             _pi05_cuda_symbol("pi05_bias_add_bf16"),
@@ -277,7 +307,7 @@ class PI05Attention(nn.Module):
         self.scale = float(scale if scale is not None else self.head_dim ** -0.5)
 
     def forward(self, q, k, v):
-        return self.forward_fast(q, k, v)
+        return dp.attention(q, k, v, scale=self.scale)
 
     def forward_fast(self, q, k, v):
         rows_q = _static_dim(q, 0)
@@ -479,7 +509,53 @@ class PI05VisionEncoderLayer(nn.Module):
         )
 
     def forward(self, hidden):
-        return self.forward_fast(hidden)
+        rows = _static_dim(hidden, 0)
+        norm_w = _view_bf16_row(self.pre_attn_norm_w, self.layer_idx, self.hidden_size)
+        norm_b = _view_bf16_row(self.pre_attn_norm_b, self.layer_idx, self.hidden_size)
+        qkv_b = _view_bf16_row(self.attn_qkv_b, self.layer_idx, self.qkv_dim)
+        o_b = _view_bf16_row(self.attn_o_b, self.layer_idx, self.hidden_size)
+        ffn_norm_w = _view_bf16_row(self.pre_ffn_norm_w, self.layer_idx, self.hidden_size)
+        ffn_norm_b = _view_bf16_row(self.pre_ffn_norm_b, self.layer_idx, self.hidden_size)
+        up_b = _view_bf16_row(self.ffn_up_b, self.layer_idx, self.intermediate_size)
+        down_b = _view_bf16_row(self.ffn_down_b, self.layer_idx, self.hidden_size)
+
+        attn_norm = dp.layer_norm(
+            hidden,
+            norm_w,
+            norm_b,
+            axes=(-1,),
+            epsilon=self.eps,
+        )
+        qkv = _add_bias_if_present(
+            _fp8_linear_ref(attn_norm, self.qkv_w_fp8, out_features=self.qkv_dim),
+            qkv_b,
+        )
+        q, k, v = _qkv_views(qkv, rows, self.num_heads, self.num_heads, self.head_dim)
+        attn = dp.attention(q, k, v, scale=self.head_dim ** -0.5)
+        attn_flat = dp.reshape(attn, (rows, self.hidden_size))
+        attn_out = _add_bias_if_present(
+            _fp8_linear_ref(attn_flat, self.o_w_fp8, out_features=self.hidden_size),
+            o_b,
+        )
+        hidden = dp.add(hidden, attn_out)
+
+        ffn_norm = dp.layer_norm(
+            hidden,
+            ffn_norm_w,
+            ffn_norm_b,
+            axes=(-1,),
+            epsilon=self.eps,
+        )
+        ffn_hidden = _add_bias_if_present(
+            _fp8_linear_ref(ffn_norm, self.up_w_fp8, out_features=self.intermediate_size),
+            up_b,
+        )
+        ffn_hidden = dp.gelu(ffn_hidden, approximate="tanh")
+        ffn_out = _add_bias_if_present(
+            _fp8_linear_ref(ffn_hidden, self.down_w_fp8, out_features=self.hidden_size),
+            down_b,
+        )
+        return dp.add(hidden, ffn_out)
 
     def forward_fast(self, hidden):
         rows = _static_dim(hidden, 0)
@@ -502,7 +578,7 @@ class PI05VisionEncoderLayer(nn.Module):
             eps_bits,
             self.qkv_act_scale if self.use_static_act_scales else None,
         )
-        qkv = dp.call_dps_packed(
+        qkv = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 attn_norm_fp8,
@@ -514,8 +590,6 @@ class PI05VisionEncoderLayer(nn.Module):
                 self.qkv_w_scale,
             ],
             output_shape=(rows, self.qkv_dim),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         q = dp.empty((rows, self.num_heads, self.head_dim), dtype="bfloat16", device="cuda")
         k = dp.empty((rows, self.num_heads, self.head_dim), dtype="bfloat16", device="cuda")
@@ -541,7 +615,7 @@ class PI05VisionEncoderLayer(nn.Module):
         if rows % self.num_views != 0:
             raise ValueError("vision hidden rows must be divisible by num_views")
         rows_per_view = rows // self.num_views
-        attn = dp.call_dps_packed(
+        attn = _packed_call(
             "runtime.cuda.pi05_fa2_bf16_batched",
             inputs=[
                 q,
@@ -556,8 +630,6 @@ class PI05VisionEncoderLayer(nn.Module):
                 _f32_to_i64_bits(self.head_dim ** -0.5),
             ],
             output_shape=(rows, self.num_heads, self.head_dim),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         attn_flat = dp.tensor_view(attn, 0, (rows, self.hidden_size))
         attn_fp8, attn_scale = _quantize_fp8_maybe_static(
@@ -566,7 +638,7 @@ class PI05VisionEncoderLayer(nn.Module):
             (rows, self.hidden_size),
             self.o_act_scale if self.use_static_act_scales else None,
         )
-        attn_out = dp.call_dps_packed(
+        attn_out = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 attn_fp8,
@@ -578,8 +650,6 @@ class PI05VisionEncoderLayer(nn.Module):
                 self.o_w_scale,
             ],
             output_shape=(rows, self.hidden_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         dp.cuda_call(
             _pi05_cuda_symbol("pi05_bias_residual_bf16"),
@@ -603,7 +673,7 @@ class PI05VisionEncoderLayer(nn.Module):
             eps_bits,
             self.up_act_scale if self.use_static_act_scales else None,
         )
-        ffn_hidden = dp.call_dps_packed(
+        ffn_hidden = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 ffn_norm_fp8,
@@ -615,8 +685,6 @@ class PI05VisionEncoderLayer(nn.Module):
                 self.up_w_scale,
             ],
             output_shape=(rows, self.intermediate_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         if self.use_static_act_scales:
             ffn_hidden_fp8 = dp.empty(
@@ -665,7 +733,7 @@ class PI05VisionEncoderLayer(nn.Module):
                 (rows, self.intermediate_size),
                 None,
             )
-        ffn_out = dp.call_dps_packed(
+        ffn_out = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 ffn_hidden_fp8,
@@ -677,8 +745,6 @@ class PI05VisionEncoderLayer(nn.Module):
                 self.down_w_scale,
             ],
             output_shape=(rows, self.hidden_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         dp.cuda_call(
             _pi05_cuda_symbol("pi05_bias_residual_bf16"),
@@ -787,7 +853,19 @@ class PI05VisionEncoder(nn.Module):
         )
 
     def forward(self, images_u8):
-        return self.forward_fast(images_u8)
+        hidden = self.patch.forward_images(images_u8)
+        rows = _static_dim(hidden, 0)
+        for layer in self.layers:
+            hidden = layer(hidden)
+        hidden = dp.layer_norm(
+            hidden,
+            self.final_norm_w,
+            self.final_norm_b,
+            axes=(-1,),
+            epsilon=self.eps,
+        )
+        out = _fp8_linear_ref(hidden, self.projector_w_fp8, out_features=self.output_size)
+        return dp.add(out, self.projector_b)
 
     def forward_fast(self, images_u8):
         hidden = self.patch.forward_fast(images_u8)
@@ -803,7 +881,7 @@ class PI05VisionEncoder(nn.Module):
             _f32_to_i64_bits(self.eps),
             self.projector_act_scale if self.use_static_act_scales else None,
         )
-        out = dp.call_dps_packed(
+        out = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 hidden_fp8,
@@ -815,8 +893,6 @@ class PI05VisionEncoder(nn.Module):
                 self.projector_w_scale,
             ],
             output_shape=(rows, self.output_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         dp.cuda_call(
             _pi05_cuda_symbol("pi05_bias_add_bf16"),
@@ -914,8 +990,56 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
             act1_scale_name=f"act_scale.encoder_ffn_down_w_{layer_idx}",
         )
 
-    def forward(self, hidden, rope_interleaved):
-        return self.forward_fast(hidden, rope_interleaved)
+    def forward(
+        self,
+        hidden,
+        rope_interleaved,
+        k_cache=None,
+        v_cache=None,
+        prefix_valid_rows=None,
+        skip_post_kv: bool = False,
+    ):
+        rows = _static_dim(hidden, 0)
+        normed = dp.rms_norm_unit(hidden, epsilon=self.eps)
+        qkv = _fp8_linear_ref(normed, self.qkv_w_fp8, out_features=self.qkv_dim)
+        q, k, v = _qkv_views(qkv, rows, self.num_q_heads, self.num_kv_heads, self.head_dim)
+        if k_cache is not None and v_cache is not None:
+            prefix_rows = _static_dim(k_cache, 1)
+            prefix_layer_bytes = prefix_rows * self.num_kv_heads * self.head_dim * 2
+            k = dp.tensor_view(
+                k_cache,
+                self.layer_idx,
+                (prefix_rows, self.num_kv_heads, self.head_dim),
+                byte_stride=prefix_layer_bytes,
+            )
+            v = dp.tensor_view(
+                v_cache,
+                self.layer_idx,
+                (prefix_rows, self.num_kv_heads, self.head_dim),
+                byte_stride=prefix_layer_bytes,
+            )
+            if skip_post_kv:
+                return hidden
+        attn = dp.attention(q, k, v, scale=self.head_dim ** -0.5)
+        attn_flat = dp.reshape(attn, (rows, self.q_dim))
+        attn_out = _fp8_linear_ref(attn_flat, self.o_w_fp8, out_features=self.hidden_size)
+        hidden = dp.add(hidden, attn_out)
+        ffn_norm = dp.rms_norm_unit(hidden, epsilon=self.eps)
+        return dp.add(hidden, self.ffn(ffn_norm))
+
+    def forward_with_kv(self, hidden, rope_interleaved, *, skip_post_kv: bool = False):
+        rows = _static_dim(hidden, 0)
+        normed = dp.rms_norm_unit(hidden, epsilon=self.eps)
+        qkv = _fp8_linear_ref(normed, self.qkv_w_fp8, out_features=self.qkv_dim)
+        q, k, v = _qkv_views(qkv, rows, self.num_q_heads, self.num_kv_heads, self.head_dim)
+        if skip_post_kv:
+            return hidden, k, v
+        attn = dp.attention(q, k, v, scale=self.head_dim ** -0.5)
+        attn_flat = dp.reshape(attn, (rows, self.q_dim))
+        attn_out = _fp8_linear_ref(attn_flat, self.o_w_fp8, out_features=self.hidden_size)
+        hidden = dp.add(hidden, attn_out)
+        ffn_norm = dp.rms_norm_unit(hidden, epsilon=self.eps)
+        return dp.add(hidden, self.ffn(ffn_norm)), k, v
 
     def forward_fast(
         self,
@@ -935,7 +1059,7 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
             eps_bits,
             self.qkv_act_scale if self.use_static_act_scales else None,
         )
-        qkv = dp.call_dps_packed(
+        qkv = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 normed_fp8,
@@ -947,8 +1071,6 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
                 self.qkv_w_scale,
             ],
             output_shape=(rows, self.qkv_dim),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         prefix_rows = rows
         prefix_layer_bytes = rows * self.num_kv_heads * self.head_dim * 2
@@ -1043,7 +1165,7 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
                 metadata=_pi05_cuda_metadata("pi05_attention_bf16", launch=launch),
             )
         else:
-            attn = dp.call_dps_packed(
+            attn = _packed_call(
                 "runtime.cuda.pi05_fa2_bf16",
                 inputs=[
                     q,
@@ -1058,8 +1180,6 @@ class PI05PaliGemmaEncoderLayer(nn.Module):
                     _f32_to_i64_bits(self.head_dim ** -0.5),
                 ],
                 output_shape=(rows, self.num_q_heads, self.head_dim),
-                output_dtype="bfloat16",
-                output_device="cuda",
             )
         attn_flat = dp.tensor_view(attn, 0, (rows, self.q_dim))
         attn_fp8, attn_scale = _quantize_fp8_maybe_static(
@@ -1142,7 +1262,25 @@ class PI05PaliGemmaPrefixEncoder(nn.Module):
         )
 
     def forward(self, prefix_embs, rope_interleaved):
-        return self.forward_fast(prefix_embs, rope_interleaved)
+        hidden = prefix_embs
+        for layer in self.layers:
+            hidden = layer(hidden, rope_interleaved)
+        return hidden
+
+    def forward_kv(self, prefix_embs, prefix_valid_rows, rope_interleaved):
+        rows = _static_dim(prefix_embs, 0)
+        hidden = prefix_embs
+        k_layers = []
+        v_layers = []
+        for i, layer in enumerate(self.layers):
+            hidden, k, v = layer.forward_with_kv(
+                hidden,
+                rope_interleaved,
+                skip_post_kv=(i == self.num_layers - 1),
+            )
+            k_layers.append(dp.reshape(k, (1, rows, self.num_kv_heads, self.head_dim)))
+            v_layers.append(dp.reshape(v, (1, rows, self.num_kv_heads, self.head_dim)))
+        return dp.cat(k_layers, axis=0), dp.cat(v_layers, axis=0)
 
     def forward_fast(self, prefix_embs, rope_or_valid_rows, rope_interleaved=None):
         if rope_interleaved is not None:
@@ -1243,11 +1381,16 @@ class PI05SampleActionsFromPrefixEmbeddings(nn.Module):
         prefix_rope_interleaved,
         suffix_rope_interleaved,
     ):
-        return self.forward_fast(
-            noise_f32,
+        prefix_k_cache, prefix_v_cache = self.prefix_encoder.forward_kv(
             prefix_embs,
             prefix_valid_rows,
             prefix_rope_interleaved,
+        )
+        return self.denoise_loop(
+            noise_f32,
+            prefix_k_cache,
+            prefix_v_cache,
+            prefix_valid_rows,
             suffix_rope_interleaved,
         )
 
@@ -1372,12 +1515,19 @@ class PI05SampleActionsFromTokens(nn.Module):
         prefix_rope_interleaved,
         suffix_rope_interleaved,
     ):
-        return self.forward_fast(
-            noise_f32,
-            images_u8,
-            token_ids,
+        image_embs = self.vision(images_u8)
+        lang_embs = self.language(token_ids)
+        prefix_embs = dp.cat([image_embs, lang_embs], axis=0)
+        prefix_k_cache, prefix_v_cache = self.prefix_encoder.forward_kv(
+            prefix_embs,
             prefix_valid_rows,
             prefix_rope_interleaved,
+        )
+        return self.denoise_loop(
+            noise_f32,
+            prefix_k_cache,
+            prefix_v_cache,
+            prefix_valid_rows,
             suffix_rope_interleaved,
         )
 
@@ -1516,7 +1666,7 @@ class PI05FFN(nn.Module):
                 launch=_grid_1d(rows * self.hidden_size),
             ),
         )
-        gate_up = dp.call_dps_packed(
+        gate_up = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 x_fp8,
@@ -1528,8 +1678,6 @@ class PI05FFN(nn.Module):
                 self.gate_up_w_scale,
             ],
             output_shape=(rows, 2 * self.intermediate_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         hidden_fp8 = dp.empty((rows, self.intermediate_size), dtype="fp8_e4m3", device="cuda")
         dp.cuda_call(
@@ -1546,7 +1694,7 @@ class PI05FFN(nn.Module):
                 launch=_grid_1d(rows * self.intermediate_size),
             ),
         )
-        return dp.call_dps_packed(
+        return _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 hidden_fp8,
@@ -1557,12 +1705,12 @@ class PI05FFN(nn.Module):
                 self.act1_scale,
                 self.down_w_scale,
             ],
-            output_like=x,
+            output_shape=(rows, self.hidden_size),
         )
 
     def _forward_fast_from_fp8(self, x_fp8, act0_scale, rows: int):
         """FFN fast path when caller already produced FP8 normalized input."""
-        gate_up = dp.call_dps_packed(
+        gate_up = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 x_fp8,
@@ -1574,8 +1722,6 @@ class PI05FFN(nn.Module):
                 self.gate_up_w_scale,
             ],
             output_shape=(rows, 2 * self.intermediate_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         hidden = dp.empty((rows, self.intermediate_size), dtype="bfloat16", device="cuda")
         dp.cuda_call(
@@ -1596,7 +1742,7 @@ class PI05FFN(nn.Module):
             rows * self.intermediate_size,
             (rows, self.intermediate_size),
         )
-        return dp.call_dps_packed(
+        return _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 hidden_fp8,
@@ -1608,13 +1754,11 @@ class PI05FFN(nn.Module):
                 self.down_w_scale,
             ],
             output_shape=(rows, self.hidden_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
 
     def _forward_fast_from_fp8_accum(self, x_fp8, act0_scale, rows: int, residual):
         """FFN fast path with the down projection accumulated into residual."""
-        gate_up = dp.call_dps_packed(
+        gate_up = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 x_fp8,
@@ -1626,8 +1770,6 @@ class PI05FFN(nn.Module):
                 self.gate_up_w_scale,
             ],
             output_shape=(rows, 2 * self.intermediate_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         hidden = dp.empty((rows, self.intermediate_size), dtype="bfloat16", device="cuda")
         dp.cuda_call(
@@ -1665,7 +1807,7 @@ class PI05FFN(nn.Module):
 
     def _forward_fast_from_fp8_static(self, x_fp8, act0_scale, rows: int):
         """FFN fast path with caller-provided input FP8 and calibrated GeGLU scale."""
-        gate_up = dp.call_dps_packed(
+        gate_up = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 x_fp8,
@@ -1677,8 +1819,6 @@ class PI05FFN(nn.Module):
                 self.gate_up_w_scale,
             ],
             output_shape=(rows, 2 * self.intermediate_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         hidden_fp8 = dp.empty((rows, self.intermediate_size), dtype="fp8_e4m3", device="cuda")
         dp.cuda_call(
@@ -1695,7 +1835,7 @@ class PI05FFN(nn.Module):
                 launch=_grid_1d(rows * self.intermediate_size),
             ),
         )
-        return dp.call_dps_packed(
+        return _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 hidden_fp8,
@@ -1707,13 +1847,11 @@ class PI05FFN(nn.Module):
                 self.down_w_scale,
             ],
             output_shape=(rows, self.hidden_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
 
     def _forward_fast_from_fp8_static_accum(self, x_fp8, act0_scale, rows: int, residual):
         """Static-scale FFN fast path with down projection accumulated in-place."""
-        gate_up = dp.call_dps_packed(
+        gate_up = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 x_fp8,
@@ -1725,8 +1863,6 @@ class PI05FFN(nn.Module):
                 self.gate_up_w_scale,
             ],
             output_shape=(rows, 2 * self.intermediate_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         hidden_fp8 = dp.empty((rows, self.intermediate_size), dtype="fp8_e4m3", device="cuda")
         dp.cuda_call(
@@ -1766,7 +1902,7 @@ class PI05FFN(nn.Module):
             rows * self.hidden_size,
             (rows, self.hidden_size),
         )
-        gate_up = dp.call_dps_packed(
+        gate_up = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 x_fp8,
@@ -1778,8 +1914,6 @@ class PI05FFN(nn.Module):
                 self.gate_up_w_scale,
             ],
             output_shape=(rows, 2 * self.intermediate_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         hidden = dp.empty((rows, self.intermediate_size), dtype="bfloat16", device="cuda")
         dp.cuda_call(
@@ -1800,7 +1934,7 @@ class PI05FFN(nn.Module):
             rows * self.intermediate_size,
             (rows, self.intermediate_size),
         )
-        return dp.call_dps_packed(
+        return _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 hidden_fp8,
@@ -1811,7 +1945,7 @@ class PI05FFN(nn.Module):
                 act1_scale,
                 self.down_w_scale,
             ],
-            output_like=x,
+            output_shape=(rows, self.hidden_size),
         )
 
 
@@ -1914,8 +2048,81 @@ class PI05DecoderLayer(nn.Module):
         )
         self._debug_name = prefix
 
-    def forward(self, hidden, cond):
-        return dp.adarms_norm(hidden, self.adarms_weight, cond, axes=(-1,), epsilon=self.eps)
+    def forward(
+        self,
+        hidden,
+        prefix_k_cache,
+        prefix_v_cache,
+        prefix_valid_rows,
+        rope_interleaved,
+        style_attn_table,
+        style_ffn_table,
+        step,
+    ):
+        rows = _static_dim(hidden, 0)
+        prefix_rows = _static_dim(prefix_k_cache, 1)
+        bf16_bytes = 2
+
+        prefix_layer_bytes = prefix_rows * self.num_kv_heads * self.head_dim * bf16_bytes
+        prefix_k = dp.tensor_view(
+            prefix_k_cache,
+            self.layer_idx,
+            (prefix_rows, self.num_kv_heads, self.head_dim),
+            byte_stride=prefix_layer_bytes,
+        )
+        prefix_v = dp.tensor_view(
+            prefix_v_cache,
+            self.layer_idx,
+            (prefix_rows, self.num_kv_heads, self.head_dim),
+            byte_stride=prefix_layer_bytes,
+        )
+        style_step_bytes = self.num_layers * rows * 3 * self.hidden_size * bf16_bytes
+        style_layer_offset = self.layer_idx * rows * 3 * self.hidden_size * bf16_bytes
+        style_attn = dp.tensor_view(
+            style_attn_table,
+            step,
+            (rows, 3 * self.hidden_size),
+            byte_stride=style_step_bytes,
+            base_offset=style_layer_offset,
+        )
+        style_ffn = dp.tensor_view(
+            style_ffn_table,
+            step,
+            (rows, 3 * self.hidden_size),
+            byte_stride=style_step_bytes,
+            base_offset=style_layer_offset,
+        )
+
+        normed = dp.adarms_norm(
+            hidden,
+            self.adarms_weight,
+            style_attn,
+            axes=(-1,),
+            epsilon=self.eps,
+        )
+        qkv = _fp8_linear_ref(normed, self.qkv_w_fp8, out_features=self.qkv_dim)
+        q, suffix_k, suffix_v = _qkv_views(
+            qkv,
+            rows,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        full_k = dp.cat([prefix_k, suffix_k], axis=0)
+        full_v = dp.cat([prefix_v, suffix_v], axis=0)
+        attn = dp.attention(q, full_k, full_v, scale=self.head_dim ** -0.5)
+        attn_flat = dp.reshape(attn, (rows, self.q_dim))
+        attn_out = _fp8_linear_ref(attn_flat, self.o_w_fp8, out_features=self.hidden_size)
+        hidden = dp.add(hidden, attn_out)
+
+        ffn_norm = dp.adarms_norm(
+            hidden,
+            self.adarms_weight,
+            style_ffn,
+            axes=(-1,),
+            epsilon=self.eps,
+        )
+        return dp.add(hidden, self.ffn(ffn_norm))
 
     def forward_fast(
         self,
@@ -2010,7 +2217,7 @@ class PI05DecoderLayer(nn.Module):
                 rows * self.hidden_size,
                 (rows, self.hidden_size),
             )
-        qkv = dp.call_dps_packed(
+        qkv = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 normed_fp8,
@@ -2022,8 +2229,6 @@ class PI05DecoderLayer(nn.Module):
                 self.qkv_w_scale,
             ],
             output_shape=(rows, self.qkv_dim),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         q = dp.empty((rows, self.num_q_heads, self.head_dim), dtype="bfloat16", device="cuda")
         full_k = dp.empty(
@@ -2063,7 +2268,7 @@ class PI05DecoderLayer(nn.Module):
                 ),
             ),
         )
-        attn = dp.call_dps_packed(
+        attn = _packed_call(
             "runtime.cuda.pi05_fa2_bf16",
             inputs=[
                 q,
@@ -2078,8 +2283,6 @@ class PI05DecoderLayer(nn.Module):
                 _f32_to_i64_bits(self.head_dim ** -0.5),
             ],
             output_shape=(rows, self.num_q_heads, self.head_dim),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         attn_flat = dp.tensor_view(attn, 0, (rows, self.q_dim))
         attn_fp8, attn_scale = _quantize_fp8_maybe_static(
@@ -2088,7 +2291,7 @@ class PI05DecoderLayer(nn.Module):
             (rows, self.q_dim),
             self.o_act_scale if self.use_static_act_scales else None,
         )
-        attn_out = dp.call_dps_packed(
+        attn_out = _packed_call(
             "runtime.cuda.fp8_nt_bf16",
             inputs=[
                 attn_fp8,
@@ -2100,8 +2303,6 @@ class PI05DecoderLayer(nn.Module):
                 self.o_w_scale,
             ],
             output_shape=(rows, self.hidden_size),
-            output_dtype="bfloat16",
-            output_device="cuda",
         )
         if self.use_static_act_scales:
             ffn_norm_fp8 = dp.empty((rows, self.hidden_size), dtype="fp8_e4m3", device="cuda")
@@ -2277,8 +2478,44 @@ class PI05DenoiseStep(nn.Module):
             bias_name="decoder_action_out_proj_b",
         )
 
-    def forward(self, action_embs, cond):
-        return dp.adarms_norm(action_embs, self.adarms_weight, cond, axes=(-1,), epsilon=self.eps)
+    def forward(
+        self,
+        actions_f32,
+        prefix_k_cache,
+        prefix_v_cache,
+        prefix_valid_rows,
+        rope_interleaved,
+        step,
+    ):
+        rows = _static_dim(actions_f32, 0)
+        hidden = self.action_in(actions_f32)
+        for layer in self.layers:
+            hidden = layer(
+                hidden,
+                prefix_k_cache,
+                prefix_v_cache,
+                prefix_valid_rows,
+                rope_interleaved,
+                self.style_attn_table,
+                self.style_ffn_table,
+                step,
+            )
+
+        style_step_bytes = self.action_horizon * 3 * self.hidden_size * 2
+        style_final = dp.tensor_view(
+            self.style_final_table,
+            step,
+            (rows, 3 * self.hidden_size),
+            byte_stride=style_step_bytes,
+        )
+        hidden_out = dp.adarms_norm(
+            hidden,
+            self.adarms_weight,
+            style_final,
+            axes=(-1,),
+            epsilon=self.eps,
+        )
+        return self.action_out(hidden_out)
 
     def forward_fast(
         self,
@@ -2409,13 +2646,17 @@ class PI05DenoiseLoop(nn.Module):
         prefix_valid_rows,
         rope_interleaved,
     ):
-        return self.forward_fast(
-            actions_f32,
-            prefix_k_cache,
-            prefix_v_cache,
-            prefix_valid_rows,
-            rope_interleaved,
-        )
+        for step in range(self.num_steps):
+            delta = self.stepper(
+                actions_f32,
+                prefix_k_cache,
+                prefix_v_cache,
+                prefix_valid_rows,
+                rope_interleaved,
+                step,
+            )
+            actions_f32 = dp.add(actions_f32, delta)
+        return actions_f32
 
     def forward_fast(
         self,
@@ -2455,6 +2696,36 @@ def _grid_1d(n: int | PrimExpr, block: int = 256) -> dp.KernelLaunchSpec:
 
 def _view_bf16_row(table, row: int, width: int):
     return dp.tensor_view(table, row, (width,), byte_stride=width * 2)
+
+
+def _fp8_linear_ref(x, weight, *, out_features: int):
+    return dp.matmul(x, weight, transpose_b=True, out_dtype="bfloat16")
+
+
+def _packed_call(
+    name: str,
+    inputs,
+    *,
+    output_shape,
+    output_dtype: str = "bfloat16",
+    output_device: str = "cuda",
+):
+    out = dp.empty(output_shape, dtype=output_dtype, device=output_device)
+    dp.call_dps_packed(name, inputs=[*inputs, out])
+    return out
+
+
+def _qkv_views(qkv, rows: int, num_q_heads: int, num_kv_heads: int, head_dim: int):
+    q_dim = num_q_heads * head_dim
+    kv_dim = num_kv_heads * head_dim
+    q = dp.tensor_view(qkv, 0, (rows, num_q_heads, head_dim))
+    k = dp.tensor_view(qkv, q_dim * 2, (rows, num_kv_heads, head_dim))
+    v = dp.tensor_view(qkv, (q_dim + kv_dim) * 2, (rows, num_kv_heads, head_dim))
+    return q, k, v
+
+
+def _add_bias_if_present(x, bias):
+    return dp.add(x, bias) if bias is not None else x
 
 
 def _quantize_fp8_maybe_static(x, n: int, output_shape, scale):

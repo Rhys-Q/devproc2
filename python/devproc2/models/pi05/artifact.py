@@ -10,8 +10,8 @@ from pathlib import Path
 import shutil
 from typing import Any
 
+from devproc2.kernel import KernelLaunchSpec, KernelSpec
 from devproc2.kernel.provider import CudaSourceProvider
-from devproc2.models.pi05.kernels import pi05_kernel_specs
 
 
 _DEFAULT_TOKENIZER = Path("/root/autodl-tmp/openpi/outputs/pi05_torch_infer/tokenizer.model")
@@ -56,6 +56,10 @@ def prepare_pi05_artifact(
     resources_dir.mkdir(exist_ok=True)
     kernels_dir.mkdir(exist_ok=True)
 
+    stale_catalog = metadata_dir / "pi05_kernel_catalog.json"
+    if stale_catalog.exists():
+        stale_catalog.unlink()
+
     manifest = _read_json_required(weight_package_dir / "manifest.json")
     index = _read_json_required(weight_package_dir / manifest.get("index_file", "weights.index.json"))
     weight_map_name = manifest.get("weight_map_file", "weight_map.json")
@@ -85,13 +89,14 @@ def prepare_pi05_artifact(
                 "sha256": _sha256(resources_dir / "tokenizer.model"),
             })
 
-    specs = pi05_kernel_specs(sm_arch=sm_arch)
-    kernel_catalog = [spec.to_json_obj() for spec in specs]
-    _write_json(metadata_dir / "pi05_kernel_catalog.json", kernel_catalog)
+    specs = _load_cuda_kernel_specs(metadata_dir / "kernel_table.json", sm_arch=sm_arch)
 
     if compile_kernels:
+        if not specs:
+            raise FileNotFoundError(
+                metadata_dir / "kernel_table.json",
+            )
         _compile_pi05_kernel_cubins(specs, artifact_dir, sm_arch=sm_arch, nvcc=nvcc)
-        _merge_kernel_table(metadata_dir / "kernel_table.json", kernel_catalog)
 
     weights_entries = len(index.get("entries", []))
     report = _read_json(report_path)
@@ -129,14 +134,60 @@ def prepare_pi05_artifact(
         "kernels": {
             "count": len(specs),
             "compiled": compile_kernels,
-            "table": (
-                "metadata/kernel_table.json"
-                if compile_kernels
-                else "metadata/pi05_kernel_catalog.json"
-            ),
+            "table": "metadata/kernel_table.json" if specs else None,
         },
     })
     return summary
+
+
+def _load_cuda_kernel_specs(path: Path, *, sm_arch: int) -> list[KernelSpec]:
+    table = _read_json(path)
+    if not isinstance(table, list):
+        return []
+    specs: list[KernelSpec] = []
+    for entry in table:
+        if not isinstance(entry, dict) or entry.get("backend") != "cuda":
+            continue
+        source = entry.get("source")
+        if not source:
+            continue
+        launch_obj = entry.get("launch")
+        launch = _launch_from_json(launch_obj) if isinstance(launch_obj, dict) else KernelLaunchSpec()
+        specs.append(
+            KernelSpec(
+                op_name=str(entry.get("op", f"cuda.{entry.get('symbol', '')}")),
+                device="cuda",
+                input_dtypes=(),
+                kernel_name=str(entry["name"]),
+                backend="cuda",
+                output_dtype=entry.get("output_dtype"),
+                symbol=str(entry.get("symbol", entry["name"])).removeprefix("kernel."),
+                sm_arches=(sm_arch,),
+                launch=launch,
+                source_path=str(source),
+                extra_nvcc_flags=("--std=c++17",),
+            )
+        )
+    return specs
+
+
+def _launch_from_json(data: dict[str, Any]) -> KernelLaunchSpec:
+    grid = data.get("grid", (1, 1, 1))
+    if not _launch_tuple_is_plain_ints(grid):
+        grid = (1, 1, 1)
+    return KernelLaunchSpec(
+        grid=tuple(grid),
+        block=tuple(data.get("block", (256, 1, 1))),
+        shared_memory_bytes=int(data.get("shared_memory_bytes", 0)),
+    )
+
+
+def _launch_tuple_is_plain_ints(value: object) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and all(isinstance(item, int) for item in value)
+    )
 
 
 def _compile_pi05_kernel_cubins(
@@ -167,19 +218,6 @@ def _compile_pi05_kernel_cubins(
         path = artifact_dir / str(spec.cubin_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(cubin_bytes)
-
-
-def _merge_kernel_table(path: Path, entries: list[dict[str, Any]]) -> None:
-    existing = _read_json(path)
-    table: list[dict[str, Any]]
-    if isinstance(existing, list):
-        table = list(existing)
-    else:
-        table = []
-    by_name = {str(entry.get("name")): entry for entry in table if isinstance(entry, dict)}
-    for entry in entries:
-        by_name[str(entry["name"])] = entry
-    _write_json(path, list(by_name.values()))
 
 
 def _copy_required(src: Path, dst: Path) -> None:

@@ -303,6 +303,7 @@ class CudaCallOp(Op):
     extra_nvcc_flags: tuple[str, ...] = ()
     compile_options: Mapping[str, object] = field(default_factory=dict)
     params: tuple[object, ...] = ()
+    param_names: tuple[str, ...] = ()
     input_dtypes: tuple[str, ...] = ()
     output_dtype: str | None = None
     kernel_name: str | None = None
@@ -318,6 +319,7 @@ class CudaCallOp(Op):
         object.__setattr__(self, "extra_nvcc_flags", tuple(self.extra_nvcc_flags))
         object.__setattr__(self, "compile_options", dict(self.compile_options))
         object.__setattr__(self, "params", tuple(self.params))
+        object.__setattr__(self, "param_names", tuple(str(v) for v in self.param_names))
         object.__setattr__(self, "input_dtypes", tuple(str(v) for v in self.input_dtypes))
         n_args = len(self.args)
         bad = [i for i in self.output_indices if i < 0 or i >= n_args]
@@ -366,6 +368,7 @@ class CudaCallOp(Op):
             extra_nvcc_flags=self.extra_nvcc_flags,
             compile_options=self.compile_options,
             params=self.params,
+            param_names=self.param_names,
             input_dtypes=self.input_dtypes,
             output_dtype=self.output_dtype,
             kernel_name=self.kernel_name,

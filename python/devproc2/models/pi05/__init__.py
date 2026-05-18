@@ -45,14 +45,6 @@ from devproc2.models.pi05.export import (
     pi05_sample_actions_tokens_input_specs,
     pi05_vision_encoder_input_specs,
 )
-from devproc2.models.pi05.kernels import (
-    PI05_KERNELS,
-    pi05_cuda_call_metadata,
-    pi05_cuda_source_path,
-    pi05_cuda_source_symbol,
-    pi05_kernel_specs,
-    register_pi05_kernels,
-)
 from devproc2.models.pi05.modules import (
     PI05Attention,
     PI05DecoderLayer,
@@ -78,7 +70,6 @@ from devproc2.models.pi05.weights import (
 )
 
 __all__ = [
-    "PI05_KERNELS",
     "PI05Attention",
     "PI05DecoderLayer",
     "PI05DenoiseLoop",
@@ -141,10 +132,5 @@ __all__ = [
     "pi05_sample_actions_precomputed_prefix_input_specs",
     "pi05_sample_actions_tokens_input_specs",
     "pi05_vision_encoder_input_specs",
-    "pi05_kernel_specs",
-    "pi05_cuda_call_metadata",
-    "pi05_cuda_source_path",
-    "pi05_cuda_source_symbol",
-    "register_pi05_kernels",
     "select_fp8_layout",
 ]

@@ -230,8 +230,7 @@ top CUDA kernels by total device time:
 ```bash
 PYTHONPATH=python pytest \
   tests/compiler/test_pi05_weight_package.py \
-  tests/compiler/test_pi05_artifact.py \
-  tests/compiler/test_pi05_kernel_catalog.py -q
+  tests/compiler/test_pi05_artifact.py -q
 
 cmake -S . -B build/root-cuda \
   -DDEVPROC2_WITH_CUDA=ON \

@@ -28,6 +28,7 @@ from devproc2.compiler.op.schema import (
 )
 from devproc2.compiler.op.tensor import (
     add,
+    cast,
     cat,
     embedding,
     equal,
@@ -35,6 +36,7 @@ from devproc2.compiler.op.tensor import (
     greater,
     greater_equal,
     identity,
+    image_patch_im2col,
     less,
     less_equal,
     matmul,
@@ -48,8 +50,10 @@ from devproc2.compiler.op.tensor import (
 )
 from devproc2.compiler.op.nn import (
     adarms_norm,
+    attention,
     layer_norm,
     rms_norm,
+    rms_norm_unit,
 )
 
 
@@ -70,7 +74,9 @@ __all__ = [
     "StandardOp",
     "add",
     "adarms_norm",
+    "attention",
     "call",
+    "cast",
     "cat",
     "embedding",
     "equal",
@@ -81,6 +87,7 @@ __all__ = [
     "greater",
     "greater_equal",
     "identity",
+    "image_patch_im2col",
     "infer_struct_info",
     "layer_norm",
     "less",
@@ -96,6 +103,7 @@ __all__ = [
     "register_op",
     "require",
     "rms_norm",
+    "rms_norm_unit",
     "set_current_emitter",
     "silu",
     "transpose",

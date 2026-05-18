@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+import ast
+import inspect
 import json
 from pathlib import Path
+import textwrap
 from typing import Any
 
 import devproc2 as dp
@@ -19,8 +22,8 @@ from devproc2.compiler.passes.lower_tensor_create_to_alloc import LowerTensorCre
 from devproc2.compiler.passes.memory_planning import MemoryPlanningPass
 from devproc2.compiler.passes.vm_codegen import VMCodegenPass
 from devproc2.ir.nodes import Function, IRModule
-from devproc2.ir.ops import ReturnOp
-from devproc2.nn import GraphBuilder, ScalarSpec, TensorSpec
+from devproc2.ir.ops import CallDPSOp, CudaCallOp, ReturnOp
+from devproc2.nn import GraphBuilder, Module, ModuleList, ScalarSpec, TensorSpec
 from devproc2.models.pi05.artifact import Pi05ArtifactSummary, prepare_pi05_artifact
 from devproc2.models.pi05.modules import (
     PI05DenoiseLoop,
@@ -56,6 +59,8 @@ DEFAULT_VISION_HIDDEN_SIZE = 1152
 DEFAULT_VISION_INTERMEDIATE_SIZE = 4304
 DEFAULT_VISION_HEADS = 16
 DEFAULT_VISION_OUTPUT_SIZE = 2048
+
+PI05CompileMode = str
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,73 @@ class Pi05DenoiseExportSummary:
             payload["tokenizer"] = self.resource_summary.tokenizer
             payload["fp8_layout"] = self.resource_summary.fp8_layout
         return payload
+
+
+def _normalize_compile_mode(compile_mode: PI05CompileMode) -> str:
+    if compile_mode not in ("fast", "normal"):
+        raise ValueError("compile_mode must be 'fast' or 'normal'")
+    return str(compile_mode)
+
+
+def _select_method(module: Module, compile_mode: PI05CompileMode, *, normal: str = "forward"):
+    compile_mode = _normalize_compile_mode(compile_mode)
+    _validate_pi05_module_contract(module, compile_mode)
+    if compile_mode == "fast" and hasattr(module, "forward_fast"):
+        return getattr(module, "forward_fast")
+    return getattr(module, normal)
+
+
+def _build_pi05_graph(
+    module: Module,
+    input_specs: dict[str, object],
+    *,
+    function_name: str,
+    compile_mode: PI05CompileMode,
+    normal: str = "forward",
+) -> tuple[IRModule, int]:
+    method = _select_method(module, compile_mode, normal=normal)
+    ir_module = GraphBuilder().build(method, input_specs)
+    if compile_mode == "normal":
+        _assert_normal_pi05_ir(ir_module)
+    method_name = getattr(method, "__name__", "main")
+    fn = ir_module.functions[method_name]
+    if function_name != method_name:
+        ir_module = IRModule({function_name: fn})
+    return ir_module, len(input_specs)
+
+
+def _validate_pi05_module_contract(root: Module, compile_mode: str) -> None:
+    for path, module in root.named_modules():
+        if isinstance(module, ModuleList):
+            continue
+        forward = type(module).__dict__.get("forward")
+        if forward is None or forward is Module.forward:
+            name = path or type(module).__name__
+            raise RuntimeError(f"{name}: Pi0.5 modules must implement forward()")
+        if _method_source_mentions(forward, "forward_fast"):
+            name = path or type(module).__name__
+            raise RuntimeError(f"{name}.forward() must not call forward_fast()")
+
+
+def _method_source_mentions(method, attr_name: str) -> bool:
+    try:
+        source = textwrap.dedent(inspect.getsource(method))
+    except (OSError, TypeError):
+        return False
+    tree = ast.parse(source)
+    return any(
+        isinstance(node, ast.Attribute) and node.attr == attr_name
+        for node in ast.walk(tree)
+    )
+
+
+def _assert_normal_pi05_ir(module: IRModule) -> None:
+    for fn_name, fn in module.functions.items():
+        for op in fn.body.entry_block.ops:
+            if isinstance(op, CudaCallOp):
+                raise RuntimeError(f"{fn_name}: normal Pi0.5 path emitted cuda_call")
+            if isinstance(op, CallDPSOp):
+                raise RuntimeError(f"{fn_name}: normal Pi0.5 path emitted DPS/packed call")
 
 
 def pi05_denoise_input_specs(
@@ -314,6 +386,7 @@ def build_pi05_denoise_module(
     head_dim: int = DEFAULT_HEAD_DIM,
     device: str = "cuda",
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build the Pi0.5 denoise fast-path IR module."""
@@ -344,11 +417,12 @@ def build_pi05_denoise_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(denoise.forward_fast, input_specs)
-    fn = module.functions["forward_fast"]
-    if function_name != "forward_fast":
-        module = IRModule({function_name: fn})
-    return module, len(input_specs)
+    return _build_pi05_graph(
+        denoise,
+        input_specs,
+        function_name=function_name,
+        compile_mode=compile_mode,
+    )
 
 
 def _build_pi05_denoise_loop_module_with_specs(
@@ -366,6 +440,7 @@ def _build_pi05_denoise_loop_module_with_specs(
     head_dim: int,
     device: str,
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
 ) -> tuple[IRModule, int]:
     denoise_loop = PI05DenoiseLoop(
         num_layers=num_layers,
@@ -380,11 +455,12 @@ def _build_pi05_denoise_loop_module_with_specs(
         device=device,
         use_static_act_scales=use_static_act_scales,
     )
-    module = GraphBuilder().build(denoise_loop.forward_fast, input_specs)
-    fn = module.functions["forward_fast"]
-    if function_name != "forward_fast":
-        module = IRModule({function_name: fn})
-    return module, len(input_specs)
+    return _build_pi05_graph(
+        denoise_loop,
+        input_specs,
+        function_name=function_name,
+        compile_mode=compile_mode,
+    )
 
 
 def build_pi05_denoise_loop_module(
@@ -402,6 +478,7 @@ def build_pi05_denoise_loop_module(
     head_dim: int = DEFAULT_HEAD_DIM,
     device: str = "cuda",
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build the Pi0.5 fixed-step denoise loop IR module."""
@@ -433,6 +510,7 @@ def build_pi05_denoise_loop_module(
         head_dim=head_dim,
         device=device,
         use_static_act_scales=use_static_act_scales,
+        compile_mode=compile_mode,
     )
 
 
@@ -451,6 +529,7 @@ def build_pi05_sample_actions_precomputed_prefix_module(
     head_dim: int = DEFAULT_HEAD_DIM,
     device: str = "cuda",
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build sample_actions back-half IR with caller-supplied prefix KV."""
@@ -482,6 +561,7 @@ def build_pi05_sample_actions_precomputed_prefix_module(
         head_dim=head_dim,
         device=device,
         use_static_act_scales=use_static_act_scales,
+        compile_mode=compile_mode,
     )
 
 
@@ -502,6 +582,7 @@ def build_pi05_sample_actions_precomputed_prefix_embs_module(
     head_dim: int = DEFAULT_HEAD_DIM,
     device: str = "cuda",
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build sample_actions IR from caller-supplied prefix embeddings."""
@@ -531,11 +612,12 @@ def build_pi05_sample_actions_precomputed_prefix_embs_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(sample.forward_fast, input_specs)
-    fn = module.functions["forward_fast"]
-    if function_name != "forward_fast":
-        module = IRModule({function_name: fn})
-    return module, len(input_specs)
+    return _build_pi05_graph(
+        sample,
+        input_specs,
+        function_name=function_name,
+        compile_mode=compile_mode,
+    )
 
 
 def build_pi05_sample_actions_tokens_module(
@@ -565,6 +647,7 @@ def build_pi05_sample_actions_tokens_module(
     head_dim: int = DEFAULT_HEAD_DIM,
     device: str = "cuda",
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build sample_actions IR from images and token ids."""
@@ -607,11 +690,12 @@ def build_pi05_sample_actions_tokens_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(sample.forward_fast, input_specs)
-    fn = module.functions["forward_fast"]
-    if function_name != "forward_fast":
-        module = IRModule({function_name: fn})
-    return module, len(input_specs)
+    return _build_pi05_graph(
+        sample,
+        input_specs,
+        function_name=function_name,
+        compile_mode=compile_mode,
+    )
 
 
 def build_pi05_vision_encoder_module(
@@ -628,6 +712,7 @@ def build_pi05_vision_encoder_module(
     output_size: int = DEFAULT_VISION_OUTPUT_SIZE,
     device: str = "cuda",
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build the SigLIP vision encoder IR module for the prefix path."""
@@ -653,11 +738,12 @@ def build_pi05_vision_encoder_module(
         image_channels=image_channels,
         device=device,
     )
-    module = GraphBuilder().build(encoder.forward_fast, input_specs)
-    fn = module.functions["forward_fast"]
-    if function_name != "forward_fast":
-        module = IRModule({function_name: fn})
-    return module, len(input_specs)
+    return _build_pi05_graph(
+        encoder,
+        input_specs,
+        function_name=function_name,
+        compile_mode=compile_mode,
+    )
 
 
 def build_pi05_paligemma_prefix_encoder_module(
@@ -672,6 +758,7 @@ def build_pi05_paligemma_prefix_encoder_module(
     head_dim: int = DEFAULT_HEAD_DIM,
     device: str = "cuda",
     use_static_act_scales: bool = False,
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build the compact PaliGemma prefix transformer IR module."""
@@ -694,11 +781,12 @@ def build_pi05_paligemma_prefix_encoder_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(encoder.forward_fast, input_specs)
-    fn = module.functions["forward_fast"]
-    if function_name != "forward_fast":
-        module = IRModule({function_name: fn})
-    return module, len(input_specs)
+    return _build_pi05_graph(
+        encoder,
+        input_specs,
+        function_name=function_name,
+        compile_mode=compile_mode,
+    )
 
 
 def build_pi05_paligemma_prefix_kv_encoder_module(
@@ -713,6 +801,7 @@ def build_pi05_paligemma_prefix_kv_encoder_module(
     head_dim: int = DEFAULT_HEAD_DIM,
     use_static_act_scales: bool = False,
     device: str = "cuda",
+    compile_mode: PI05CompileMode = "fast",
     reset_dsl: bool = True,
 ) -> tuple[IRModule, int]:
     """Build the compact PaliGemma prefix transformer plus KV-cache outputs."""
@@ -735,25 +824,31 @@ def build_pi05_paligemma_prefix_kv_encoder_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(encoder.forward_fast, input_specs)
-    fn = module.functions["forward_fast"]
-    if function_name != "forward_fast":
-        module = IRModule({function_name: fn})
-    return module, len(input_specs)
+    return _build_pi05_graph(
+        encoder,
+        input_specs,
+        function_name=function_name,
+        compile_mode=compile_mode,
+        normal="forward_kv",
+    )
 
 
-def compile_pi05_denoise_executable(
+def _compile_pi05_ir_module(
+    module: IRModule,
+    num_user_inputs: int,
     *,
-    sm_arch: int = 89,
-    **module_kwargs: Any,
+    sm_arch: int,
+    compile_mode: PI05CompileMode,
 ) -> Pi05DenoiseCompileResult:
-    """Compile the denoise fast path to VM bytecode structures."""
-
-    module, num_user_inputs = build_pi05_denoise_module(**module_kwargs)
+    compile_mode = _normalize_compile_mode(compile_mode)
     module = InferStructInfoPass().run(module)
     module = _stamp_single_return_struct_info(module)
     abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
+    module = DPSLoweringPass(
+        dsl.get_kernel_registry(),
+        sm_arch=sm_arch,
+        reference_fallback=(compile_mode == "normal"),
+    ).run(module)
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     module = LowerTensorCreateToAllocPass(ctx).run(module)
@@ -767,6 +862,22 @@ def compile_pi05_denoise_executable(
     )
 
 
+def compile_pi05_denoise_executable(
+    *,
+    sm_arch: int = 89,
+    **module_kwargs: Any,
+) -> Pi05DenoiseCompileResult:
+    """Compile the denoise fast path to VM bytecode structures."""
+
+    module, num_user_inputs = build_pi05_denoise_module(**module_kwargs)
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
+    )
+
+
 def compile_pi05_denoise_loop_executable(
     *,
     sm_arch: int = 89,
@@ -775,20 +886,11 @@ def compile_pi05_denoise_loop_executable(
     """Compile the unrolled denoise loop to VM bytecode structures."""
 
     module, num_user_inputs = build_pi05_denoise_loop_module(**module_kwargs)
-    module = InferStructInfoPass().run(module)
-    module = _stamp_single_return_struct_info(module)
-    abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
-    ctx = PassContext()
-    MemoryPlanningPass().run(module, ctx)
-    module = LowerTensorCreateToAllocPass(ctx).run(module)
-    exe = VMCodegenPass().run(module)
-    return Pi05DenoiseCompileResult(
-        module=abi_module,
-        lowered_module=module,
-        executable=exe,
-        context=ctx,
-        num_user_inputs=num_user_inputs,
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
     )
 
 
@@ -802,20 +904,11 @@ def compile_pi05_sample_actions_precomputed_prefix_executable(
     module, num_user_inputs = build_pi05_sample_actions_precomputed_prefix_module(
         **module_kwargs
     )
-    module = InferStructInfoPass().run(module)
-    module = _stamp_single_return_struct_info(module)
-    abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
-    ctx = PassContext()
-    MemoryPlanningPass().run(module, ctx)
-    module = LowerTensorCreateToAllocPass(ctx).run(module)
-    exe = VMCodegenPass().run(module)
-    return Pi05DenoiseCompileResult(
-        module=abi_module,
-        lowered_module=module,
-        executable=exe,
-        context=ctx,
-        num_user_inputs=num_user_inputs,
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
     )
 
 
@@ -829,20 +922,11 @@ def compile_pi05_sample_actions_precomputed_prefix_embs_executable(
     module, num_user_inputs = build_pi05_sample_actions_precomputed_prefix_embs_module(
         **module_kwargs
     )
-    module = InferStructInfoPass().run(module)
-    module = _stamp_single_return_struct_info(module)
-    abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
-    ctx = PassContext()
-    MemoryPlanningPass().run(module, ctx)
-    module = LowerTensorCreateToAllocPass(ctx).run(module)
-    exe = VMCodegenPass().run(module)
-    return Pi05DenoiseCompileResult(
-        module=abi_module,
-        lowered_module=module,
-        executable=exe,
-        context=ctx,
-        num_user_inputs=num_user_inputs,
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
     )
 
 
@@ -856,20 +940,11 @@ def compile_pi05_sample_actions_tokens_executable(
     module, num_user_inputs = build_pi05_sample_actions_tokens_module(
         **module_kwargs
     )
-    module = InferStructInfoPass().run(module)
-    module = _stamp_single_return_struct_info(module)
-    abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
-    ctx = PassContext()
-    MemoryPlanningPass().run(module, ctx)
-    module = LowerTensorCreateToAllocPass(ctx).run(module)
-    exe = VMCodegenPass().run(module)
-    return Pi05DenoiseCompileResult(
-        module=abi_module,
-        lowered_module=module,
-        executable=exe,
-        context=ctx,
-        num_user_inputs=num_user_inputs,
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
     )
 
 
@@ -881,20 +956,11 @@ def compile_pi05_vision_encoder_executable(
     """Compile the SigLIP vision encoder prefix slice to VM bytecode."""
 
     module, num_user_inputs = build_pi05_vision_encoder_module(**module_kwargs)
-    module = InferStructInfoPass().run(module)
-    module = _stamp_single_return_struct_info(module)
-    abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
-    ctx = PassContext()
-    MemoryPlanningPass().run(module, ctx)
-    module = LowerTensorCreateToAllocPass(ctx).run(module)
-    exe = VMCodegenPass().run(module)
-    return Pi05DenoiseCompileResult(
-        module=abi_module,
-        lowered_module=module,
-        executable=exe,
-        context=ctx,
-        num_user_inputs=num_user_inputs,
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
     )
 
 
@@ -906,20 +972,11 @@ def compile_pi05_paligemma_prefix_encoder_executable(
     """Compile the compact PaliGemma prefix encoder to VM bytecode."""
 
     module, num_user_inputs = build_pi05_paligemma_prefix_encoder_module(**module_kwargs)
-    module = InferStructInfoPass().run(module)
-    module = _stamp_single_return_struct_info(module)
-    abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
-    ctx = PassContext()
-    MemoryPlanningPass().run(module, ctx)
-    module = LowerTensorCreateToAllocPass(ctx).run(module)
-    exe = VMCodegenPass().run(module)
-    return Pi05DenoiseCompileResult(
-        module=abi_module,
-        lowered_module=module,
-        executable=exe,
-        context=ctx,
-        num_user_inputs=num_user_inputs,
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
     )
 
 
@@ -933,20 +990,11 @@ def compile_pi05_paligemma_prefix_kv_encoder_executable(
     module, num_user_inputs = build_pi05_paligemma_prefix_kv_encoder_module(
         **module_kwargs
     )
-    module = InferStructInfoPass().run(module)
-    module = _stamp_single_return_struct_info(module)
-    abi_module = module
-    module = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=sm_arch).run(module)
-    ctx = PassContext()
-    MemoryPlanningPass().run(module, ctx)
-    module = LowerTensorCreateToAllocPass(ctx).run(module)
-    exe = VMCodegenPass().run(module)
-    return Pi05DenoiseCompileResult(
-        module=abi_module,
-        lowered_module=module,
-        executable=exe,
-        context=ctx,
-        num_user_inputs=num_user_inputs,
+    return _compile_pi05_ir_module(
+        module,
+        num_user_inputs,
+        sm_arch=sm_arch,
+        compile_mode=module_kwargs.get("compile_mode", "fast"),
     )
 
 
@@ -1554,6 +1602,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--sm-arch", type=int, default=89)
     parser.add_argument("--use-static-act-scales", action="store_true")
     parser.add_argument("--no-compile-kernels", action="store_true")
+    parser.add_argument("--compile-mode", choices=("fast", "normal"), default="fast")
     args = parser.parse_args(argv)
 
     if args.entry_kind == "loop":
@@ -1587,6 +1636,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.entry_kind == "vision_encoder":
         kwargs["num_views"] = args.num_views
     kwargs["use_static_act_scales"] = args.use_static_act_scales
+    kwargs["compile_mode"] = args.compile_mode
     summary = exporter(
         artifact_dir=args.artifact_dir,
         weight_package_dir=args.weight_package_dir,
