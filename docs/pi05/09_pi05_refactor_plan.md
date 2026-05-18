@@ -99,32 +99,34 @@ dp.call_dps_packed(
 
 ## 目标形态
 
-重构后的 Pi0.5 目录应该让每一层只知道自己该知道的东西。关键原则是：不要按 normal/fast 拆成两套模型；同一个 Module 仍然同时拥有 `forward()` 和 `forward_fast()`，只是 `forward_fast()` 通过受控 facade 接入 HPC 后端。
+重构后的 Pi0.5 目录应该只保留 Pi0.5 业务模型资产。Pi0.5 是 devproc2 内置业务模型，不是 plugin；但它也不应该重新实现 framework export、artifact、oracle、quantization pipeline。关键原则是：不要按 normal/fast 拆成两套模型；同一个 Module 仍然同时拥有 `forward()` 和 `forward_fast()`，只是 `forward_fast()` 通过 Pi0.5 CUDA/HPC op 边界接入高性能后端。
 
-另一个必须钉死的边界是：precision/quantization 可以决定 DSL graph variant，device/architecture 只能决定 backend lowering variant。FP8 量化和 FP16/BF16 非量化路径不必强行共享同一张 DSL 图；FP8 引入 scale、quant/dequant、FP8 artifact layout、fused norm/activation-to-FP8 等可见数值路径，硬塞进一张图只会制造到处都是 `if quantized` 的脏抽象。4090、Thor 这类 target 则不应该拆模型图；它们共享同一个 precision graph，通过 `forward_fast(ctx)`、`pi05_ops` 和 backend registry 选择不同手写 kernel。
+另一个必须钉死的边界是：precision/quantization 可以决定 DSL graph variant，device/architecture 只能决定 backend lowering variant。FP8 量化和 FP16/BF16 非量化路径不必强行共享同一张 DSL 图；FP8 引入 scale、quant/dequant、FP8 artifact layout、fused norm/activation-to-FP8 等可见数值路径，硬塞进一张图只会制造到处都是 `if quantized` 的脏抽象。4090、Thor 这类 target 则不应该拆模型图；它们共享同一个 precision graph，通过 `ops.py` / lowering / kernel registry 选择不同手写 kernel。
 
-- `model/*.py`：Pi0.5 Module 结构，每个 Module 内保留 `forward()` / `forward_fast(ctx)` 双路径；FP8 和非 FP8 可以导出不同 fast graph variant，但共享 Module skeleton 和非量化子图 helper。
-- `ops.py` 或 `pi05_ops.py`：Pi0.5 high-level primitives，封装 CUDA source kernel 和 packed func；接受 `FastContext` / target profile，由 lowering 选择 4090、Thor 或 fallback backend。
-- `layout.py`：QKV、KV cache、style table、FP8 weight layout 的唯一事实来源。
-- `target.py` 或 backend target profile：描述 `precision`、`target`、`layout`、`quant_profile`、kernel capability，不让模型代码直接判断 `sm89` / `thor`。
+- `config.py`：唯一的 Pi0.5 配置入口，定义 `PI05Config` dataclass；模型结构、shape、entrypoint、precision/quantization variant、layout/fusion policy、kernel source 列表、artifact recipe 默认值都从这里来。
+- `model.py`：Pi0.5 Module 结构，每个 Module 内保留 `forward()` / `forward_fast()` 双路径；FP8 和非 FP8 可以导出不同 fast graph variant，但共享 Module skeleton 和非量化子图 helper。
+- `ops.py` 或 `pi05_ops.py`：Pi0.5 专用 CUDA/HPC op 边界，封装手写 kernel、packed func、kernel spec 注册和 target-specific kernel 选择；这是 CUDA 相关文件，应该保留在 Pi0.5 目录。
+- `weights.py`：Pi0.5 checkpoint conversion、deploy fusion mapping、weight package assembly；消费 `PI05Config`、框架层 quantization manifest 和 requant helper，不自研量化算法。
 - `cuda/`：Pi0.5 自有 CUDA source、vendored kernel 子集和本模型专用 backend wrapper 的唯一归属地。
+- `python/devproc2/export/`：框架层构图、compile、emit executable/ABI、entrypoint selection、CLI scaffolding。
+- `python/devproc2/artifact/`：框架层 artifact builder、resource copy、kernel packaging、manifest 写入。
 - `python/devproc2/quantization/`：框架层 quantization manifest schema、通用 requant helper 和 fusion/requant 规则；不依赖业务 PyTorch 模型，不引入 ModelOpt runtime 依赖。
 - `python/devproc2/integrations/modelopt/` 或 `tools/quant/modelopt_export.py`：可选生产端 exporter，从业务侧已经量化好的 PyTorch model / ModelOpt state 导出标准 manifest；不进入 runtime，也不放进 Pi0.5 模型目录。
-- `weights.py`：Pi0.5 checkpoint conversion、deploy fusion mapping、weight package assembly；消费 layout/spec/框架层 quantization manifest，不自研量化算法。
-- `export.py`：构图、compile、artifact export orchestration；不承载模型细节。
+- `tools/pi05/dump_torch_oracle.py`：OpenPI/PyTorch oracle producer；devproc2 可以消费 oracle artifact，但 Pi0.5 runtime/model package 不拥有业务 PyTorch producer。
 
 目标不是让文件数量变多，而是让依赖方向变干净：
 
 ```text
-model modules -> pi05_ops -> devproc2 DSL/backend
-model modules -> layout
-weights       -> layout
-weights       -> devproc2.quantization
-export        -> model entrypoints
-export        -> target/precision graph variant selection
+model.py      -> ops.py -> devproc2 DSL/backend
+model.py      -> config.py
+ops.py        -> config.py / cuda/
+weights.py    -> config.py
+weights.py    -> devproc2.quantization
+devproc2.export   -> PI05Config / PI05Model
+devproc2.artifact -> PI05Config artifact recipe
 ```
 
-Module 可以知道“这里有一个 fast implementation”，也可以根据 `ctx.precision` 进入 FP8 或 BF16/FP16 fast helper；但 Module 不应该知道 CUDA 参数顺序、target-specific kernel symbol 或 device-specific launch 策略。`layout.py` 不应该调用 CUDA；`weights.py` 不应该构图；`export.py` 不应该理解 QKV byte stride。
+Module 可以知道“这里有一个 fast implementation”，也可以根据 `PI05Config.precision` 或构图时传入的 dtype/quant mode 进入 FP8 或 BF16/FP16 fast helper；但 Module 不应该知道 CUDA 参数顺序、target-specific kernel symbol 或 device-specific launch 策略。`ops.py` 可以知道这些 CUDA 细节；`weights.py` 不应该构图；Pi0.5 目录不应该拥有长期 `export.py`、`artifact.py` 或 `torch_oracle.py`。
 
 ## 重构方案
 
@@ -135,16 +137,16 @@ Module 可以知道“这里有一个 fast implementation”，也可以根据 `
 - 每个 `nn.Module` 必须实现 `forward()`。
 - `forward()` 禁止引用 `forward_fast`。
 - normal compile 只能使用 standard op；构图后不得出现 `CudaCallOp`、`CallDPSOp`、backend packed func。
-- Pi0.5 模型层禁止直接调用 `dp.cuda_call`、`dp.call_dps_packed`、`dp.tensor_view`；CUDA/packed 只能出现在 `pi05_ops.py` 这类受控边界，tensor 切片必须通过标准 `select`、`slice`、`index`、`split`、`reshape` 表达。
+- Pi0.5 `model.py` 禁止直接调用 `dp.cuda_call`、`dp.call_dps_packed`、`dp.tensor_view`；CUDA/packed 只能出现在 `ops.py` / `pi05_ops.py` 这类受控边界，tensor 切片必须通过标准 `select`、`slice`、`index`、`split`、`reshape` 表达。
 - fast path 允许 fallback 到 `forward()`，但 fallback 由 compile mode 选择逻辑完成，不由子模块手动调用。
-- `forward_fast()` 接受显式 context/profile，至少包含 `precision` 和 `target`；模型层最多按 `precision` 选择 FP8 / 非 FP8 graph variant，不允许按 4090、Thor、SM 版本散落分支。
-- 同一个 `nn.Module` 可以实现 4090 和 Thor 的 fast path，但 target 分发必须停在 `pi05_ops` / lowering / backend registry，不能在 layer 主体里手写不同 kernel symbol。
+- `forward_fast()` 不强制接受 `ctx`；precision/quant mode 可以来自 `PI05Config`、构图参数或显式 dtype 参数。模型层最多按 precision/quant mode 选择 FP8 / 非 FP8 graph variant，不允许按 4090、Thor、SM 版本散落分支。
+- 同一个 `nn.Module` 可以实现 4090 和 Thor 的 fast path，但 target 分发必须停在 `ops.py` / lowering / backend registry，不能在 layer 主体里手写不同 kernel symbol。
 
 这一步先以 lint/test 约束落地，不急着一次性拆完所有文件。先把“以后不许继续变脏”钉住。
 
 ### 2. 建立 Pi0.5 fast primitive facade
 
-把裸 backend 调用集中收口成 Pi0.5 私有 primitive。模型层调用：
+把裸 backend 调用集中收口成 Pi0.5 私有 CUDA/HPC primitive。模型层调用：
 
 ```python
 qkv = pi05_ops.fp8_linear(x, weight, x_scale, w_scale, out_shape)
@@ -175,7 +177,7 @@ dp.call_dps_packed("runtime.cuda.fp8_nt_bf16_accum", inputs=[...])
 - `geglu_to_fp8(...)`
 - `attention_fa2(...)`
 
-facade 初期可以沿用现有 `dp.cuda_call` 和 `dp.call_dps_packed` 形态，先保证性能路径不变；但 `attention_fa2(...)` 的最终 lowering 必须指向 Pi0.5-owned CUDA kernel 或 Pi0.5-owned runtime backend，不能继续指向 FlashRT 产物。变化不是把 ABI 换个地方藏起来，而是先从模型层赶出去，再把 Pi0.5 专用 backend ownership 收回来。
+`ops.py` 初期可以沿用现有 `dp.cuda_call` 和 `dp.call_dps_packed` 形态，先保证性能路径不变；但 `attention_fa2(...)` 的最终 lowering 必须指向 Pi0.5-owned CUDA kernel 或 Pi0.5-owned runtime backend，不能继续指向 FlashRT 产物。变化不是把 ABI 换个地方藏起来，而是先从 `model.py` 赶出去，再把 Pi0.5 专用 backend ownership 收回来。
 
 ### 3. 固化 precision graph variant 和 target lowering 边界
 
@@ -198,28 +200,37 @@ bf16/fp16 graph
 推荐接口形态：
 
 ```python
+@dataclass(frozen=True)
+class PI05Config:
+    precision: str = "fp8"
+    target: str = "rtx4090_sm89"
+    fp8_layout: str = "nk"
+
 class PI05DecoderLayer(nn.Module):
-    def forward_fast(self, hidden, *, ctx: PI05FastContext):
-        if ctx.precision == "fp8":
-            return self._forward_fast_fp8(hidden, ctx)
-        return self._forward_fast_bf16(hidden, ctx)
+    def __init__(self, config: PI05Config, layer_idx: int):
+        self.config = config
+
+    def forward_fast(self, hidden):
+        if self.config.precision == "fp8":
+            return self._forward_fast_fp8(hidden)
+        return self._forward_fast_bf16(hidden)
 ```
 
 这里允许按 `precision` 选择 graph variant，因为量化和非量化确实是不同数值路径；但不允许在 layer 主体里写：
 
 ```python
-if ctx.target == "rtx4090_sm89":
+if self.config.target == "rtx4090_sm89":
     dp.cuda_call("pi05_xxx_sm89", ...)
-elif ctx.target == "thor":
+elif self.config.target == "thor":
     dp.cuda_call("pi05_xxx_thor", ...)
 ```
 
-target-specific 分发必须写在 `pi05_ops` / lowering registry：
+target-specific 分发必须写在 `ops.py` / lowering registry：
 
 ```python
-qkv = pi05_ops.fp8_linear(hidden, self.qkv, ctx=ctx)
-q, k, v = pi05_ops.qkv_split_rope_cache(qkv, rope, cache, ctx=ctx)
-attn = pi05_ops.attention(q, k, v, cache=cache, ctx=ctx)
+qkv = pi05_ops.fp8_linear(hidden, self.qkv, config=self.config)
+q, k, v = pi05_ops.qkv_split_rope_cache(qkv, rope, cache, config=self.config)
+attn = pi05_ops.attention(q, k, v, cache=cache, config=self.config)
 ```
 
 对应 lowering 规则：
@@ -494,9 +505,9 @@ common_input_scale = max(common_input_amax / 448.0, 1e-12)
 - 是否从 original FP/BF16 weight 重新量化，而不是拼接已量化 FP8。
 - devproc2 target layout：`nk` / `kn`。
 
-### 9. 权重/layout spec 集中化
+### 9. `PI05Config` / `weights.py` spec 集中化
 
-新增 `layout.py` 或 `weight_spec.py`，集中定义：
+不新增长期 `layout.py` 或 `weight_spec.py`。配置类和权重映射文件共同定义：
 
 - 每类权重的 logical name。
 - BF16 / FP8 artifact name。
@@ -506,54 +517,62 @@ common_input_scale = max(common_input_amax / 448.0, 1e-12)
 - 是否 per-layer。
 - 是否 constant tensor。
 
-Module init 不再拼接字符串，只请求 spec：
+Module init 不再拼接字符串，只从 `PI05Config` / `weights.py` 请求 spec：
 
 ```python
 self.qkv = PI05WeightSpec.decoder_attn_qkv(layer_idx).parameter(device)
 ```
 
-这样 `weights.py` 和模型代码使用同一份 spec。checkpoint conversion 不再通过字符串约定和 Module 隐式对齐。
+这样 `weights.py` 和 `model.py` 使用同一份 spec。checkpoint conversion 不再通过字符串约定和 Module 隐式对齐。
 
-### 10. 拆分 `modules.py`
+### 10. 收敛 Pi0.5 业务模型目录
 
-在 contract 和 facade 建立后，再拆文件。建议顺序：
+在 contract、`PI05Config` 和 `ops.py` 建立后，再收敛文件。目标不是把 `modules.py` 拆成更多模型文件，而是把 Pi0.5 目录压回业务模型应该拥有的最小职责。
 
-1. 提取 layout helper，不改变行为。
-2. 提取 `pi05_ops` facade，不改变行为。
-3. 把 vision、prefix encoder、decoder/action expert 拆成独立文件；每个文件内继续让同一个 Module 同时包含 `forward()` 和 `forward_fast()`。
-4. 最后将 `modules.py` 变成兼容 re-export 层，避免一次性破坏 import。
+建议顺序：
+
+1. 新增 `config.py`，把 shape、layer 数、head 数、entrypoint、precision、layout/fusion、kernel source、artifact recipe 默认值统一收到 `PI05Config` dataclass。
+2. 新增 `ops.py` / `pi05_ops.py`，迁移 `_packed_call`、CUDA helper、FP8 quant/norm/attention wrapper、Pi0.5 kernel spec 注册。
+3. 将 `modules.py` 收敛成 `model.py`；短期可以保留 `modules.py` 兼容 re-export，长期删除。
+4. 将 `layout.py` / `target.py` 这类想象中的独立文件并入 `config.py`，除非未来配置体量证明必须再拆。
+5. 将 `export.py` / `artifact.py` 的通用逻辑迁到 `python/devproc2/export/` 和 `python/devproc2/artifact/`；Pi0.5 只通过 `PI05Config` 暴露模型 entrypoint 和 artifact recipe。
+6. 将 `torch_oracle.py` 移到 `tools/pi05/dump_torch_oracle.py` 或业务生产端，不从 Pi0.5 runtime/model package 暴露。
 
 建议目标结构：
 
 ```text
 python/devproc2/models/pi05/
   __init__.py
-  artifact.py
-  export.py
-  layout.py
-  ops.py
-  target.py
-  modules.py        # compatibility re-export only
-  model/
-    vision.py
-    prefix.py
-    decoder.py
-    sample.py
+  config.py
+  model.py
+  ops.py            # Pi0.5 CUDA/HPC op boundary
   weights.py
-  torch_oracle.py
   cuda/
     pi05_kernels.cu
     fa2/
     gemm/
 ```
 
-拆分过程中对外 import 暂时保持兼容：
+框架层目标结构：
 
-```python
-from devproc2.models.pi05.modules import PI05DenoiseLoop
+```text
+python/devproc2/export/
+  pipeline.py
+  entrypoint.py
+  emit.py
+  cli.py
+
+python/devproc2/artifact/
+  builder.py
+  resources.py
+  kernels.py
+  manifest.py
+
+tools/pi05/
+  dump_torch_oracle.py
 ```
 
-仍然可用，内部再 re-export。
+迁移过程中对外 import 暂时保持兼容，例如 `from devproc2.models.pi05.modules import PI05DenoiseLoop` 仍然可用，内部 re-export 到 `model.py`；但这只是迁移期兼容，不是最终结构。
 
 ## 分阶段执行
 
@@ -565,11 +584,11 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 
 ### Phase 1：封装不改行为
 
-- 新增 `layout.py`，迁移 `_view_bf16_row`、`_qkv_views`、KV cache/style table view。
-- 新增 `ops.py`，迁移 `_packed_call`、FP8 quant、norm-to-FP8、CUDA helper。
-- 新增 `PI05FastContext` / target profile，显式携带 `precision`、`target`、`layout`、`quant_profile`。
-- 构图入口按 `precision` 选择 FP8 / BF16-FP16 fast graph variant；4090、Thor 等 target 不改变 DSL 构图，只改变 lowering/backend selection。
-- 在 `pi05_ops` 或 backend registry 中注册 target-specific handwritten kernel；模型层不得出现 target-specific CUDA symbol 分支。
+- 新增 `config.py`，定义 `PI05Config` dataclass，迁移所有 shape/default/entrypoint/precision/layout/fusion/kernel-source/artifact-recipe 配置。
+- 新增 `ops.py`，迁移 `_packed_call`、FP8 quant、norm-to-FP8、CUDA helper、Pi0.5 kernel spec 注册。
+- 将 `_view_bf16_row`、`_qkv_views`、KV cache/style table view 这类 layout helper 先迁到 `model.py` 或 `ops.py` 的私有 helper；长期配置和规则由 `PI05Config` 承载，不新增长期 `layout.py`。
+- 构图入口按 `PI05Config.precision` 或构图 dtype/quant mode 选择 FP8 / BF16-FP16 fast graph variant；4090、Thor 等 target 不改变 DSL 构图，只改变 `ops.py`/lowering/backend selection。
+- 在 `ops.py` 或 backend registry 中注册 target-specific handwritten kernel；`model.py` 不得出现 target-specific CUDA symbol 分支。
 - 模型代码只替换调用点，不改 kernel 参数顺序、不改 output shape、不改 launch。
 
 ### Phase 2：去除 FlashRT FA2 运行时依赖
@@ -580,9 +599,13 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 - 从正式 runtime path 中删除 FlashRT 绝对路径、`DEVPROC2_FLASHRT_FA2_SO` 依赖和 Python extension 依赖。
 - 保留 FlashRT 只作为 benchmark/reference 对照，不作为验收路径。
 
-### Phase 3：修正入口语义
+### Phase 3：框架化 export / artifact / oracle 边界
 
-- 引入 `GraphBuilder.build_method(...)` 或 export-level named entrypoint。
+- 引入框架层 `python/devproc2/export/`：通用 GraphBuilder entrypoint selection、compile pipeline、EmitExecutable、EmitABI、CLI scaffolding 都迁出 Pi0.5。
+- 引入框架层 `python/devproc2/artifact/`：通用 artifact builder、resource copy、kernel packaging、manifest 写入都迁出 Pi0.5。
+- Pi0.5 不再长期保留 `export.py` / `artifact.py`；迁移期只允许薄兼容 wrapper，调用框架层 pipeline 并传入 `PI05Config`。
+- 将 `torch_oracle.py` 移到 `tools/pi05/dump_torch_oracle.py` 或业务生产端；Pi0.5 runtime/model package 不 import OpenPI/PyTorch oracle producer。
+- 引入 `GraphBuilder.build_method(...)` 或框架 export-level named entrypoint。
 - 将 `forward_kv` 重命名为 `materialize_kv`。
 - 删除 `forward_fast(prefix_embs, rope_or_valid_rows, rope_interleaved=None)` 这种通过参数个数重载语义的写法。
 
@@ -590,24 +613,25 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 
 - 新增框架层 `python/devproc2/quantization/`，提供通用 manifest schema、fusion manifest 表达和 FP8 requant helper；该包不依赖 `torch`、`nvidia-modelopt` 或 OpenPI。
 - 可选新增 `python/devproc2/integrations/modelopt/` 或 `tools/quant/modelopt_export.py`，作为 producer-side exporter；它只从业务侧已经量化好的 torch module / ModelOpt state 导出 `QuantizationManifest`。
-- Pi0.5 目录不放通用 ModelOpt adapter；只新增 Pi0.5 deploy quant mapping/fusion spec，可归入 `layout.py` / `weight_spec.py` / `weights.py`。
+- Pi0.5 目录不放通用 ModelOpt adapter；只在 `config.py` / `weights.py` 中声明 Pi0.5 deploy quant mapping/fusion spec。
 - exporter 不加载 OpenPI，不构造业务 dataloader，不执行 calibration loop，不 import 业务 repo；这些属于业务 PyTorch repo 的生产端职责。
 - 对 QKV、gate-up 等 fused projection 执行 common-scale requantization：Pi0.5 spec 声明 fusion group，框架 helper 从原始 FP/BF16 权重重新量化到 fused scalar scale，禁止直接拼接不同 scale 的 FP8 tensor。
 - 将 `act_scale.*` 生成纳入框架层 calibration manifest + Pi0.5 deploy manifest，禁止依赖 out-of-band 手工注入的性能包资产。
-- 建立 Pi0.5 weight/layout spec。
+- 在 `PI05Config` / `weights.py` 中建立 Pi0.5 weight/layout spec。
 - `weights.py` conversion 和 Module parameter creation 共用 spec。
 - 保持 artifact 文件名兼容；只改变代码生成这些名字的位置。
 
-### Phase 5：文件拆分
+### Phase 5：收敛 Pi0.5 文件结构
 
-- 拆 vision/prefix/decoder/sample 模块。
-- `modules.py` 只做兼容导出。
+- 将 `modules.py` 收敛到 `model.py`，短期 `modules.py` 只做兼容导出。
+- Pi0.5 目录长期只保留 `config.py`、`model.py`、`ops.py`、`weights.py`、`cuda/` 和最小 `__init__.py`。
+- 删除或迁走 Pi0.5 目录内长期 `export.py`、`artifact.py`、`torch_oracle.py`、`layout.py`、`target.py`。
 - 更新 tests import，保留旧 import 的兼容测试。
 
 ### Phase 6：前端 view 语义升级
 
 - 设计并实现标准张量语义 op：`select`、`slice`、`index`、`split`、`reshape`；`index` 只作为 `select` + `slice` 的 sugar，不做 advanced indexing；不引入 `reshape_view` / `slice_view` / `TensorLayoutView` 这类把实现方式写进名字的 op。
-- 将 Pi0.5 layout helper 从 `dp.tensor_view` 迁移到这些标准 op。
+- 将 Pi0.5 model/layout helper 从 `dp.tensor_view` 迁移到这些标准 op。
 - 将 byte offset / stride 计算下沉到 storage alias lowering、VM codegen 或 runtime tensor descriptor 生成阶段。
 - 最终禁止任何模型层或 Pi0.5 layout 层手写 byte offset，除 low-level lowering/codegen 外。
 
@@ -615,13 +639,16 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 
 结构验收：
 
-- `python/devproc2/models/pi05/modules.py` 不再承载全部实现；目标是兼容导出层。
-- 模型层没有裸 `dp.cuda_call`、裸 `dp.call_dps_packed`、裸 `dp.tensor_view`。
+- `python/devproc2/models/pi05/` 长期只保留 `config.py`、`model.py`、`ops.py`、`weights.py`、`cuda/` 和最小 `__init__.py`；`modules.py` 只允许作为迁移期兼容导出层。
+- `python/devproc2/models/pi05/` 长期不保留 `export.py`、`artifact.py`、`torch_oracle.py`、`layout.py`、`target.py`；通用 export/artifact/oracle producer 迁到框架层或 tools。
+- `model.py` 没有裸 `dp.cuda_call`、裸 `dp.call_dps_packed`、裸 `dp.tensor_view`。
+- `ops.py` 是 Pi0.5 CUDA/HPC op 边界，可以封装手写 kernel、packed func、kernel spec 注册和 target-specific dispatch，但不得承载通用 export/artifact/oracle 逻辑。
 - `forward()` 不包含 fast path、CUDA、packed func 或 storage byte math。
-- fast path 所有 backend 调用都经过 `pi05_ops` facade。
+- fast path 所有 backend 调用都经过 `ops.py` / `pi05_ops.py` facade。
 - FP8 和 BF16/FP16 fast path 可以导出不同 DSL graph variant；共享部分通过 helper/子模块复用，不用一张带大量量化条件分支的图伪复用。
-- 4090、Thor 对同一个 precision graph 共享 DSL 构图；target-specific 差异只允许出现在 `pi05_ops`、lowering registry、kernel registry 和 Pi0.5-owned CUDA backend。
-- `forward_fast(ctx)` 可以根据 `ctx.precision` 选择 graph variant，但不得根据 `ctx.target` 在 layer 主体里手写不同 CUDA symbol 或 packed func。
+- 4090、Thor 对同一个 precision graph 共享 DSL 构图；target-specific 差异只允许出现在 `ops.py`、lowering registry、kernel registry 和 Pi0.5-owned CUDA backend。
+- `forward_fast()` 可以根据 `PI05Config.precision` 或构图 dtype/quant mode 选择 graph variant，但不得根据 target 在 layer 主体里手写不同 CUDA symbol 或 packed func。
+- `PI05Config` 是 Pi0.5 配置唯一事实来源；模型结构、shape、entrypoint、precision、layout/fusion、kernel source、artifact recipe 默认值不得散落在 `export.py`/`artifact.py`/临时 helper 中。
 - 前端和高层 IR 中没有 byte-level view；KV/style/QKV 切片只通过 `select`、`slice`、`index`、`split`、`reshape` 表达。
 - devproc2 不再自研 Pi0.5 量化算法和校准流程；ModelOpt 作为业务生产端离线量化前端，devproc2 core 只消费标准 manifest + FP/BF16 weights。
 - `python/devproc2/quantization/` 不 import `torch`、`nvidia-modelopt`、OpenPI 或业务 repo；ModelOpt 读取逻辑只能存在于 optional producer-side exporter。
@@ -637,6 +664,8 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 - normal compile 只生成 standard op graph。
 - fast compile 仍生成等价 CUDA/packed func 调用序列或 Pi0.5-owned kernel 调用序列，不发生性能路径退化。
 - 对同一 precision graph，`target=rtx4090_sm89` 和 `target=thor` 的差异体现在 lowered backend graph / executable，而不是两套模型代码或两套 DSL 构图。
+- 框架层 `devproc2.export` 可以基于 `PI05Config` 完成 Pi0.5 entrypoint 构图、compile、emit；Pi0.5 目录不自己实现 pass pipeline。
+- 框架层 `devproc2.artifact` 可以基于 `PI05Config` artifact recipe 打包 weights/resources/kernels/metadata；Pi0.5 目录不自己实现通用 artifact builder。
 - artifact 仍生成完整 `metadata/kernel_table.json`。
 - artifact/package 自包含 Pi0.5 所需 kernel；除 CUDA/cuBLASLt 等系统库外，不要求外部 FlashRT 安装。
 - 现有 `tests/compiler/test_pi05_fast_modules.py`、artifact tests、runtime smoke 全部通过。
@@ -656,8 +685,8 @@ from devproc2.models.pi05.modules import PI05DenoiseLoop
 - devproc2 core 的量化边界是标准 manifest + requant helper；ModelOpt 读取逻辑若存在，只能是 optional producer-side exporter，不属于 Pi0.5 模型目录。
 - 第一阶段不改 OpenPI Torch 模型，不改当前 scalar `A_scale/B_scale` GEMM ABI；通过 deploy-side fusion requantization 对齐当前 runtime。
 - 通用 cuBLASLt GEMM packed func 可以继续留在 runtime；Pi0.5 专用 FA2 packed func 应迁移出通用 `cuda_gemm.cc`。
-- `forward_fast(ctx)` 保留为 `nn.Module` 的一等接口，并与 `forward()` 放在同一个语义 Module 中；重构目标是让它干净，而不是消灭它或拆成另一套模型。
+- `forward_fast()` 保留为 `nn.Module` 的一等接口，并与 `forward()` 放在同一个语义 Module 中；不强制引入 `ctx` 参数。precision/target/layout 等配置由 `PI05Config` 或框架构图配置提供。
 - FP8 与 BF16/FP16 的差异是 precision/quantization graph variant 差异，可以分图；4090 与 Thor 的差异是 target/backend lowering 差异，不应该分模型图。
-- 手写 kernel 保留为最高优先级 backend implementation；它通过 `pi05_ops`、lowering registry 和 `KernelSpec` 接入，不通过模型层裸 `dp.cuda_call` 接入。
+- `ops.py` / `pi05_ops.py` 保留在 Pi0.5 目录，作为 CUDA/HPC op 边界。手写 kernel 保留为最高优先级 backend implementation；它通过 `ops.py`、lowering registry 和 `KernelSpec` 接入，不通过 `model.py` 裸 `dp.cuda_call` 接入。
 - `dp.tensor_view` 的底层能力可以暂时保留给 compiler internal lowering；公开 DSL 和高层 IR 应迁移到 `select`、`slice`、`index`、`split`、`reshape`。
 - `forward_kv` 的根因是多入口构图能力不足，应该修 frontend/export contract，而不是继续给模型加私有方法名。
