@@ -47,8 +47,9 @@ from devproc2.models.pi05.export import (
 )
 from devproc2.models.pi05.kernels import (
     PI05_KERNELS,
-    call_pi05_cuda_kernel,
+    pi05_cuda_call_metadata,
     pi05_cuda_source_path,
+    pi05_cuda_source_symbol,
     pi05_kernel_specs,
     register_pi05_kernels,
 )
@@ -106,7 +107,6 @@ __all__ = [
     "build_pi05_sample_actions_precomputed_prefix_module",
     "build_pi05_sample_actions_tokens_module",
     "build_pi05_vision_encoder_module",
-    "call_pi05_cuda_kernel",
     "compile_pi05_denoise_executable",
     "compile_pi05_denoise_loop_executable",
     "compile_pi05_paligemma_prefix_encoder_executable",
@@ -142,7 +142,9 @@ __all__ = [
     "pi05_sample_actions_tokens_input_specs",
     "pi05_vision_encoder_input_specs",
     "pi05_kernel_specs",
+    "pi05_cuda_call_metadata",
     "pi05_cuda_source_path",
+    "pi05_cuda_source_symbol",
     "register_pi05_kernels",
     "select_fp8_layout",
 ]

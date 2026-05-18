@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
     int prefix_valid_rows = 895;
     int num_views = 3;
     int action_horizon = 50;
+    std::string oracle_dir_arg;
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--no-graph") {
@@ -91,6 +92,8 @@ int main(int argc, char** argv) {
             num_views = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--action-horizon" && i + 1 < argc) {
             action_horizon = std::max(1, std::atoi(argv[++i]));
+        } else if (arg == "--oracle-dir" && i + 1 < argc) {
+            oracle_dir_arg = argv[++i];
         } else if (arg == "--entry-kind" && i + 1 < argc) {
             std::string kind = argv[++i];
             if (kind == "loop") {
@@ -141,7 +144,9 @@ int main(int argc, char** argv) {
             ++i;
         }
     }
-    const std::string oracle_dir = root + "/build/pi05_torch_denoise_oracle/bf16_example0/raw";
+    const std::string oracle_dir = oracle_dir_arg.empty()
+        ? root + "/build/pi05_torch_denoise_oracle/bf16_example0/raw"
+        : oracle_dir_arg;
 
     constexpr int L = 18;
     const int P = entry_uses_tokens ? (num_views * 256 + max_prompt_len) : 968;

@@ -23,7 +23,7 @@ from devproc2.ir.ops import (
     TupleOp,
 )
 from devproc2.nn import GraphBuilder, ScalarSpec, TensorSpec
-from devproc2.models.pi05.kernels import call_pi05_cuda_kernel
+from devproc2.models.pi05.kernels import pi05_cuda_call_metadata, pi05_cuda_source_symbol
 from devproc2.models.pi05.modules import (
     PI05Attention,
     PI05DecoderLayer,
@@ -120,10 +120,10 @@ def test_pi05_ffn_forward_fast_uses_fused_op():
     assert "down_w_fp8" in ".".join(param_names)
 
 
-def test_pi05_ffn_forward_fast_dynamic_uses_dynamic_quant_scales():
+def test_pi05_ffn_forward_fast_uses_dynamic_quant_scales():
     ffn = PI05FFN(8, 16)
-    module = GraphBuilder().build(ffn.forward_fast_dynamic, {"x": TensorSpec((33, 8), "bfloat16")})
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    module = GraphBuilder().build(ffn._forward_fast_dynamic, {"x": TensorSpec((33, 8), "bfloat16")})
+    ops = _lowered_ops(module, "_forward_fast_dynamic")
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     assert [op.target_ref.name for op in dps_ops] == [
         "kernel.pi05_quantize_fp8_dynamic_bf16",
@@ -245,10 +245,10 @@ def test_pi05_vision_encoder_layer_fast_dynamic_wires_siglip_block():
         num_heads=2,
     )
     module = GraphBuilder().build(
-        layer.forward_fast_dynamic,
+        layer.forward_fast,
         {"hidden": TensorSpec((4, 8), "bfloat16")},
     )
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    ops = _lowered_ops(module, "forward_fast")
     views = [op for op in ops if isinstance(op, TensorViewOp)]
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
@@ -270,7 +270,7 @@ def test_pi05_vision_encoder_layer_fast_dynamic_wires_siglip_block():
     assert targets.count("kernel.pi05_bias_residual_bf16") == 2
     assert "kernel.pi05_qkv_bias_split_bf16" in targets
     assert "kernel.pi05_gelu_inplace_bf16" in targets
-    names = [p.name for p in module.functions["forward_fast_dynamic"].params]
+    names = [p.name for p in module.functions["forward_fast"].params]
     assert "vision_pre_attn_norm_w" in names
     assert "vision_attn_qkv_b" in names
     assert "fp8.vision_attn_qkv_w_1.weight" in names
@@ -287,10 +287,10 @@ def test_pi05_vision_encoder_layer_static_scales_fuse_layer_norm_quant():
         use_static_act_scales=True,
     )
     module = GraphBuilder().build(
-        layer.forward_fast_dynamic,
+        layer.forward_fast,
         {"hidden": TensorSpec((4, 8), "bfloat16")},
     )
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    ops = _lowered_ops(module, "forward_fast")
     dps_ops = [
         op for op in ops
         if isinstance(op, CallDPSOp)
@@ -319,11 +319,11 @@ def test_pi05_vision_encoder_unrolls_layers_and_projects_image_tokens():
         output_size=12,
     )
     module = GraphBuilder().build(
-        encoder.forward_fast_dynamic,
+        encoder.forward_fast,
         {"images_u8": TensorSpec((1, 4, 4, 3), "uint8")},
     )
-    fn = module.functions["forward_fast_dynamic"]
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    fn = module.functions["forward_fast"]
+    ops = _lowered_ops(module, "forward_fast")
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
     ret = ops[-1]
@@ -366,7 +366,7 @@ def test_pi05_vision_encoder_fast_dynamic_lowers_to_vm():
         output_size=12,
     )
     module = GraphBuilder().build(
-        encoder.forward_fast_dynamic,
+        encoder.forward_fast,
         {"images_u8": TensorSpec((1, 4, 4, 3), "uint8")},
     )
     module = InferStructInfoPass().run(module)
@@ -376,7 +376,7 @@ def test_pi05_vision_encoder_fast_dynamic_lowers_to_vm():
     module = LowerTensorCreateToAllocPass(ctx).run(module)
     exe = VMCodegenPass().run(module)
     names = [entry.name for entry in exe.function_table]
-    assert "forward_fast_dynamic" in names
+    assert "forward_fast" in names
     assert "vm.builtin.tensor_view" in names
     assert "runtime.cuda.pi05_fa2_bf16_batched" in names
     assert "runtime.cuda.fp8_nt_bf16" in names
@@ -392,13 +392,13 @@ def test_pi05_paligemma_encoder_layer_fast_dynamic_wires_rope_attention_and_ffn(
         head_dim=4,
     )
     module = GraphBuilder().build(
-        layer.forward_fast_dynamic,
+        layer.forward_fast,
         {
             "hidden": TensorSpec((5, 8), "bfloat16"),
             "rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    ops = _lowered_ops(module, "forward_fast")
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
 
@@ -414,7 +414,7 @@ def test_pi05_paligemma_encoder_layer_fast_dynamic_wires_rope_attention_and_ffn(
     assert targets.count("runtime.cuda.fp8_nt_bf16_accum") == 2
     assert targets.count("kernel.pi05_residual_add_bf16") == 0
     assert "kernel.pi05_geglu_bf16" in targets
-    names = [p.name for p in module.functions["forward_fast_dynamic"].params]
+    names = [p.name for p in module.functions["forward_fast"].params]
     assert "fp8.encoder_attn_qkv_w_1.weight" in names
     assert "fp8.encoder_ffn_gate_up_w_1.weight" in names
     assert "fp8.encoder_ffn_down_w_1.scale" in names
@@ -431,13 +431,13 @@ def test_pi05_paligemma_encoder_layer_static_scales_fuse_rms_quant():
         use_static_act_scales=True,
     )
     module = GraphBuilder().build(
-        layer.forward_fast_dynamic,
+        layer.forward_fast,
         {
             "hidden": TensorSpec((5, 8), "bfloat16"),
             "rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    ops = _lowered_ops(module, "forward_fast")
     dps_ops = [
         op for op in ops
         if isinstance(op, CallDPSOp)
@@ -460,14 +460,14 @@ def test_pi05_paligemma_prefix_encoder_unrolls_and_lowers_to_vm():
         head_dim=4,
     )
     module = GraphBuilder().build(
-        encoder.forward_fast_dynamic,
+        encoder.forward_fast,
         {
             "prefix_embs": TensorSpec((5, 8), "bfloat16"),
             "rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    fn = module.functions["forward_fast_dynamic"]
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    fn = module.functions["forward_fast"]
+    ops = _lowered_ops(module, "forward_fast")
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
     ret = ops[-1]
@@ -490,7 +490,7 @@ def test_pi05_paligemma_prefix_encoder_unrolls_and_lowers_to_vm():
     module = LowerTensorCreateToAllocPass(ctx).run(module)
     exe = VMCodegenPass().run(module)
     lowered_names = [entry.name for entry in exe.function_table]
-    assert "forward_fast_dynamic" in lowered_names
+    assert "forward_fast" in lowered_names
     assert "kernel.pi05_rms_norm_unit_bf16" in lowered_names
     assert "kernel.pi05_qkv_split_rope_bf16" in lowered_names
 
@@ -505,15 +505,15 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
         head_dim=4,
     )
     module = GraphBuilder().build(
-        encoder.forward_fast_kv_dynamic,
+        encoder.forward_fast,
         {
             "prefix_embs": TensorSpec((5, 8), "bfloat16"),
             "prefix_valid_rows": ScalarSpec("int64"),
             "rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    fn = module.functions["forward_fast_kv_dynamic"]
-    ops = _lowered_ops(module, "forward_fast_kv_dynamic")
+    fn = module.functions["forward_fast"]
+    ops = _lowered_ops(module, "forward_fast")
     creates = [op for op in ops if isinstance(op, TensorCreateOp)]
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
@@ -531,9 +531,9 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
     assert isinstance(ret.values[0].op, TupleOp)
 
     module = InferStructInfoPass().run(module)
-    tuple_si = module.functions["forward_fast_kv_dynamic"].ret_struct_info
+    tuple_si = module.functions["forward_fast"].ret_struct_info
     assert tuple_si is None
-    ret_si = module.functions["forward_fast_kv_dynamic"].body.blocks[0].ops[-1].values[0].struct_info
+    ret_si = module.functions["forward_fast"].body.blocks[0].ops[-1].values[0].struct_info
     assert ret_si.fields[0].shape[0].value == 2
     assert ret_si.fields[0].shape[1].value == 5
     assert ret_si.fields[1].shape[3].value == 4
@@ -544,7 +544,7 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
     module = LowerTensorCreateToAllocPass(ctx).run(module)
     exe = VMCodegenPass().run(module)
     lowered_names = [entry.name for entry in exe.function_table]
-    assert "forward_fast_kv_dynamic" in lowered_names
+    assert "forward_fast" in lowered_names
     assert "kernel.pi05_qkv_split_rope_cache_bf16" in lowered_names
     assert "vm.builtin.make_tuple" in lowered_names
 
@@ -564,7 +564,7 @@ def test_pi05_sample_actions_from_prefix_embeddings_chains_prefix_kv_and_denoise
         head_dim=4,
     )
     module = GraphBuilder().build(
-        sample.forward_fast_dynamic,
+        sample.forward_fast,
         {
             "noise_f32": TensorSpec((5, 4), "float32"),
             "prefix_embs": TensorSpec((3, 8), "bfloat16"),
@@ -573,8 +573,8 @@ def test_pi05_sample_actions_from_prefix_embeddings_chains_prefix_kv_and_denoise
             "suffix_rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    fn = module.functions["forward_fast_dynamic"]
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    fn = module.functions["forward_fast"]
+    ops = _lowered_ops(module, "forward_fast")
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
     ret = ops[-1]
@@ -648,17 +648,23 @@ def test_pi05_attention_forward_fast_uses_cuda_kernel():
     assert create.results[0].struct_info.shape[2].value == 4
 
 
-def test_pi05_cuda_kernel_helper_supports_multiple_outputs_without_registration():
+def test_pi05_direct_cuda_call_supports_multiple_outputs_without_registration():
     class SplitModule:
         def forward_fast(self, qkv):
-            q, _k, _v = call_pi05_cuda_kernel(
-                "pi05_qkv_split_bf16",
-                inputs=[qkv, 1, 2, 2, 2],
-                output_specs=[
-                    TensorSpec((1, 2), "bfloat16"),
-                    TensorSpec((1, 2), "bfloat16"),
-                    TensorSpec((1, 2), "bfloat16"),
-                ],
+            q = dp.empty((1, 2), dtype="bfloat16", device="cuda")
+            k = dp.empty((1, 2), dtype="bfloat16", device="cuda")
+            v = dp.empty((1, 2), dtype="bfloat16", device="cuda")
+            dp.cuda_call(
+                pi05_cuda_source_symbol("pi05_qkv_split_bf16"),
+                qkv,
+                1,
+                2,
+                2,
+                2,
+                q,
+                k,
+                v,
+                metadata=pi05_cuda_call_metadata("pi05_qkv_split_bf16"),
             )
             return q
 
@@ -712,7 +718,7 @@ def test_pi05_decoder_layer_fast_dynamic_wires_views_kv_and_inplace_residual():
         head_dim=4,
     )
     module = GraphBuilder().build(
-        layer.forward_fast_dynamic,
+        layer.forward_fast,
         {
             "hidden": TensorSpec((5, 8), "bfloat16"),
             "prefix_k_cache": TensorSpec((18, 3, 1, 4), "bfloat16"),
@@ -724,7 +730,7 @@ def test_pi05_decoder_layer_fast_dynamic_wires_views_kv_and_inplace_residual():
             "step": ScalarSpec("int64"),
         },
     )
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    ops = _lowered_ops(module, "forward_fast")
     views = [op for op in ops if isinstance(op, TensorViewOp)]
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     assert len(views) >= 5
@@ -737,7 +743,7 @@ def test_pi05_decoder_layer_fast_dynamic_wires_views_kv_and_inplace_residual():
     assert targets.count("kernel.pi05_gate_mul_residual_bf16") == 2
     inplace = [op for op in dps_ops if op.target_ref.name == "kernel.pi05_gate_mul_residual_bf16"]
     assert all(not op.outputs for op in inplace)
-    names = [p.name for p in module.functions["forward_fast_dynamic"].params]
+    names = [p.name for p in module.functions["forward_fast"].params]
     assert "fp8.decoder_attn_qkv_w_1.weight" in names
     assert "fp8.decoder_ffn_gate_up_w_1.weight" in names
     assert "constant.decoder_adarms_weight" in names
@@ -756,7 +762,7 @@ def test_pi05_denoise_step_fast_dynamic_wires_action_cast_layers_and_delta():
         head_dim=4,
     )
     module = GraphBuilder().build(
-        denoise.forward_fast_dynamic,
+        denoise.forward_fast,
         {
             "actions_f32": TensorSpec((5, 4), "float32"),
             "prefix_k_cache": TensorSpec((2, 3, 1, 4), "bfloat16"),
@@ -766,7 +772,7 @@ def test_pi05_denoise_step_fast_dynamic_wires_action_cast_layers_and_delta():
             "step": ScalarSpec("int64"),
         },
     )
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    ops = _lowered_ops(module, "forward_fast")
     targets = [
         op.target_ref.name
         for op in ops
@@ -779,7 +785,7 @@ def test_pi05_denoise_step_fast_dynamic_wires_action_cast_layers_and_delta():
         "runtime.cuda.bf16_nn_bf16",
         "kernel.pi05_bias_add_bf16",
     ]
-    names = [p.name for p in module.functions["forward_fast_dynamic"].params]
+    names = [p.name for p in module.functions["forward_fast"].params]
     assert "decoder_action_in_proj_w" in names
     assert "decoder_action_out_proj_b" in names
     assert "precomputed.decoder_style_attn" in names
@@ -792,13 +798,13 @@ def test_pi05_denoise_step_fast_dynamic_wires_action_cast_layers_and_delta():
 def test_pi05_denoise_step_apply_delta_uses_bf16_euler_kernel():
     denoise = PI05DenoiseStep(num_layers=1, hidden_size=8, intermediate_size=16, action_dim=4)
     module = GraphBuilder().build(
-        denoise.apply_delta_fast,
+        denoise._apply_delta_fast,
         {
             "actions_f32": TensorSpec((5, 4), "float32"),
             "delta_bf16": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    ops = _lowered_ops(module, "apply_delta_fast")
+    ops = _lowered_ops(module, "_apply_delta_fast")
     dps_ops = [
         op for op in ops
         if isinstance(op, CallDPSOp)
@@ -821,7 +827,7 @@ def test_pi05_denoise_loop_unrolls_steps_and_updates_actions_inplace():
         head_dim=4,
     )
     module = GraphBuilder().build(
-        denoise_loop.forward_fast_dynamic,
+        denoise_loop.forward_fast,
         {
             "actions_f32": TensorSpec((5, 4), "float32"),
             "prefix_k_cache": TensorSpec((1, 3, 1, 4), "bfloat16"),
@@ -830,8 +836,8 @@ def test_pi05_denoise_loop_unrolls_steps_and_updates_actions_inplace():
             "rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    fn = module.functions["forward_fast_dynamic"]
-    ops = _lowered_ops(module, "forward_fast_dynamic")
+    fn = module.functions["forward_fast"]
+    ops = _lowered_ops(module, "forward_fast")
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     targets = [op.target_ref.name for op in dps_ops]
 
@@ -857,7 +863,7 @@ def test_pi05_denoise_step_fast_dynamic_lowers_to_vm():
         head_dim=4,
     )
     module = GraphBuilder().build(
-        denoise.forward_fast_dynamic,
+        denoise.forward_fast,
         {
             "actions_f32": TensorSpec((5, 4), "float32"),
             "prefix_k_cache": TensorSpec((1, 3, 1, 4), "bfloat16"),
@@ -874,7 +880,7 @@ def test_pi05_denoise_step_fast_dynamic_lowers_to_vm():
     module = LowerTensorCreateToAllocPass(ctx).run(module)
     exe = VMCodegenPass().run(module)
     names = [entry.name for entry in exe.function_table]
-    assert "forward_fast_dynamic" in names
+    assert "forward_fast" in names
     assert "vm.builtin.tensor_view" in names
     assert "kernel.pi05_qkv_split_rope_concat_bf16" in names
     assert "runtime.cuda.fp8_nt_bf16" in names

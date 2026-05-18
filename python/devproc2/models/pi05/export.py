@@ -344,9 +344,9 @@ def build_pi05_denoise_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(denoise.forward_fast_dynamic, input_specs)
-    fn = module.functions["forward_fast_dynamic"]
-    if function_name != "forward_fast_dynamic":
+    module = GraphBuilder().build(denoise.forward_fast, input_specs)
+    fn = module.functions["forward_fast"]
+    if function_name != "forward_fast":
         module = IRModule({function_name: fn})
     return module, len(input_specs)
 
@@ -380,9 +380,9 @@ def _build_pi05_denoise_loop_module_with_specs(
         device=device,
         use_static_act_scales=use_static_act_scales,
     )
-    module = GraphBuilder().build(denoise_loop.forward_fast_dynamic, input_specs)
-    fn = module.functions["forward_fast_dynamic"]
-    if function_name != "forward_fast_dynamic":
+    module = GraphBuilder().build(denoise_loop.forward_fast, input_specs)
+    fn = module.functions["forward_fast"]
+    if function_name != "forward_fast":
         module = IRModule({function_name: fn})
     return module, len(input_specs)
 
@@ -531,9 +531,9 @@ def build_pi05_sample_actions_precomputed_prefix_embs_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(sample.forward_fast_dynamic, input_specs)
-    fn = module.functions["forward_fast_dynamic"]
-    if function_name != "forward_fast_dynamic":
+    module = GraphBuilder().build(sample.forward_fast, input_specs)
+    fn = module.functions["forward_fast"]
+    if function_name != "forward_fast":
         module = IRModule({function_name: fn})
     return module, len(input_specs)
 
@@ -607,9 +607,9 @@ def build_pi05_sample_actions_tokens_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(sample.forward_fast_dynamic, input_specs)
-    fn = module.functions["forward_fast_dynamic"]
-    if function_name != "forward_fast_dynamic":
+    module = GraphBuilder().build(sample.forward_fast, input_specs)
+    fn = module.functions["forward_fast"]
+    if function_name != "forward_fast":
         module = IRModule({function_name: fn})
     return module, len(input_specs)
 
@@ -653,9 +653,9 @@ def build_pi05_vision_encoder_module(
         image_channels=image_channels,
         device=device,
     )
-    module = GraphBuilder().build(encoder.forward_fast_dynamic, input_specs)
-    fn = module.functions["forward_fast_dynamic"]
-    if function_name != "forward_fast_dynamic":
+    module = GraphBuilder().build(encoder.forward_fast, input_specs)
+    fn = module.functions["forward_fast"]
+    if function_name != "forward_fast":
         module = IRModule({function_name: fn})
     return module, len(input_specs)
 
@@ -694,9 +694,9 @@ def build_pi05_paligemma_prefix_encoder_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(encoder.forward_fast_dynamic, input_specs)
-    fn = module.functions["forward_fast_dynamic"]
-    if function_name != "forward_fast_dynamic":
+    module = GraphBuilder().build(encoder.forward_fast, input_specs)
+    fn = module.functions["forward_fast"]
+    if function_name != "forward_fast":
         module = IRModule({function_name: fn})
     return module, len(input_specs)
 
@@ -735,9 +735,9 @@ def build_pi05_paligemma_prefix_kv_encoder_module(
         head_dim=head_dim,
         device=device,
     )
-    module = GraphBuilder().build(encoder.forward_fast_kv_dynamic, input_specs)
-    fn = module.functions["forward_fast_kv_dynamic"]
-    if function_name != "forward_fast_kv_dynamic":
+    module = GraphBuilder().build(encoder.forward_fast, input_specs)
+    fn = module.functions["forward_fast"]
+    if function_name != "forward_fast":
         module = IRModule({function_name: fn})
     return module, len(input_specs)
 
