@@ -2,14 +2,12 @@
 
 ## 背景
 
-目标是在 devproc2 中支持 openpi0.5 模型的编译和纯 C++ 推理运行。PyTorch 参考实现位于 `/root/autodl-tmp/openpi`，参考脚本为：
+目标是在 devproc2 中支持 openpi0.5 模型的编译和纯 C++ 推理运行。当前本机操作默认复用已有 PyTorch dump 和 tokenizer，不安装、不更新、不修改 openpi 的 uv 环境：
 
-```bash
-cd /root/autodl-tmp/openpi
-uv run python scripts/check_pi05_fp16_infer.py
-```
+- torch 对点数据和 tokenizer：`/root/tw/openpi/outputs/pi05_torch_infer`
+- checkpoint：`/root/tools/pi05_libero_base/model.safetensors`
 
-该脚本加载 `/root/autodl-tmp/tools/pi05-pytorch-base/model.safetensors`，使用 `Pi0Config(pi05=True, dtype="float16")`，运行 `PI0Pytorch.sample_actions(..., num_steps=10)`，并与已 dump 的 fp16 输出做 `rtol=1e-2, atol=1e-2` 对齐。
+当前 PyTorch dump 包含 `inputs.npz`、`fp16/outputs.npz`、`bf16/outputs.npz` 和 `tokenizer.model`。devproc2 benchmark 侧还需要 `build/pi05_torch_denoise_oracle/bf16_example0/raw` 下的 raw 对点文件；如果缺失，应复用已有 raw dump 或由维护者在已配置好的 openpi 环境中生成，不在本流程里执行 openpi `uv` 安装/更新。
 
 本目录最初描述设计方案和实施阶段；当前实现已开始落地，状态记录见
 `04_weight_artifact_quant.md` 和 `05_runtime_accuracy_milestones.md` 顶部的
@@ -38,7 +36,7 @@ uv run python scripts/check_pi05_fp16_infer.py
 - 已新增 `sample_actions` precomputed-prefix ABI：`build/pi05_fp8_sample_precomputed_prefix_artifact` 入口 `main`，输入 `noise_f32 + prefix_k_cache + prefix_v_cache + prefix_valid_rows + rope_interleaved`，输出 `[50, 32]` float32 actions，4090 CUDA Graph 最新复测 `13.286ms/10-step`（strict/oracle artifact，低于 21ms 目标）。
 - 已新增 prefix 前半段的可编译切片：`PI05VisionPatchEmbedding.forward_fast()` 通过 DSL 注入 image normalize、patch im2col、BF16 GEMM、bias/position add；`PI05VisionEncoderLayer` / `PI05VisionEncoder` 已覆盖 SigLIP vision tower block、final norm 和 multimodal projector，并可导出 `build/pi05_fp8_vision_encoder_executable`。`PI05LanguageEmbedding.forward_fast()` 已通过 DSL 注入 PaliGemma language embedding gather；`PI05PaliGemmaPrefixEncoder` 已覆盖 compact prefix transformer 和 prefix KV cache materialization，可导出 `build/pi05_fp8_paligemma_prefix_encoder_artifact` 与 `build/pi05_fp8_paligemma_prefix_kv_encoder_artifact`。prefix KV materialization fast path 当前使用 `pi05_qkv_split_rope_cache_bf16`，decoder attention fast path 使用 `pi05_qkv_split_rope_concat_bf16`，分别把 prefix cache 写回和 suffix full-KV concat 融成 DSL-injected CUDA kernel。
 - 已新增单 artifact 桥接形态：`build/pi05_fp8_sample_precomputed_prefix_embs_artifact` 入口 `main`，输入 `noise_f32 + prefix_embs + prefix_valid_rows + prefix_rope_interleaved + suffix_rope_interleaved`，在一个 VM graph 内完成 prefix transformer KV materialization 和 10-step denoise。4090 CUDA Graph 当前 `25.812ms`，说明 prefix transformer FP8 GEMM 仍是完整路径的主要优化缺口。
-- 已新增 full-token artifact：`build/pi05_fp8_sample_tokens_127_artifact` 入口 `main`，输入 `noise_f32 + images_u8 + token_ids + prefix_valid_rows + prefix_rope_interleaved + suffix_rope_interleaved`，在一个 VM graph 内完成 vision encoder、language embedding、prefix concat、prefix KV materialization 和 10-step denoise；CUTLASS-enabled 4090 CUDA Graph 当前复测 3-view/P=895 `28.548ms`，2-view/P=562 `23.425ms`，example0 `final_abs_max≈0.14-0.16`、`final_abs_mean≈0.026-0.028`。
+- 已新增 full-token artifact：`build/pi05_fp8_sample_tokens_3v895_artifact` 入口 `main`，输入 `noise_f32 + images_u8 + token_ids + prefix_valid_rows + prefix_rope_interleaved + suffix_rope_interleaved`，在一个 VM graph 内完成 vision encoder、language embedding、prefix concat、prefix KV materialization 和 10-step denoise；CUTLASS-enabled 4090 CUDA Graph 当前复测 3-view/P=895 `28.548ms`，2-view/P=562 `23.425ms`，example0 `final_abs_max≈0.14-0.16`、`final_abs_mean≈0.026-0.028`。
 - denoise fast path 已接 FlashRT vendored FA2 packed func，fallback BF16 attention kernel 仍保留在 catalog 用于 correctness/debug。
 - 已新增 torch denoise oracle dump 和 C++ VM smoke：strict FP8 accumulation 下 bf16 example0 step0 当前 `abs_max=0.00868897`、`abs_mean=0.00144342`；example0 10-step closed-loop 当前 `final_abs_max=0.078042`、`final_abs_mean=0.0104354`；10-example bf16 multi-oracle 当前 `worst_abs_max=0.149316`、`worst_abs_mean=0.0131491`；runtime-vs-fp16 torch outputs 当前 `worst_abs_max=0.165487`、`worst_abs_mean=0.0158259`。
 - RTX 4090 上 denoise/full-token 路径已完成 CUDA Graph capture/replay：precomputed-prefix 后半段 `13.286ms`（strict/oracle artifact），prefix-embeddings single artifact `25.812ms`，CUTLASS-enabled 3-view full-token artifact `28.548ms`，2-view/P=562 full-token artifact `23.425ms`。
@@ -53,7 +51,7 @@ uv run python scripts/check_pi05_fp16_infer.py
 - FP8 权重量化和静态 activation scale 已完成并进入主性能 artifact；完整 graph 的多样本 actions 级精度报告仍需补齐。
 - denoise 子图已能运行并通过 step0/10-step torch oracle 阈值；仍不是完整 `sample_actions` 的最终精度验收。
 - 非量化部分当前以 BF16 为主，主要用于 torch oracle 对齐和现有辅助 kernel 过渡。RTX 4090 上针对 Pi0.5 关键 GEMM shape 的 FP16/BF16 microbench 显示二者总体同级：3-view prefix FFN gate/up `0.768ms` vs `0.766ms`，down `0.383ms` vs `0.380ms`，vision QKV `0.049ms` vs `0.051ms`；2-view prefix FFN down FP16 有局部优势 `0.255ms` vs `0.292ms`。因此 FP16 variant 是后续兼容和局部 profile TODO，但不是当前性能闭环的主杠杆。
-- precomputed-prefix denoise 后半段已与 `/root/autodl-tmp/openpi/outputs/pi05_torch_infer/fp16/outputs.npz` 做 runtime-vs-fp16 actions 对比；完整 vision/text `sample_actions` 尚未做整图 actions 对齐。
+- precomputed-prefix denoise 后半段已与 `/root/tw/openpi/outputs/pi05_torch_infer/fp16/outputs.npz` 做 runtime-vs-fp16 actions 对比；完整 vision/text `sample_actions` 尚未做整图 actions 对齐。
 - full-token sample path 已用 nsys profile 验证 CUDA Graph 路径；当前接受 2-view/P=562 `23.425ms` 和 3-view/P=895 `28.548ms` 作为性能快照。FlashRT PR #19 的 `~21ms` 对照无法从公开 head 复现，且报告环境为 RTX 4060 Ti，不再作为硬验收口径。当前 profile 显示主瓶颈为 vision/prefix encoder FP8 GEMM；下一阶段重点是保持该性能并按 devproc2 设计重构 fast path，而不是继续追逐独立 elementwise launch fusion。
 
 ## openpi0.5 推理路径
@@ -88,6 +86,7 @@ PyTorch 侧 `sample_actions` 的核心流程：
 - [05_runtime_accuracy_milestones.md](05_runtime_accuracy_milestones.md)：C++ runtime、精度对齐流程、分阶段 milestone。
 - [06_performance_snapshot.md](06_performance_snapshot.md)：当前性能快照、已采用优化、未采用结论和下一阶段设计债务。
 - [07_frontend_dsl_refactor.md](07_frontend_dsl_refactor.md)：`forward_fast()` 一等接口和 CUDA 自定义算子无注册接入重构。
+- [08_build_run_profile.md](08_build_run_profile.md)：面向新手的 Pi0.5 编译、运行和 Nsight profile 操作手册。
 
 ## Milestones
 
