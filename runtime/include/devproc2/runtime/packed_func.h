@@ -49,12 +49,16 @@ public:
     static PackedFuncRegistry& Global();
 
     void Register(const std::string& name, PackedFunc func);
+    void RegisterWithDevice(const std::string& name, PackedFunc func, std::string device);
+    void SetDevice(const std::string& name, std::string device);
     PackedFunc Get(const std::string& name) const;
     bool Has(const std::string& name) const;
+    std::string Device(const std::string& name) const;
 
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, PackedFunc> registry_;
+    std::unordered_map<std::string, std::string> devices_;
 };
 
 // Helper for static-initializer registration

@@ -1,6 +1,6 @@
 #ifdef DEVPROC2_WITH_CUDA
 
-#include "devproc2/runtime/cuda_gemm.h"
+#include "devproc2/runtime/packed_backend.h"
 
 #include "cutlass_fp8_gemm_sm89.h"
 
@@ -756,8 +756,6 @@ Pi05FA2Runner& GlobalFA2Runner() {
     return runner;
 }
 
-thread_local cudaStream_t g_current_packed_stream = nullptr;
-
 TensorObj* RequireTensor(const VMValue& value, const char* name) {
     if (!value.IsObjectRef()) {
         throw std::runtime_error(std::string(name) + " must be a Tensor");
@@ -785,7 +783,7 @@ void RequireCudaTensor(const TensorObj* tensor, const char* name) {
 void FP8Gemm(PackedArgs args, FP8Layout layout) {
     if (args.size() < 8 || args.size() > 9) {
         throw std::runtime_error(
-            "runtime.cuda.fp8_*_bf16 expects A, B, M, N, K, A_scale, B_scale[, stream], D_out");
+            "pi05.cuda.fp8_*_bf16 expects A, B, M, N, K, A_scale, B_scale[, stream], D_out");
     }
     auto* a = RequireTensor(args[0], "A");
     auto* b = RequireTensor(args[1], "B");
@@ -803,7 +801,7 @@ void FP8Gemm(PackedArgs args, FP8Layout layout) {
     RequireCudaTensor(b_scale, "B_scale");
     auto stream = args.size() == 9
         ? reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(RequireInt(args[7], "stream")))
-        : g_current_packed_stream;
+        : reinterpret_cast<cudaStream_t>(CurrentCUDAPackedFuncStream());
     GlobalRunner().Run(
         layout,
         a->data(),
@@ -821,7 +819,7 @@ void FP8Gemm(PackedArgs args, FP8Layout layout) {
 void FP8GemmAccum(PackedArgs args, FP8Layout layout) {
     if (args.size() < 8 || args.size() > 9) {
         throw std::runtime_error(
-            "runtime.cuda.fp8_*_bf16_accum expects A, B, D_inout, M, N, K, A_scale, B_scale[, stream]");
+            "pi05.cuda.fp8_*_bf16_accum expects A, B, D_inout, M, N, K, A_scale, B_scale[, stream]");
     }
     auto* a = RequireTensor(args[0], "A");
     auto* b = RequireTensor(args[1], "B");
@@ -833,7 +831,7 @@ void FP8GemmAccum(PackedArgs args, FP8Layout layout) {
     auto* b_scale = RequireTensor(args[7], "B_scale");
     cudaStream_t stream = args.size() == 9
         ? reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(RequireInt(args[8], "stream")))
-        : g_current_packed_stream;
+        : reinterpret_cast<cudaStream_t>(CurrentCUDAPackedFuncStream());
     RequireCudaTensor(a, "A");
     RequireCudaTensor(b, "B");
     RequireCudaTensor(d, "D_inout");
@@ -856,7 +854,7 @@ void FP8GemmAccum(PackedArgs args, FP8Layout layout) {
 void BF16Gemm(PackedArgs args, BF16Layout layout) {
     if (args.size() < 6 || args.size() > 7) {
         throw std::runtime_error(
-            "runtime.cuda.bf16_*_bf16 expects A, B, M, N, K[, stream], D_out");
+            "pi05.cuda.bf16_*_bf16 expects A, B, M, N, K[, stream], D_out");
     }
     auto* a = RequireTensor(args[0], "A");
     auto* b = RequireTensor(args[1], "B");
@@ -870,7 +868,7 @@ void BF16Gemm(PackedArgs args, BF16Layout layout) {
     RequireCudaTensor(d, "D");
     auto stream = args.size() == 7
         ? reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(RequireInt(args[5], "stream")))
-        : g_current_packed_stream;
+        : reinterpret_cast<cudaStream_t>(CurrentCUDAPackedFuncStream());
     GlobalBF16Runner().Run(
         layout,
         a->data(),
@@ -885,7 +883,7 @@ void BF16Gemm(PackedArgs args, BF16Layout layout) {
 void Pi05FA2BF16(PackedArgs args) {
     if (args.size() < 11 || args.size() > 12) {
         throw std::runtime_error(
-            "runtime.cuda.pi05_fa2_bf16 expects Q, K, V, rows_q, prefix_rows, suffix_rows, Hq, Hkv, D, scale_bits[, stream], O_out");
+            "pi05.cuda.fa2_bf16 expects Q, K, V, rows_q, prefix_rows, suffix_rows, Hq, Hkv, D, scale_bits[, stream], O_out");
     }
     auto* q = RequireTensor(args[0], "Q");
     auto* k = RequireTensor(args[1], "K");
@@ -906,7 +904,7 @@ void Pi05FA2BF16(PackedArgs args) {
     RequireCudaTensor(out, "O_out");
     auto stream = args.size() == 12
         ? reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(RequireInt(args[10], "stream")))
-        : g_current_packed_stream;
+        : reinterpret_cast<cudaStream_t>(CurrentCUDAPackedFuncStream());
     GlobalFA2Runner().Run(
         q->data(),
         k->data(),
@@ -924,7 +922,7 @@ void Pi05FA2BF16(PackedArgs args) {
 void Pi05FA2BF16Batched(PackedArgs args) {
     if (args.size() < 11 || args.size() > 12) {
         throw std::runtime_error(
-            "runtime.cuda.pi05_fa2_bf16_batched expects Q, K, V, batch, rows_q, rows_k, Hq, Hkv, D, scale_bits[, stream], O_out");
+            "pi05.cuda.fa2_bf16_batched expects Q, K, V, batch, rows_q, rows_k, Hq, Hkv, D, scale_bits[, stream], O_out");
     }
     auto* q = RequireTensor(args[0], "Q");
     auto* k = RequireTensor(args[1], "K");
@@ -944,7 +942,7 @@ void Pi05FA2BF16Batched(PackedArgs args) {
     RequireCudaTensor(out, "O_out");
     auto stream = args.size() == 12
         ? reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(RequireInt(args[10], "stream")))
-        : g_current_packed_stream;
+        : reinterpret_cast<cudaStream_t>(CurrentCUDAPackedFuncStream());
     GlobalFA2Runner().RunBatched(
         q->data(),
         k->data(),
@@ -980,53 +978,31 @@ PackedFunc MakeBF16Packed(BF16Layout layout) {
 
 }  // namespace
 
-void* CurrentCUDAPackedFuncStream() {
-    return static_cast<void*>(g_current_packed_stream);
-}
-
-void SetCUDAPackedFuncStream(void* stream) {
-    g_current_packed_stream = static_cast<cudaStream_t>(stream);
-}
-
-void RegisterCUDAPackedFuncs() {
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.fp8_nn_bf16", MakeFP8Packed(FP8Layout::kNN));
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.fp8_nt_bf16", MakeFP8Packed(FP8Layout::kNT));
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.fp8_nn_bf16_accum", MakeFP8AccumPacked(FP8Layout::kNN));
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.fp8_nt_bf16_accum", MakeFP8AccumPacked(FP8Layout::kNT));
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.bf16_nn_bf16", MakeBF16Packed(BF16Layout::kNN));
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.bf16_nt_bf16", MakeBF16Packed(BF16Layout::kNT));
+extern "C" void devproc2_register_pi05_cuda_backend(PackedFuncRegistry* registry) {
+    PackedFuncRegistry& reg = registry ? *registry : PackedFuncRegistry::Global();
+    reg.RegisterWithDevice(
+        "pi05.cuda.fp8_nn_bf16", MakeFP8Packed(FP8Layout::kNN), "cuda");
+    reg.RegisterWithDevice(
+        "pi05.cuda.fp8_nt_bf16", MakeFP8Packed(FP8Layout::kNT), "cuda");
+    reg.RegisterWithDevice(
+        "pi05.cuda.fp8_nn_bf16_accum", MakeFP8AccumPacked(FP8Layout::kNN), "cuda");
+    reg.RegisterWithDevice(
+        "pi05.cuda.fp8_nt_bf16_accum", MakeFP8AccumPacked(FP8Layout::kNT), "cuda");
+    reg.RegisterWithDevice(
+        "pi05.cuda.bf16_nn_bf16", MakeBF16Packed(BF16Layout::kNN), "cuda");
+    reg.RegisterWithDevice(
+        "pi05.cuda.bf16_nt_bf16", MakeBF16Packed(BF16Layout::kNT), "cuda");
     auto* fa2 = new PackedFuncObj();
     fa2->body = [](PackedArgs args) { Pi05FA2BF16(args); };
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.pi05_fa2_bf16", PackedFunc(fa2));
+    reg.RegisterWithDevice("pi05.cuda.fa2_bf16", PackedFunc(fa2), "cuda");
     auto* fa2_batched = new PackedFuncObj();
     fa2_batched->body = [](PackedArgs args) { Pi05FA2BF16Batched(args); };
-    PackedFuncRegistry::Global().Register(
-        "runtime.cuda.pi05_fa2_bf16_batched", PackedFunc(fa2_batched));
+    reg.RegisterWithDevice(
+        "pi05.cuda.fa2_bf16_batched", PackedFunc(fa2_batched), "cuda");
 }
 
 }  // namespace devproc2
 
 #else
-
-#include "devproc2/runtime/cuda_gemm.h"
-
-namespace devproc2 {
-
-void RegisterCUDAPackedFuncs() {}
-
-void* CurrentCUDAPackedFuncStream() {
-    return nullptr;
-}
-
-void SetCUDAPackedFuncStream(void*) {}
-
-}  // namespace devproc2
 
 #endif  // DEVPROC2_WITH_CUDA

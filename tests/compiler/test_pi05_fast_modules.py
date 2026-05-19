@@ -40,7 +40,7 @@ from devproc2.models.pi05.model import (
     PI05VisionEncoderLayer,
     PI05VisionPatchEmbedding,
 )
-from devproc2.export.pi05 import (
+from devproc2.models.pi05.recipe import (
     emit_pi05_denoise_executable,
     emit_pi05_denoise_loop_executable,
     emit_pi05_paligemma_prefix_encoder_executable,
@@ -120,10 +120,9 @@ def test_pi05_public_imports_use_canonical_modules():
     import devproc2.models.pi05.config as config
     import devproc2.models.pi05.model as model
     import devproc2.models.pi05.ops as pi05_ops
+    import devproc2.models.pi05.recipe as recipe
     import devproc2.models.pi05.weights as weights
-    import devproc2.artifact.pi05 as artifact
-    import devproc2.export.pi05 as export
-    import devproc2.integrations.pi05.weights as integration_weights
+    import devproc2.weights as package_weights
 
     cfg = config.PI05Config()
     assert cfg.precision == "fp8"
@@ -137,21 +136,29 @@ def test_pi05_public_imports_use_canonical_modules():
     assert pkg.PI05DenoiseLoop is model.PI05DenoiseLoop
     assert pkg.PI05PaliGemmaPrefixEncoder is model.PI05PaliGemmaPrefixEncoder
     assert weights.WeightPackageWriter is pkg.WeightPackageWriter
-    assert artifact.prepare_pi05_artifact is not None
-    assert export.emit_pi05_denoise_executable is not None
-    assert integration_weights.convert_pi05_weights is not None
+    assert recipe.pi05_recipe.entrypoint("sample_tokens") is recipe.sample_tokens
+    assert recipe.sample_tokens.packed_backends[0].name == "pi05.cuda"
+    assert recipe.sample_tokens.packed_backends[0].kind == "compiled_packed_backend"
+    assert recipe.sample_tokens.packed_backends[0].to_table_obj(
+        target_arch="sm89",
+    )["library"] == "backends/pi05_cuda.so"
+    assert pkg.pi05_cuda_backend is recipe.pi05_cuda_backend
+    assert package_weights.WeightPackageWriter is not None
     for legacy_name in (
         "devproc2.models.pi05.modules",
         "devproc2.models.pi05.artifact",
         "devproc2.models.pi05.export",
         "devproc2.models.pi05.torch_oracle",
+        "devproc2.export." + "pi05",
+        "devproc2.artifact." + "pi05",
+        "devproc2.integrations." + "pi05",
     ):
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(legacy_name)
 
 
 def test_pi05_normal_compile_rejects_backend_ops_in_forward():
-    from devproc2.export.pi05 import _build_pi05_graph
+    from devproc2.models.pi05.recipe import _build_pi05_graph
 
     source = _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "cuda" / "pi05_kernels.cu"
 
@@ -176,7 +183,7 @@ def test_pi05_normal_compile_rejects_backend_ops_in_forward():
         def forward(self, x):
             out = dp.empty((2, 4), dtype="bfloat16", device="cuda")
             dp.call_dps_packed(
-                "runtime.cuda.bf16_nn_bf16",
+                "pi05.cuda.bf16_nn_bf16",
                 inputs=[x, x, 2, 4, 4, out],
             )
             return out
@@ -220,9 +227,9 @@ def test_pi05_ffn_forward_fast_uses_fused_op():
     targets = [op.target_ref.name for op in dps_ops]
     assert targets == [
         "kernel.pi05_quantize_fp8_static_bf16",
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
         "kernel.pi05_geglu_to_fp8_bf16",
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
     ]
     assert isinstance(dps_ops[0].target_ref, KernelRef)
     assert dps_ops[0].target_ref.spec is not None
@@ -248,10 +255,10 @@ def test_pi05_ffn_forward_fast_uses_dynamic_quant_scales():
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     assert [op.target_ref.name for op in dps_ops] == [
         "kernel.pi05_quantize_fp8_dynamic_bf16",
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
         "kernel.pi05_geglu_bf16",
         "kernel.pi05_quantize_fp8_dynamic_bf16",
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
     ]
     first_quant = dps_ops[0]
     second_quant = dps_ops[3]
@@ -271,7 +278,7 @@ def test_pi05_linear_forward_fast_uses_bf16_packed_gemm():
     ops = _lowered_ops(module, "forward_fast")
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
     assert len(dps_ops) == 1
-    assert dps_ops[0].target_ref.name == "runtime.cuda.bf16_nn_bf16"
+    assert dps_ops[0].target_ref.name == "pi05.cuda.bf16_nn_bf16"
     assert isinstance(dps_ops[0].target_ref, PackedFuncRef)
     create = next(op for op in ops if isinstance(op, TensorCreateOp))
     assert create.results[0].struct_info.shape[1].value == 16
@@ -286,7 +293,7 @@ def test_pi05_linear_forward_fast_bias_uses_inplace_cuda_bias_kernel():
         if isinstance(op, CallDPSOp)
     ]
     assert [op.target_ref.name for op in dps_ops] == [
-        "runtime.cuda.bf16_nn_bf16",
+        "pi05.cuda.bf16_nn_bf16",
         "kernel.pi05_bias_add_bf16",
     ]
     assert not dps_ops[1].outputs
@@ -324,7 +331,7 @@ def test_pi05_vision_patch_embedding_forward_fast_wires_prefix_kernels():
     assert targets == [
         "kernel.pi05_image_u8_to_bf16_norm",
         "kernel.pi05_patch_im2col_bf16",
-        "runtime.cuda.bf16_nn_bf16",
+        "pi05.cuda.bf16_nn_bf16",
         "kernel.pi05_bias_add_bf16",
         "kernel.pi05_position_add_bf16",
     ]
@@ -380,14 +387,14 @@ def test_pi05_vision_encoder_layer_fast_dynamic_wires_siglip_block():
     assert targets[:6] == [
         "kernel.pi05_layer_norm_bf16",
         "kernel.pi05_quantize_fp8_dynamic_bf16",
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
         "kernel.pi05_qkv_bias_split_bf16",
-        "runtime.cuda.pi05_fa2_bf16_batched",
+        "pi05.cuda.fa2_bf16_batched",
         "kernel.pi05_quantize_fp8_dynamic_bf16",
     ]
     assert targets.count("kernel.pi05_layer_norm_bf16") == 2
-    assert targets.count("runtime.cuda.fp8_nt_bf16") == 4
-    assert targets.count("runtime.cuda.fp8_nt_bf16_accum") == 0
+    assert targets.count("pi05.cuda.fp8_nt_bf16") == 4
+    assert targets.count("pi05.cuda.fp8_nt_bf16_accum") == 0
     assert targets.count("kernel.pi05_bias_residual_bf16") == 2
     assert "kernel.pi05_qkv_bias_split_bf16" in targets
     assert "kernel.pi05_gelu_inplace_bf16" in targets
@@ -452,15 +459,15 @@ def test_pi05_vision_encoder_unrolls_layers_and_projects_image_tokens():
     assert targets[:5] == [
         "kernel.pi05_image_u8_to_bf16_norm",
         "kernel.pi05_patch_im2col_bf16",
-        "runtime.cuda.bf16_nn_bf16",
+        "pi05.cuda.bf16_nn_bf16",
         "kernel.pi05_bias_add_bf16",
         "kernel.pi05_position_add_bf16",
     ]
     assert targets.count("kernel.pi05_layer_norm_bf16") == 5
-    assert targets.count("runtime.cuda.fp8_nt_bf16") == 9
-    assert targets.count("runtime.cuda.fp8_nt_bf16_accum") == 0
+    assert targets.count("pi05.cuda.fp8_nt_bf16") == 9
+    assert targets.count("pi05.cuda.fp8_nt_bf16_accum") == 0
     assert targets[-2:] == [
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
         "kernel.pi05_bias_add_bf16",
     ]
     assert isinstance(ret, ReturnOp)
@@ -499,8 +506,8 @@ def test_pi05_vision_encoder_fast_dynamic_lowers_to_vm():
     names = [entry.name for entry in exe.function_table]
     assert "forward_fast" in names
     assert "vm.builtin.tensor_view" in names
-    assert "runtime.cuda.pi05_fa2_bf16_batched" in names
-    assert "runtime.cuda.fp8_nt_bf16" in names
+    assert "pi05.cuda.fa2_bf16_batched" in names
+    assert "pi05.cuda.fp8_nt_bf16" in names
 
 
 def test_pi05_paligemma_encoder_layer_fast_dynamic_wires_rope_attention_and_ffn():
@@ -526,13 +533,13 @@ def test_pi05_paligemma_encoder_layer_fast_dynamic_wires_rope_attention_and_ffn(
     assert targets[:5] == [
         "kernel.pi05_rms_norm_unit_bf16",
         "kernel.pi05_quantize_fp8_dynamic_bf16",
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
         "kernel.pi05_qkv_split_rope_bf16",
         "kernel.pi05_attention_bf16",
     ]
     assert targets.count("kernel.pi05_rms_norm_unit_bf16") == 2
-    assert targets.count("runtime.cuda.fp8_nt_bf16") == 2
-    assert targets.count("runtime.cuda.fp8_nt_bf16_accum") == 2
+    assert targets.count("pi05.cuda.fp8_nt_bf16") == 2
+    assert targets.count("pi05.cuda.fp8_nt_bf16_accum") == 2
     assert targets.count("kernel.pi05_residual_add_bf16") == 0
     assert "kernel.pi05_geglu_bf16" in targets
     names = [p.name for p in module.functions["forward_fast"].params]
@@ -596,8 +603,8 @@ def test_pi05_paligemma_prefix_encoder_unrolls_and_lowers_to_vm():
     assert targets.count("kernel.pi05_rms_norm_unit_bf16") == 4
     assert targets.count("kernel.pi05_qkv_split_rope_bf16") == 2
     assert targets.count("kernel.pi05_attention_bf16") == 2
-    assert targets.count("runtime.cuda.fp8_nt_bf16") == 4
-    assert targets.count("runtime.cuda.fp8_nt_bf16_accum") == 4
+    assert targets.count("pi05.cuda.fp8_nt_bf16") == 4
+    assert targets.count("pi05.cuda.fp8_nt_bf16_accum") == 4
     assert isinstance(ret, ReturnOp)
     assert ret.values[0].struct_info.shape[0].value == 5
     names = [p.name for p in fn.params]
@@ -647,7 +654,7 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
     assert shape_tuple(creates[1].shape) == (2, 5, 1, 4)
     assert targets.count("kernel.pi05_qkv_split_rope_cache_bf16") == 2
     assert targets.count("kernel.pi05_copy_kv_cache_layer_bf16") == 0
-    assert targets.count("runtime.cuda.pi05_fa2_bf16") == 1
+    assert targets.count("pi05.cuda.fa2_bf16") == 1
     assert isinstance(ret, ReturnOp)
     assert isinstance(ret.values[0].op, TupleOp)
 
@@ -709,7 +716,7 @@ def test_pi05_sample_actions_from_prefix_embeddings_chains_prefix_kv_and_denoise
     ]
     assert targets.count("kernel.pi05_qkv_split_rope_cache_bf16") == 1
     assert targets.count("kernel.pi05_copy_kv_cache_layer_bf16") == 0
-    assert targets.count("runtime.cuda.pi05_fa2_bf16") == 2
+    assert targets.count("pi05.cuda.fa2_bf16") == 2
     assert targets.count("kernel.pi05_euler_update_bf16") == 2
     assert isinstance(ret, ReturnOp)
     assert ret.values[0].struct_info.dtype == "float32"
@@ -864,7 +871,7 @@ def test_pi05_decoder_layer_fast_dynamic_wires_views_kv_and_inplace_residual():
     targets = [op.target_ref.name for op in dps_ops]
     assert "kernel.pi05_qkv_split_rope_concat_bf16" in targets
     assert "kernel.pi05_kv_concat_bf16" not in targets
-    assert "runtime.cuda.pi05_fa2_bf16" in targets
+    assert "pi05.cuda.fa2_bf16" in targets
     assert targets.count("kernel.pi05_gate_mul_residual_bf16") == 2
     inplace = [op for op in dps_ops if op.target_ref.name == "kernel.pi05_gate_mul_residual_bf16"]
     assert all(not op.outputs for op in inplace)
@@ -907,7 +914,7 @@ def test_pi05_denoise_step_fast_dynamic_wires_action_cast_layers_and_delta():
     assert targets.count("kernel.pi05_qkv_split_rope_concat_bf16") == 2
     assert targets.count("kernel.pi05_kv_concat_bf16") == 0
     assert targets[-2:] == [
-        "runtime.cuda.bf16_nn_bf16",
+        "pi05.cuda.bf16_nn_bf16",
         "kernel.pi05_bias_add_bf16",
     ]
     names = [p.name for p in module.functions["forward_fast"].params]
@@ -1008,7 +1015,7 @@ def test_pi05_denoise_step_fast_dynamic_lowers_to_vm():
     assert "forward_fast" in names
     assert "vm.builtin.tensor_view" in names
     assert "kernel.pi05_qkv_split_rope_concat_bf16" in names
-    assert "runtime.cuda.fp8_nt_bf16" in names
+    assert "pi05.cuda.fp8_nt_bf16" in names
 
 
 def test_pi05_denoise_input_specs_match_default_oracle_shapes():
@@ -1147,8 +1154,8 @@ def test_pi05_denoise_export_emits_main_vm_and_abi(tmp_path):
     assert "precomputed.decoder_style_final" in names
     assert "decoder_action_out_proj_b" in names
     assert {entry["name"] for entry in packed_table} >= {
-        "runtime.cuda.bf16_nn_bf16",
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.bf16_nn_bf16",
+        "pi05.cuda.fp8_nt_bf16",
     }
 
 
@@ -1179,7 +1186,7 @@ def test_pi05_denoise_loop_export_emits_main_vm_and_abi(tmp_path):
     assert abi["outputs"] == [{"dtype": "float32", "shape": [5, 4], "device": "cuda"}]
     assert "step" not in names[: summary.num_user_inputs]
     assert "kernel.pi05_euler_update_bf16" in fn_names
-    assert "runtime.cuda.pi05_fa2_bf16" in fn_names
+    assert "pi05.cuda.fa2_bf16" in fn_names
 
 
 def test_pi05_sample_actions_precomputed_prefix_export_emits_sample_actions_abi(tmp_path):
@@ -1214,7 +1221,7 @@ def test_pi05_sample_actions_precomputed_prefix_export_emits_sample_actions_abi(
     assert "actions_f32" not in names[:5]
     assert abi["outputs"] == [{"dtype": "float32", "shape": [5, 4], "device": "cuda"}]
     assert "kernel.pi05_euler_update_bf16" in fn_names
-    assert "runtime.cuda.pi05_fa2_bf16" in fn_names
+    assert "pi05.cuda.fa2_bf16" in fn_names
 
 
 def test_pi05_sample_actions_precomputed_prefix_embs_export_emits_single_artifact_abi(tmp_path):
@@ -1250,9 +1257,9 @@ def test_pi05_sample_actions_precomputed_prefix_embs_export_emits_single_artifac
     ]
     assert abi["outputs"] == [{"dtype": "float32", "shape": [5, 4], "device": "cuda"}]
     assert "kernel.pi05_qkv_split_rope_cache_bf16" in fn_names
-    assert "runtime.cuda.pi05_fa2_bf16" in fn_names
+    assert "pi05.cuda.fa2_bf16" in fn_names
     assert "kernel.pi05_euler_update_bf16" in fn_names
-    assert "runtime.cuda.pi05_fa2_bf16" in fn_names
+    assert "pi05.cuda.fa2_bf16" in fn_names
     assert "fp8.encoder_attn_qkv_w_0.weight" in names
     assert "fp8.decoder_attn_qkv_w_0.weight" in names
 
@@ -1281,8 +1288,8 @@ def test_pi05_vision_encoder_export_emits_main_vm_and_abi(tmp_path):
     assert names[0] == "images_u8"
     assert abi["outputs"] == [{"dtype": "bfloat16", "shape": [4, 12], "device": "cuda"}]
     assert "kernel.pi05_image_u8_to_bf16_norm" in fn_names
-    assert "runtime.cuda.pi05_fa2_bf16_batched" in fn_names
-    assert "runtime.cuda.fp8_nt_bf16" in fn_names
+    assert "pi05.cuda.fa2_bf16_batched" in fn_names
+    assert "pi05.cuda.fp8_nt_bf16" in fn_names
     assert "fp8.vision_projector_w.weight" in names
 
 
@@ -1309,7 +1316,7 @@ def test_pi05_paligemma_prefix_encoder_export_emits_main_vm_and_abi(tmp_path):
     assert abi["outputs"] == [{"dtype": "bfloat16", "shape": [5, 8], "device": "cuda"}]
     assert "kernel.pi05_rms_norm_unit_bf16" in fn_names
     assert "kernel.pi05_qkv_split_rope_bf16" in fn_names
-    assert "runtime.cuda.fp8_nt_bf16" in fn_names
+    assert "pi05.cuda.fp8_nt_bf16" in fn_names
     assert "fp8.encoder_attn_qkv_w_0.weight" in names
     assert "fp8.encoder_ffn_down_w_0.scale" in names
 

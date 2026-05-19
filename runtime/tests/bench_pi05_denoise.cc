@@ -71,7 +71,7 @@ double diff_abs_mean(const std::vector<float>& got, const std::vector<float>& wa
 int main(int argc, char** argv) {
     const int iters = argc > 1 ? std::max(1, std::atoi(argv[1])) : 5;
     bool use_graph = true;
-    bool entry_is_loop = false;
+    bool entry_is_loop = true;
     bool entry_is_sample_precomputed = false;
     bool entry_uses_prefix_embs = false;
     bool entry_uses_tokens = false;

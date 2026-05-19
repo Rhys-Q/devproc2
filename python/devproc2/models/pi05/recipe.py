@@ -1,4 +1,4 @@
-"""Pi0.5 executable/artifact export helpers."""
+"""Pi0.5 compile recipe and model-owned export helpers."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,7 +24,9 @@ from devproc2.compiler.passes.vm_codegen import VMCodegenPass
 from devproc2.ir.nodes import Function, IRModule
 from devproc2.ir.ops import CallDPSOp, CudaCallOp, ReturnOp
 from devproc2.nn import GraphBuilder, Module, ModuleList, ScalarSpec, TensorSpec
-from devproc2.artifact.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact
+from devproc2.artifact.builder import ArtifactBuildSummary, prepare_artifact
+from devproc2.artifact.manifest import PackedBackendRecipe, PackedFuncSpec, ResourceSpec
+from devproc2.export.recipe import CompileRecipe, EntrypointRecipe
 from devproc2.models.pi05.model import (
     PI05DenoiseLoop,
     PI05DenoiseStep,
@@ -36,6 +38,7 @@ from devproc2.models.pi05.model import (
 from devproc2.vm.executable import Executable
 
 
+PI05_MODEL_ID = "openpi0.5"
 DEFAULT_PREFIX_ROWS = 968
 DEFAULT_ACTION_HORIZON = 50
 DEFAULT_ACTION_DIM = 32
@@ -61,6 +64,7 @@ DEFAULT_VISION_HEADS = 16
 DEFAULT_VISION_OUTPUT_SIZE = 2048
 
 PI05CompileMode = str
+Pi05ArtifactSummary = ArtifactBuildSummary
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,48 @@ class Pi05DenoiseExportSummary:
             payload["tokenizer"] = self.resource_summary.tokenizer
             payload["fp8_layout"] = self.resource_summary.fp8_layout
         return payload
+
+
+def prepare_pi05_artifact(
+    *,
+    weight_package_dir: str | Path,
+    artifact_dir: str | Path,
+    tokenizer_model_path: str | Path | None = None,
+    sm_arch: int = 89,
+    compile_kernels: bool = True,
+    compile_backends: bool = True,
+    nvcc: str | None = None,
+    backend_build_dir: str | Path | None = None,
+    backend_library_dirs: tuple[str | Path, ...] = (),
+    entrypoint: str = "unknown",
+) -> Pi05ArtifactSummary:
+    resources: list[ResourceSpec] = []
+    if tokenizer_model_path is not None:
+        resources.append(
+            ResourceSpec(
+                name="tokenizer",
+                path=tokenizer_model_path,
+                target_path="resources/tokenizer.model",
+                metadata={
+                    "tokenizer_kind": "sentencepiece",
+                    "tokenizer_model": "paligemma",
+                },
+            )
+        )
+    return prepare_artifact(
+        model_id=PI05_MODEL_ID,
+        entrypoint=entrypoint,
+        weight_package_dir=weight_package_dir,
+        artifact_dir=artifact_dir,
+        resources=tuple(resources),
+        packed_backends=(pi05_cuda_backend,),
+        sm_arch=sm_arch,
+        compile_kernels=compile_kernels,
+        compile_backends=compile_backends,
+        nvcc=nvcc,
+        backend_build_dir=backend_build_dir,
+        backend_library_dirs=backend_library_dirs,
+    )
 
 
 def _normalize_compile_mode(compile_mode: PI05CompileMode) -> str:
@@ -1280,6 +1326,7 @@ def export_pi05_denoise_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="step",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1320,6 +1367,7 @@ def export_pi05_denoise_loop_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="loop",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1360,6 +1408,7 @@ def export_pi05_sample_actions_precomputed_prefix_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="sample_precomputed_prefix",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1400,6 +1449,7 @@ def export_pi05_sample_actions_precomputed_prefix_embs_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="sample_precomputed_prefix_embs",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1440,6 +1490,7 @@ def export_pi05_sample_actions_tokens_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="sample_tokens",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1480,6 +1531,7 @@ def export_pi05_vision_encoder_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="vision_encoder",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1520,6 +1572,7 @@ def export_pi05_paligemma_prefix_encoder_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="paligemma_prefix_encoder",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1560,6 +1613,7 @@ def export_pi05_paligemma_prefix_kv_encoder_artifact(
             sm_arch=sm_arch,
             compile_kernels=compile_kernels,
             nvcc=nvcc,
+            entrypoint="paligemma_prefix_kv_encoder",
         )
     return Pi05DenoiseExportSummary(
         artifact_dir=summary.artifact_dir,
@@ -1571,6 +1625,342 @@ def export_pi05_paligemma_prefix_kv_encoder_artifact(
         storage_bytes=summary.storage_bytes,
         resource_summary=resource_summary,
     )
+
+
+def _opt(options: dict[str, Any] | object, name: str, default: Any) -> Any:
+    if isinstance(options, dict):
+        return options.get(name, default)
+    return default
+
+
+def _denoise_step_module(options: dict[str, Any]) -> Module:
+    return PI05DenoiseStep(
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_HIDDEN_SIZE)),
+        intermediate_size=int(_opt(options, "intermediate_size", DEFAULT_INTERMEDIATE_SIZE)),
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        num_steps=int(_opt(options, "num_steps", DEFAULT_NUM_STEPS)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        num_q_heads=int(_opt(options, "num_q_heads", DEFAULT_NUM_Q_HEADS)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+        use_static_act_scales=bool(_opt(options, "use_static_act_scales", False)),
+    )
+
+
+def _denoise_loop_module(options: dict[str, Any]) -> Module:
+    return PI05DenoiseLoop(
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_HIDDEN_SIZE)),
+        intermediate_size=int(_opt(options, "intermediate_size", DEFAULT_INTERMEDIATE_SIZE)),
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        num_steps=int(_opt(options, "num_steps", DEFAULT_NUM_STEPS)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        num_q_heads=int(_opt(options, "num_q_heads", DEFAULT_NUM_Q_HEADS)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+        use_static_act_scales=bool(_opt(options, "use_static_act_scales", False)),
+    )
+
+
+def _sample_prefix_embs_module(options: dict[str, Any]) -> Module:
+    return PI05SampleActionsFromPrefixEmbeddings(
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        prefix_hidden_size=int(_opt(options, "prefix_hidden_size", DEFAULT_PREFIX_HIDDEN_SIZE)),
+        prefix_intermediate_size=int(
+            _opt(options, "prefix_intermediate_size", DEFAULT_PREFIX_INTERMEDIATE_SIZE)
+        ),
+        decoder_hidden_size=int(_opt(options, "decoder_hidden_size", DEFAULT_HIDDEN_SIZE)),
+        decoder_intermediate_size=int(
+            _opt(options, "decoder_intermediate_size", DEFAULT_INTERMEDIATE_SIZE)
+        ),
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        num_steps=int(_opt(options, "num_steps", DEFAULT_NUM_STEPS)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        num_q_heads=int(_opt(options, "num_q_heads", DEFAULT_NUM_Q_HEADS)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+        use_static_act_scales=bool(_opt(options, "use_static_act_scales", False)),
+    )
+
+
+def _sample_tokens_module(options: dict[str, Any]) -> Module:
+    return PI05SampleActionsFromTokens(
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        num_views=int(_opt(options, "num_views", DEFAULT_VISION_VIEWS)),
+        image_size=int(_opt(options, "image_size", DEFAULT_IMAGE_SIZE)),
+        patch_size=int(_opt(options, "patch_size", DEFAULT_PATCH_SIZE)),
+        image_channels=int(_opt(options, "image_channels", DEFAULT_IMAGE_CHANNELS)),
+        vision_layers=int(_opt(options, "vision_layers", DEFAULT_VISION_LAYERS)),
+        vision_hidden_size=int(_opt(options, "vision_hidden_size", DEFAULT_VISION_HIDDEN_SIZE)),
+        vision_intermediate_size=int(
+            _opt(options, "vision_intermediate_size", DEFAULT_VISION_INTERMEDIATE_SIZE)
+        ),
+        vision_heads=int(_opt(options, "vision_heads", DEFAULT_VISION_HEADS)),
+        vocab_size=int(_opt(options, "vocab_size", DEFAULT_VOCAB_SIZE)),
+        max_prompt_len=int(_opt(options, "max_prompt_len", DEFAULT_MAX_PROMPT_LEN)),
+        prefix_hidden_size=int(_opt(options, "prefix_hidden_size", DEFAULT_PREFIX_HIDDEN_SIZE)),
+        prefix_intermediate_size=int(
+            _opt(options, "prefix_intermediate_size", DEFAULT_PREFIX_INTERMEDIATE_SIZE)
+        ),
+        decoder_hidden_size=int(_opt(options, "decoder_hidden_size", DEFAULT_HIDDEN_SIZE)),
+        decoder_intermediate_size=int(
+            _opt(options, "decoder_intermediate_size", DEFAULT_INTERMEDIATE_SIZE)
+        ),
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        num_steps=int(_opt(options, "num_steps", DEFAULT_NUM_STEPS)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        num_q_heads=int(_opt(options, "num_q_heads", DEFAULT_NUM_Q_HEADS)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+        use_static_act_scales=bool(_opt(options, "use_static_act_scales", False)),
+    )
+
+
+def _vision_encoder_module(options: dict[str, Any]) -> Module:
+    return PI05VisionEncoder(
+        num_layers=int(_opt(options, "num_layers", DEFAULT_VISION_LAYERS)),
+        num_views=int(_opt(options, "num_views", DEFAULT_VISION_VIEWS)),
+        image_size=int(_opt(options, "image_size", DEFAULT_IMAGE_SIZE)),
+        patch_size=int(_opt(options, "patch_size", DEFAULT_PATCH_SIZE)),
+        in_channels=int(_opt(options, "image_channels", DEFAULT_IMAGE_CHANNELS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_VISION_HIDDEN_SIZE)),
+        intermediate_size=int(_opt(options, "intermediate_size", DEFAULT_VISION_INTERMEDIATE_SIZE)),
+        num_heads=int(_opt(options, "num_heads", DEFAULT_VISION_HEADS)),
+        output_size=int(_opt(options, "output_size", DEFAULT_VISION_OUTPUT_SIZE)),
+        device=str(_opt(options, "device", "cuda")),
+        use_static_act_scales=bool(_opt(options, "use_static_act_scales", False)),
+    )
+
+
+def _prefix_encoder_module(options: dict[str, Any]) -> Module:
+    return PI05PaliGemmaPrefixEncoder(
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_PREFIX_HIDDEN_SIZE)),
+        intermediate_size=int(_opt(options, "intermediate_size", DEFAULT_PREFIX_INTERMEDIATE_SIZE)),
+        num_q_heads=int(_opt(options, "num_q_heads", DEFAULT_NUM_Q_HEADS)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+        use_static_act_scales=bool(_opt(options, "use_static_act_scales", False)),
+    )
+
+
+def _denoise_step_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_denoise_input_specs(
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        prefix_rows=int(_opt(options, "prefix_rows", DEFAULT_PREFIX_ROWS)),
+        num_steps=int(_opt(options, "num_steps", DEFAULT_NUM_STEPS)),
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_HIDDEN_SIZE)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+def _denoise_loop_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_denoise_loop_input_specs(
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        prefix_rows=int(_opt(options, "prefix_rows", DEFAULT_PREFIX_ROWS)),
+        num_steps=int(_opt(options, "num_steps", DEFAULT_NUM_STEPS)),
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_HIDDEN_SIZE)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+def _sample_prefix_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_sample_actions_precomputed_prefix_input_specs(
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        prefix_rows=int(_opt(options, "prefix_rows", DEFAULT_PREFIX_ROWS)),
+        num_steps=int(_opt(options, "num_steps", DEFAULT_NUM_STEPS)),
+        num_layers=int(_opt(options, "num_layers", DEFAULT_NUM_LAYERS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_HIDDEN_SIZE)),
+        num_kv_heads=int(_opt(options, "num_kv_heads", DEFAULT_NUM_KV_HEADS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+def _sample_prefix_embs_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_sample_actions_precomputed_prefix_embs_input_specs(
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        prefix_rows=int(_opt(options, "prefix_rows", DEFAULT_PREFIX_ROWS)),
+        prefix_hidden_size=int(_opt(options, "prefix_hidden_size", DEFAULT_PREFIX_HIDDEN_SIZE)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+def _sample_tokens_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_sample_actions_tokens_input_specs(
+        action_horizon=int(_opt(options, "action_horizon", DEFAULT_ACTION_HORIZON)),
+        action_dim=int(_opt(options, "action_dim", DEFAULT_ACTION_DIM)),
+        num_views=int(_opt(options, "num_views", DEFAULT_VISION_VIEWS)),
+        image_size=int(_opt(options, "image_size", DEFAULT_IMAGE_SIZE)),
+        image_channels=int(_opt(options, "image_channels", DEFAULT_IMAGE_CHANNELS)),
+        max_prompt_len=int(_opt(options, "max_prompt_len", DEFAULT_MAX_PROMPT_LEN)),
+        prefix_rows=int(_opt(options, "prefix_rows", DEFAULT_PREFIX_ROWS)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+def _vision_encoder_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_vision_encoder_input_specs(
+        num_views=int(_opt(options, "num_views", DEFAULT_VISION_VIEWS)),
+        image_size=int(_opt(options, "image_size", DEFAULT_IMAGE_SIZE)),
+        image_channels=int(_opt(options, "image_channels", DEFAULT_IMAGE_CHANNELS)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+def _prefix_encoder_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_paligemma_prefix_encoder_input_specs(
+        prefix_rows=int(_opt(options, "prefix_rows", DEFAULT_PREFIX_ROWS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_PREFIX_HIDDEN_SIZE)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+def _prefix_kv_encoder_specs(options: dict[str, Any]) -> dict[str, object]:
+    return pi05_paligemma_prefix_kv_encoder_input_specs(
+        prefix_rows=int(_opt(options, "prefix_rows", DEFAULT_PREFIX_ROWS)),
+        hidden_size=int(_opt(options, "hidden_size", DEFAULT_PREFIX_HIDDEN_SIZE)),
+        head_dim=int(_opt(options, "head_dim", DEFAULT_HEAD_DIM)),
+        device=str(_opt(options, "device", "cuda")),
+    )
+
+
+pi05_cuda_backend = PackedBackendRecipe(
+    name="pi05.cuda",
+    kind="compiled_packed_backend",
+    sources=(
+        "python/devproc2/models/pi05/cuda/backends/fp8_gemm/cublaslt_runner.cc",
+        "python/devproc2/models/pi05/cuda/backends/fp8_gemm/cutlass_fp8_gemm_sm89.cu",
+        "python/devproc2/models/pi05/cuda/fa2/fa2_wrapper.cu",
+    ),
+    include_dirs=(
+        "runtime/include",
+        "python/devproc2/models/pi05/cuda/backends/fp8_gemm",
+        "python/devproc2/models/pi05/cuda/fa2",
+        "python/devproc2/models/pi05/cuda/fa2/flash_attn_2_src",
+    ),
+    compile_definitions=(
+        "DEVPROC2_WITH_CUDA",
+        "DEVPROC2_WITH_CUTLASS",
+        "DEVPROC2_WITH_PI05_FA2",
+    ),
+    link_libraries=("CUDA::cudart", "CUDA::cublasLt"),
+    targets=("sm89",),
+    register_symbol="devproc2_register_pi05_cuda_backend",
+    packed_funcs=(
+        PackedFuncSpec("pi05.cuda.fp8_nn_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fp8_nt_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fp8_nn_bf16_accum", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fp8_nt_bf16_accum", device="cuda"),
+        PackedFuncSpec("pi05.cuda.bf16_nn_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.bf16_nt_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fa2_bf16", device="cuda"),
+        PackedFuncSpec("pi05.cuda.fa2_bf16_batched", device="cuda"),
+    ),
+)
+
+
+step = EntrypointRecipe(
+    name="step",
+    model_id=PI05_MODEL_ID,
+    build_module=_denoise_step_module,
+    input_specs=_denoise_step_specs,
+    model_name="openpi0.5-denoise-fast",
+    packed_backends=(pi05_cuda_backend,),
+)
+loop = EntrypointRecipe(
+    name="loop",
+    model_id=PI05_MODEL_ID,
+    build_module=_denoise_loop_module,
+    input_specs=_denoise_loop_specs,
+    model_name="openpi0.5-denoise-loop-fast",
+    packed_backends=(pi05_cuda_backend,),
+)
+sample_precomputed_prefix = EntrypointRecipe(
+    name="sample_precomputed_prefix",
+    model_id=PI05_MODEL_ID,
+    build_module=_denoise_loop_module,
+    input_specs=_sample_prefix_specs,
+    model_name="openpi0.5-sample-actions-precomputed-prefix",
+    packed_backends=(pi05_cuda_backend,),
+)
+sample_precomputed_prefix_embs = EntrypointRecipe(
+    name="sample_precomputed_prefix_embs",
+    model_id=PI05_MODEL_ID,
+    build_module=_sample_prefix_embs_module,
+    input_specs=_sample_prefix_embs_specs,
+    model_name="openpi0.5-sample-actions-precomputed-prefix-embs",
+    packed_backends=(pi05_cuda_backend,),
+)
+sample_tokens = EntrypointRecipe(
+    name="sample_tokens",
+    model_id=PI05_MODEL_ID,
+    build_module=_sample_tokens_module,
+    input_specs=_sample_tokens_specs,
+    model_name="openpi0.5-sample-actions-tokens",
+    packed_backends=(pi05_cuda_backend,),
+)
+vision_encoder = EntrypointRecipe(
+    name="vision_encoder",
+    model_id=PI05_MODEL_ID,
+    build_module=_vision_encoder_module,
+    input_specs=_vision_encoder_specs,
+    model_name="openpi0.5-vision-encoder-fast",
+    packed_backends=(pi05_cuda_backend,),
+)
+paligemma_prefix_encoder = EntrypointRecipe(
+    name="paligemma_prefix_encoder",
+    model_id=PI05_MODEL_ID,
+    build_module=_prefix_encoder_module,
+    input_specs=_prefix_encoder_specs,
+    model_name="openpi0.5-paligemma-prefix-encoder-fast",
+    packed_backends=(pi05_cuda_backend,),
+)
+paligemma_prefix_kv_encoder = EntrypointRecipe(
+    name="paligemma_prefix_kv_encoder",
+    model_id=PI05_MODEL_ID,
+    build_module=_prefix_encoder_module,
+    input_specs=_prefix_kv_encoder_specs,
+    normal_method="materialize_kv",
+    fast_method="materialize_kv_fast",
+    model_name="openpi0.5-paligemma-prefix-kv-encoder-fast",
+    packed_backends=(pi05_cuda_backend,),
+)
+pi05_recipe = CompileRecipe(
+    model_id=PI05_MODEL_ID,
+    entrypoints={
+        item.name: item
+        for item in (
+            step,
+            loop,
+            sample_precomputed_prefix,
+            sample_precomputed_prefix_embs,
+            sample_tokens,
+            vision_encoder,
+            paligemma_prefix_encoder,
+            paligemma_prefix_kv_encoder,
+        )
+    },
+)
 
 
 def _stamp_single_return_struct_info(module: IRModule) -> IRModule:

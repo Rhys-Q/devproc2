@@ -132,7 +132,7 @@ weight pkg source: /root/tools/pi05_libero_base/model.safetensors
 
 ```bash
 python - <<'PY'
-from devproc2.integrations.pi05.weights import convert_pi05_weights
+from tools.pi05.convert_weights import convert_pi05_weights
 
 convert_pi05_weights(
     checkpoint_dir="/root/tools/pi05_libero_base",
@@ -344,30 +344,30 @@ token_valid_len: [127, 132, 138, 132, 136, 126, 134, 138, 130, 137]
 真实 dump 对点主线使用 3-view / P=968：
 
 ```bash
-python -m devproc2.export.pi05 \
-  --entry-kind sample_tokens \
+PYTHONPATH=python python -m devproc2.export.cli \
+  --recipe devproc2.models.pi05.recipe:sample_tokens \
   --artifact-dir build/pi05_fp8_sample_tokens_3v968_artifact \
   --weight-package-dir "$PI05_WEIGHT_PKG" \
-  --tokenizer-model-path "$PI05_TOKENIZER" \
-  --prefix-rows 968 \
-  --max-prompt-len 200 \
-  --num-views 3 \
+  --resource tokenizer="$PI05_TOKENIZER" \
+  --option prefix_rows=968 \
+  --option max_prompt_len=200 \
+  --option num_views=3 \
   --sm-arch 89 \
-  --use-static-act-scales
+  --option use_static_act_scales=true
 ```
 
 性能 smoke 可继续导出 3-view / P=769 的历史 synthetic 形态：
 
 ```bash
-python -m devproc2.export.pi05 \
-  --entry-kind sample_tokens \
+PYTHONPATH=python python -m devproc2.export.cli \
+  --recipe devproc2.models.pi05.recipe:sample_tokens \
   --artifact-dir build/pi05_fp8_sample_tokens_3v769_artifact \
   --weight-package-dir "$PI05_WEIGHT_PKG" \
-  --tokenizer-model-path "$PI05_TOKENIZER" \
-  --prefix-rows 769 \
-  --max-prompt-len 1 \
-  --num-views 3 \
-  --sm-arch 89 \
+  --resource tokenizer="$PI05_TOKENIZER" \
+  --option prefix_rows=769 \
+  --option max_prompt_len=1 \
+  --option num_views=3 \
+  --sm-arch 89
   --use-static-act-scales
 ```
 
@@ -828,14 +828,14 @@ OMP_NUM_THREADS=1 PYTHONPATH=$OPENPI_ROOT:$OPENPI_ROOT/src "$OPENPI_PY" \
 # 2. 按“从 Dump 生成 Runtime Raw”一节生成 $PI05_DUMP_RAW。
 
 # 3. 导出 P=968 full-token artifact。
-python -m devproc2.export.pi05 \
-  --entry-kind sample_tokens \
+PYTHONPATH=python python -m devproc2.export.cli \
+  --recipe devproc2.models.pi05.recipe:sample_tokens \
   --artifact-dir build/pi05_fp8_sample_tokens_3v968_artifact \
   --weight-package-dir "$PI05_WEIGHT_PKG" \
-  --tokenizer-model-path "$PI05_TOKENIZER" \
-  --prefix-rows 968 \
-  --max-prompt-len 200 \
-  --num-views 3 \
+  --resource tokenizer="$PI05_TOKENIZER" \
+  --option prefix_rows=968 \
+  --option max_prompt_len=200 \
+  --option num_views=3 \
   --sm-arch 89 \
   --use-static-act-scales
 

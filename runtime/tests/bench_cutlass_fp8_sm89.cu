@@ -2,7 +2,7 @@
 //
 // This intentionally stays outside the default test list.  Build manually with
 // nvcc when evaluating whether a shape-specialized CUTLASS path is worth
-// wiring into runtime.cuda.fp8_nt_bf16.
+// wiring into pi05.cuda.fp8_nt_bf16.
 
 #include <cuda_runtime.h>
 

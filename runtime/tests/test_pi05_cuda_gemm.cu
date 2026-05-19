@@ -3,14 +3,17 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <dlfcn.h>
 #include <dlpack/dlpack.h>
 
-#include "devproc2/runtime/cuda_gemm.h"
 #include "devproc2/runtime/device_api.h"
+#include "devproc2/runtime/packed_backend.h"
 #include "devproc2/runtime/packed_func.h"
 #include "devproc2/runtime/tensor.h"
 #include "devproc2/runtime/vm_value.h"
@@ -43,6 +46,36 @@ int g_fail = 0;
 
 using namespace devproc2;
 
+#ifndef DEVPROC2_PI05_CUDA_BACKEND_SO
+#define DEVPROC2_PI05_CUDA_BACKEND_SO "libdevproc2_pi05_cuda_backend.so"
+#endif
+
+using BackendRegisterFn = void (*)(PackedFuncRegistry*);
+
+void register_pi05_cuda_backend_for_test() {
+    (void)CurrentCUDAPackedFuncStream();
+    static void* handle = []() -> void* {
+        void* h = dlopen(DEVPROC2_PI05_CUDA_BACKEND_SO, RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            const char* err = dlerror();
+            throw std::runtime_error(
+                std::string("failed to dlopen Pi0.5 CUDA backend: ") +
+                (err ? err : "unknown error"));
+        }
+        return h;
+    }();
+    dlerror();
+    auto* fn = reinterpret_cast<BackendRegisterFn>(
+        dlsym(handle, "devproc2_register_pi05_cuda_backend"));
+    const char* err = dlerror();
+    if (err || !fn) {
+        throw std::runtime_error(
+            std::string("failed to resolve Pi0.5 CUDA backend register symbol: ") +
+            (err ? err : "missing symbol"));
+    }
+    fn(&PackedFuncRegistry::Global());
+}
+
 template <typename T>
 static Tensor external_cpu_tensor(std::vector<T>& data,
                                   std::vector<int64_t> shape,
@@ -51,8 +84,8 @@ static Tensor external_cpu_tensor(std::vector<T>& data,
 }
 
 void test_fp8_nt_bf16_matches_small_reference() {
-    RegisterCUDAPackedFuncs();
-    auto pf = PackedFuncRegistry::Global().Get("runtime.cuda.fp8_nt_bf16");
+    register_pi05_cuda_backend_for_test();
+    auto pf = PackedFuncRegistry::Global().Get("pi05.cuda.fp8_nt_bf16");
     CHECK(pf.defined());
 
     constexpr int M = 16;
@@ -121,8 +154,8 @@ void test_fp8_nt_bf16_matches_small_reference() {
 }
 
 void test_bf16_nn_bf16_matches_small_reference() {
-    RegisterCUDAPackedFuncs();
-    auto pf = PackedFuncRegistry::Global().Get("runtime.cuda.bf16_nn_bf16");
+    register_pi05_cuda_backend_for_test();
+    auto pf = PackedFuncRegistry::Global().Get("pi05.cuda.bf16_nn_bf16");
     CHECK(pf.defined());
 
     constexpr int M = 8;
@@ -183,8 +216,8 @@ void test_bf16_nn_bf16_matches_small_reference() {
 }
 
 void test_fp8_nt_bf16_accum_adds_into_output() {
-    RegisterCUDAPackedFuncs();
-    auto pf = PackedFuncRegistry::Global().Get("runtime.cuda.fp8_nt_bf16_accum");
+    register_pi05_cuda_backend_for_test();
+    auto pf = PackedFuncRegistry::Global().Get("pi05.cuda.fp8_nt_bf16_accum");
     CHECK(pf.defined());
 
     constexpr int M = 16;

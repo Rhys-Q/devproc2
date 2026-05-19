@@ -1,12 +1,8 @@
 """Pi0.5 deploy weight specs and package writer."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-import json
 from pathlib import Path
-from typing import Any, Literal
 
-import numpy as np
 
 from devproc2.quantization import (
     FusionComponentSpec,
@@ -14,12 +10,17 @@ from devproc2.quantization import (
     QuantTensorSpec,
     QuantizationManifest,
 )
+from devproc2.weights import (
+    BF16,
+    FP16,
+    FP32,
+    FP8_E4M3,
+    QuantSpec,
+    WeightEntry,
+    WeightPackageWriter as _WeightPackageWriter,
+)
 
 
-BF16 = "bfloat16"
-FP16 = "float16"
-FP32 = "float32"
-FP8_E4M3 = "fp8_e4m3"
 PI05_MODEL_NAME = "open" + "pi0.5"
 
 VIS_L = 27
@@ -49,52 +50,6 @@ def pi05_fp8_scale_name(logical_name: str, layer_idx: int | None = None) -> str:
 def pi05_fp8_weight_name(logical_name: str, layer_idx: int | None = None) -> str:
     suffix = f"_{layer_idx}" if layer_idx is not None else ""
     return f"fp8.{logical_name}{suffix}.weight"
-
-
-@dataclass(frozen=True)
-class QuantSpec:
-    scheme: str
-    storage_dtype: str
-    compute_dtype: str
-    scale_name: str | None
-    zero_point_name: str | None = None
-    group_size: int | None = None
-    axis: int | None = None
-    packed_layout: str | None = None
-
-
-@dataclass(frozen=True)
-class WeightEntry:
-    name: str
-    kind: Literal["weight", "constant_tensor", "scale"]
-    shape: tuple[int, ...]
-    dtype: str
-    layout: str
-    offset: int
-    nbytes: int
-    alignment: int = 256
-    transform: str | None = None
-    tied_to: str | None = None
-    quant: QuantSpec | None = None
-
-    def to_weight_map_obj(self) -> dict[str, object]:
-        payload = asdict(self)
-        payload["shape"] = list(self.shape)
-        payload["quant"] = None if self.quant is None else asdict(self.quant)
-        payload.pop("offset")
-        payload.pop("nbytes")
-        payload.pop("alignment")
-        return payload
-
-    def to_index_obj(self) -> dict[str, object]:
-        return {
-            "name": self.name,
-            "offset": self.offset,
-            "nbytes": self.nbytes,
-            "shape": list(self.shape),
-            "dtype": self.dtype,
-            "alignment": self.alignment,
-        }
 
 
 def select_fp8_layout(hardware: str | None = None, fp8_layout: str | None = None) -> str:
@@ -180,8 +135,8 @@ def pi05_deploy_quantization_manifest(*, fp8_layout: str = "nk") -> Quantization
     )
 
 
-class WeightPackageWriter:
-    """Write a devproc2 self-contained weight package."""
+class WeightPackageWriter(_WeightPackageWriter):
+    """Pi0.5 convenience wrapper over the generic weight package writer."""
 
     def __init__(
         self,
@@ -191,99 +146,9 @@ class WeightPackageWriter:
         precision: str = BF16,
         alignment: int = 256,
     ) -> None:
-        self.output_dir = Path(output_dir)
-        self.model = model
-        self.precision = precision
-        self.alignment = int(alignment)
-        self._data = bytearray()
-        self.entries: list[WeightEntry] = []
-
-    def add_tensor(
-        self,
-        name: str,
-        tensor: Any,
-        *,
-        dtype: str | None = None,
-        kind: Literal["weight", "constant_tensor", "scale"] = "weight",
-        layout: str = "row_major",
-        transform: str | None = None,
-        tied_to: str | None = None,
-        quant: QuantSpec | None = None,
-    ) -> WeightEntry:
-        raw, shape, resolved_dtype = _tensor_to_bytes(tensor, dtype)
-        offset = self._align(len(self._data))
-        if offset > len(self._data):
-            self._data.extend(b"\x00" * (offset - len(self._data)))
-        self._data.extend(raw)
-        entry = WeightEntry(
-            name=name,
-            kind=kind,
-            shape=tuple(int(s) for s in shape),
-            dtype=resolved_dtype,
-            layout=layout,
-            offset=offset,
-            nbytes=len(raw),
-            alignment=self.alignment,
-            transform=transform,
-            tied_to=tied_to,
-            quant=quant,
+        super().__init__(
+            output_dir,
+            model=model,
+            precision=precision,
+            alignment=alignment,
         )
-        self.entries.append(entry)
-        return entry
-
-    def write(self) -> None:
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / "weights.bin").write_bytes(bytes(self._data))
-        _write_json(self.output_dir / "manifest.json", {
-            "format": "devproc2.weights",
-            "format_version": 1,
-            "model": self.model,
-            "precision": self.precision,
-            "data_file": "weights.bin",
-            "index_file": "weights.index.json",
-            "weight_map_file": "weight_map.json",
-        })
-        _write_json(self.output_dir / "weights.index.json", {
-            "format_version": 1,
-            "data_file": "weights.bin",
-            "entries": [entry.to_index_obj() for entry in self.entries],
-        })
-        _write_json(self.output_dir / "weight_map.json", {
-            "format_version": 1,
-            "weights": [entry.to_weight_map_obj() for entry in self.entries],
-        })
-        _write_json(self.output_dir / "quantization.json", {
-            "format_version": 1,
-            "entries": [
-                {
-                    "name": entry.name,
-                    "shape": list(entry.shape),
-                    "dtype": entry.dtype,
-                    "quant": asdict(entry.quant),
-                }
-                for entry in self.entries
-                if entry.quant is not None
-            ],
-        })
-
-    def _align(self, value: int) -> int:
-        rem = value % self.alignment
-        return value if rem == 0 else value + (self.alignment - rem)
-
-
-def _tensor_to_bytes(tensor: Any, dtype: str | None) -> tuple[bytes, tuple[int, ...], str]:
-    arr = np.asarray(tensor)
-    resolved = dtype or str(arr.dtype)
-    if resolved == BF16:
-        if arr.dtype != np.uint16:
-            raise TypeError("numpy bfloat16 payload must be provided as uint16 bit pattern")
-        raw = np.ascontiguousarray(arr).tobytes()
-    elif resolved == FP8_E4M3:
-        raw = np.ascontiguousarray(arr.astype(np.uint8, copy=False)).tobytes()
-    else:
-        raw = np.ascontiguousarray(arr).tobytes()
-    return raw, tuple(int(s) for s in arr.shape), resolved
-
-
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")

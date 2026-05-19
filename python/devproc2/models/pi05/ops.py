@@ -73,7 +73,7 @@ def call_cuda(
 
 def bf16_linear(x, weight, *, rows: int, out_features: int, in_features: int):
     return call_packed_out(
-        "runtime.cuda.bf16_nn_bf16",
+        "pi05.cuda.bf16_nn_bf16",
         inputs=[x, weight, rows, out_features, in_features],
         output_shape=(rows, out_features),
     )
@@ -90,7 +90,7 @@ def fp8_linear(
     weight_scale,
 ):
     return call_packed_out(
-        "runtime.cuda.fp8_nt_bf16",
+        "pi05.cuda.fp8_nt_bf16",
         inputs=[
             x_fp8,
             weight_fp8,
@@ -116,7 +116,7 @@ def fp8_linear_accum_(
     weight_scale,
 ):
     dp.call_dps_packed(
-        "runtime.cuda.fp8_nt_bf16_accum",
+        "pi05.cuda.fp8_nt_bf16_accum",
         inputs=[
             x_fp8,
             weight_fp8,
@@ -145,7 +145,7 @@ def attention_fa2(
     scale_bits: int,
 ):
     return call_packed_out(
-        "runtime.cuda.pi05_fa2_bf16",
+        "pi05.cuda.fa2_bf16",
         inputs=[
             q,
             k,
@@ -176,7 +176,7 @@ def attention_fa2_batched(
     scale_bits: int,
 ):
     return call_packed_out(
-        "runtime.cuda.pi05_fa2_bf16_batched",
+        "pi05.cuda.fa2_bf16_batched",
         inputs=[
             q,
             k,

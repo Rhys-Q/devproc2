@@ -82,7 +82,7 @@ artifact/
 ```
 
 `metadata/pi05_artifact.json` currently has format
-`devproc2.artifact.pi05`, `format_version` 1, model `openpi0.5`, target
+`python/devproc2/artifact/pi05.py`, `format_version` 1, model `openpi0.5`, target
 `cuda`, and keeps the weight, tokenizer, kernel table, and FP8 layout metadata
 covered by `tests/compiler/test_pi05_artifact.py`.
 

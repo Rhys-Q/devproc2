@@ -1,5 +1,5 @@
 #include <devproc2/runtime/vm.h>
-#include <devproc2/runtime/cuda_gemm.h>
+#include <devproc2/runtime/packed_backend.h>
 #include <devproc2/runtime/packed_func.h>
 #include <devproc2/runtime/stream.h>
 #include <devproc2/runtime/tokenizer.h>
@@ -18,10 +18,12 @@ namespace devproc2 {
 #include <nlohmann/json.hpp>
 #include <array>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace devproc2 {
 
@@ -93,6 +95,83 @@ static std::vector<uint8_t> read_file_binary(const std::string& path) {
 static bool file_exists(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     return f.good();
+}
+
+static std::string artifact_file_path(
+    const std::string& artifact_dir,
+    const std::string& rel
+) {
+    if (!rel.empty() && rel[0] == '/') return rel;
+    return artifact_dir + "/" + rel;
+}
+
+using PackedBackendRegisterFn = void (*)(PackedFuncRegistry*);
+
+static std::vector<void*>& packed_backend_handles() {
+    static std::vector<void*> handles;
+    return handles;
+}
+
+static void load_packed_backend_table(const std::string& artifact_dir) {
+    std::string path = artifact_dir + "/metadata/packed_backend_table.json";
+    if (!file_exists(path)) return;
+
+    auto table = nlohmann::json::parse(read_file_text(path));
+    if (!table.is_array()) {
+        throw std::runtime_error("metadata/packed_backend_table.json must be an array");
+    }
+
+    for (const auto& entry : table) {
+        if (!entry.is_object()) {
+            throw std::runtime_error("packed_backend_table entries must be objects");
+        }
+        std::string name = entry.value("name", std::string{"<unknown>"});
+        std::string library;
+        if (entry.contains("library") && entry["library"].is_string()) {
+            library = entry["library"].get<std::string>();
+        }
+        void* handle = nullptr;
+        if (library.empty()) {
+            handle = RTLD_DEFAULT;
+        } else {
+            std::string library_path = artifact_file_path(artifact_dir, library);
+            handle = dlopen(library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (!handle) {
+                const char* err = dlerror();
+                throw std::runtime_error(
+                    "Failed to load packed backend '" + name + "' from " +
+                    library_path + ": " + (err ? err : "unknown dlopen error"));
+            }
+            packed_backend_handles().push_back(handle);
+        }
+        std::string register_symbol = entry.value(
+            "register_symbol",
+            std::string{"devproc2_register_packed_backend"});
+        dlerror();
+        auto* register_fn = reinterpret_cast<PackedBackendRegisterFn>(
+            dlsym(handle, register_symbol.c_str()));
+        const char* err = dlerror();
+        if (err || !register_fn) {
+            throw std::runtime_error(
+                "Failed to resolve packed backend register symbol '" +
+                register_symbol + "' for '" + name + "': " +
+                (err ? err : "missing symbol"));
+        }
+        register_fn(&PackedFuncRegistry::Global());
+
+        if (entry.contains("packed_funcs") && entry["packed_funcs"].is_array()) {
+            for (const auto& func : entry["packed_funcs"]) {
+                if (!func.is_object() || !func.contains("name") || !func["name"].is_string()) {
+                    continue;
+                }
+                if (func.contains("device") && func["device"].is_string()) {
+                    PackedFuncRegistry::Global().SetDevice(
+                        func["name"].get<std::string>(),
+                        func["device"].get<std::string>());
+                }
+            }
+        }
+    }
 }
 
 #ifdef DEVPROC2_WITH_CUDA
@@ -308,7 +387,7 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
         SetPaligemmaTokenizerModelPath(artifact_dir + "/resources/tokenizer.model");
     }
     RegisterTokenizerPackedFuncs();
-    RegisterCUDAPackedFuncs();
+    load_packed_backend_table(artifact_dir);
     for (const auto& name : abi.value("required_packed_funcs",
                                        nlohmann::json::array())) {
         std::string fn = name.get<std::string>();
@@ -529,7 +608,7 @@ VMValue VMState::DispatchExternal(
         PackedArgs pa(args);
 #ifdef DEVPROC2_WITH_CUDA
         void* previous_cuda_stream = nullptr;
-        bool scoped_cuda_stream = callee.name.rfind("runtime.cuda.", 0) == 0;
+        bool scoped_cuda_stream = PackedFuncRegistry::Global().Device(callee.name) == "cuda";
         if (scoped_cuda_stream) {
             Device cuda_dev{kDLCUDA, 0};
             previous_cuda_stream = CurrentCUDAPackedFuncStream();

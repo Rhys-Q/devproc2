@@ -7,9 +7,9 @@ set(DEVPROC2_RUNTIME_SOURCES
     src/vm.cc
     src/builtins.cc
     src/packed_func.cc
+    src/packed_backend.cc
     src/tokenizer.cc
     src/weight_store.cc
-    src/cuda/cuda_gemm.cc
 )
 
 add_library(devproc2_runtime STATIC ${DEVPROC2_RUNTIME_SOURCES})
@@ -21,6 +21,9 @@ target_include_directories(devproc2_runtime
 )
 
 target_link_libraries(devproc2_runtime PUBLIC dlpack nlohmann_json ${CMAKE_DL_LIBS})
+target_link_options(devproc2_runtime PUBLIC
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wl,--export-dynamic>
+)
 
 if(DEVPROC2_WITH_TOKENIZERS)
     target_link_libraries(devproc2_runtime PRIVATE tokenizers_cpp)
@@ -42,11 +45,33 @@ if(DEVPROC2_WITH_CUDA)
         src/cuda/cuda_kernel_registry.cc
         src/cuda/cuda_memory_pool.cc
     )
+    set(DEVPROC2_PI05_FP8_BACKEND_ROOT
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/devproc2/models/pi05/cuda/backends/fp8_gemm")
+
+    add_library(devproc2_pi05_cuda_backend SHARED
+        "${DEVPROC2_PI05_FP8_BACKEND_ROOT}/cublaslt_runner.cc"
+    )
+    set_target_properties(devproc2_pi05_cuda_backend PROPERTIES
+        CXX_STANDARD 17
+        POSITION_INDEPENDENT_CODE ON
+        OUTPUT_NAME "devproc2_pi05_cuda_backend"
+    )
+    target_include_directories(devproc2_pi05_cuda_backend PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${DEVPROC2_PI05_FP8_BACKEND_ROOT}"
+    )
+    target_link_libraries(devproc2_pi05_cuda_backend
+        PRIVATE
+            dlpack
+            CUDA::cudart
+            CUDA::cublasLt
+    )
+    target_compile_definitions(devproc2_pi05_cuda_backend PRIVATE DEVPROC2_WITH_CUDA)
+
     target_link_libraries(devproc2_runtime
         PRIVATE
             CUDA::cuda_driver
             CUDA::cudart
-            CUDA::cublasLt
     )
     target_compile_definitions(devproc2_runtime PUBLIC DEVPROC2_WITH_CUDA)
     if(DEVPROC2_WITH_CUTLASS)
@@ -57,15 +82,15 @@ if(DEVPROC2_WITH_CUDA)
         if(NOT EXISTS "${DEVPROC2_CUTLASS_ROOT}/include/cutlass/cutlass.h")
             message(FATAL_ERROR "DEVPROC2_WITH_CUTLASS=ON requires DEVPROC2_CUTLASS_ROOT to point to a CUTLASS checkout")
         endif()
-        target_sources(devproc2_runtime PRIVATE
-            src/cuda/cutlass_fp8_gemm_sm89.cu
+        target_sources(devproc2_pi05_cuda_backend PRIVATE
+            "${DEVPROC2_PI05_FP8_BACKEND_ROOT}/cutlass_fp8_gemm_sm89.cu"
         )
-        target_include_directories(devproc2_runtime PRIVATE
+        target_include_directories(devproc2_pi05_cuda_backend PRIVATE
             ${DEVPROC2_CUTLASS_ROOT}/include
             ${DEVPROC2_CUTLASS_ROOT}/tools/util/include
         )
-        target_compile_definitions(devproc2_runtime PUBLIC DEVPROC2_WITH_CUTLASS)
-        target_compile_options(devproc2_runtime PRIVATE
+        target_compile_definitions(devproc2_pi05_cuda_backend PRIVATE DEVPROC2_WITH_CUTLASS)
+        target_compile_options(devproc2_pi05_cuda_backend PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         )
     endif()
@@ -118,8 +143,8 @@ if(DEVPROC2_WITH_CUDA)
                 "SHELL:-t 4"
             >
         )
-        target_sources(devproc2_runtime PRIVATE $<TARGET_OBJECTS:devproc2_pi05_fa2_obj>)
-        target_compile_definitions(devproc2_runtime PUBLIC DEVPROC2_WITH_PI05_FA2)
+        target_sources(devproc2_pi05_cuda_backend PRIVATE $<TARGET_OBJECTS:devproc2_pi05_fa2_obj>)
+        target_compile_definitions(devproc2_pi05_cuda_backend PRIVATE DEVPROC2_WITH_PI05_FA2)
     endif()
 endif()
 

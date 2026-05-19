@@ -20,17 +20,17 @@
 
 ```text
 OpenPI / safetensors checkpoint
-  -> devproc2.integrations.pi05.weights.convert_pi05_weights(...)
+  -> tools/pi05/convert_weights.py.convert_pi05_weights(...)
   -> devproc2 weight package
 
-devproc2.export.pi05
+python/devproc2/export/pi05.py
   -> import devproc2.models.pi05.model
   -> 构造 Pi0.5 Module
   -> GraphBuilder 构图
   -> InferStructInfo / DPSLowering / MemoryPlanning / VMCodegen
   -> EmitExecutablePass / EmitABIPass
 
-devproc2.artifact.pi05.prepare_pi05_artifact(...)
+python/devproc2/artifact/pi05.py.prepare_pi05_artifact(...)
   -> 拷贝 weights / metadata / tokenizer
   -> 根据 emitted kernel_table 编译 cubin
   -> 写 metadata/pi05_artifact.json
@@ -108,7 +108,7 @@ kernels = emitted kernel_table
 metadata = pi05-specific recipe metadata
 ```
 
-现在 `artifact/pi05.py` 反过来把这些都写死了，甚至 manifest format 是 `devproc2.artifact.pi05`。这说明 artifact schema 还没有真正通用化。
+现在 `artifact/pi05.py` 反过来把这些都写死了，甚至 manifest format 是 `python/devproc2/artifact/pi05.py`。这说明 artifact schema 还没有真正通用化。
 
 ### 4. producer integration 和 deploy weight spec 混在一起
 
@@ -294,7 +294,7 @@ summary = export_artifact(
 )
 ```
 
-CLI 也应该是通用 CLI 加 recipe，而不是 `python -m devproc2.export.pi05`：
+CLI 也应该是通用 CLI 加 recipe，而不是 `python -m python/devproc2/export/pi05.py`：
 
 ```bash
 PYTHONPATH=python python -m devproc2.export.cli \
@@ -418,7 +418,7 @@ class ArtifactRecipe:
 }
 ```
 
-不再写 `metadata/pi05_artifact.json`，也不再把 format 写成 `devproc2.artifact.pi05`。Pi0.5 专有信息可以放进：
+不再写 `metadata/pi05_artifact.json`，也不再把 format 写成 `python/devproc2/artifact/pi05.py`。Pi0.5 专有信息可以放进：
 
 ```text
 metadata/model.json
@@ -699,7 +699,7 @@ rg -n "openpi|paligemma|pi05" python/devproc2/artifact
 
 - 通用 `WeightPackageWriter` 等 schema 进入 `devproc2.weights.package`。
 - Pi0.5 logical weight naming 保留在 `models/pi05/weights.py`。
-- `convert_pi05_weights(...)` 从 `devproc2.integrations.pi05.weights` 移到 `tools/pi05/convert_weights.py`。
+- `convert_pi05_weights(...)` 从 `tools/pi05/convert_weights.py` 移到 `tools/pi05/convert_weights.py`。
 
 最终删除：
 
@@ -814,9 +814,9 @@ import importlib
 import pytest
 
 for name in (
-    "devproc2.export.pi05",
-    "devproc2.artifact.pi05",
-    "devproc2.integrations.pi05",
+    "python/devproc2/export/pi05.py",
+    "python/devproc2/artifact/pi05.py",
+    "python/devproc2/integrations/pi05",
 ):
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module(name)

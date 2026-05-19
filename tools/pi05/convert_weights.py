@@ -1,197 +1,42 @@
 """Pi0.5 weight package conversion and FP8 quantization."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-import json
+import argparse
 import math
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 
+from devproc2.models.pi05.weights import (
+    ACTION_DIM,
+    ACTION_HORIZON,
+    DEC_D,
+    DEC_H,
+    DEC_L,
+    ENC_D,
+    ENC_H,
+    ENC_L,
+    NUM_STEPS_DEFAULT,
+    PI05_MODEL_NAME,
+    VIS_D,
+    VIS_H,
+    VIS_L,
+    pi05_act_scale_name,
+    pi05_fp8_scale_name,
+    pi05_fp8_weight_name,
+    select_fp8_layout,
+)
 from devproc2.quantization import common_fp8_scale
-
-
-BF16 = "bfloat16"
-FP16 = "float16"
-FP32 = "float32"
-FP8_E4M3 = "fp8_e4m3"
-
-VIS_L = 27
-VIS_D = 1152
-VIS_H = 4304
-ENC_L = 18
-ENC_D = 2048
-ENC_H = 16384
-DEC_L = 18
-DEC_D = 1024
-DEC_H = 4096
-ACTION_DIM = 32
-ACTION_HORIZON = 50
-NUM_STEPS_DEFAULT = 10
-
-
-def pi05_act_scale_name(logical_name: str, layer_idx: int | None = None) -> str:
-    suffix = f"_{layer_idx}" if layer_idx is not None else ""
-    return f"act_scale.{logical_name}{suffix}"
-
-
-@dataclass(frozen=True)
-class QuantSpec:
-    scheme: str
-    storage_dtype: str
-    compute_dtype: str
-    scale_name: str | None
-    zero_point_name: str | None = None
-    group_size: int | None = None
-    axis: int | None = None
-    packed_layout: str | None = None
-
-
-@dataclass(frozen=True)
-class WeightEntry:
-    name: str
-    kind: Literal["weight", "constant_tensor", "scale"]
-    shape: tuple[int, ...]
-    dtype: str
-    layout: str
-    offset: int
-    nbytes: int
-    alignment: int = 256
-    transform: str | None = None
-    tied_to: str | None = None
-    quant: QuantSpec | None = None
-
-    def to_weight_map_obj(self) -> dict[str, object]:
-        payload = asdict(self)
-        payload["shape"] = list(self.shape)
-        payload["quant"] = None if self.quant is None else asdict(self.quant)
-        payload.pop("offset")
-        payload.pop("nbytes")
-        payload.pop("alignment")
-        return payload
-
-    def to_index_obj(self) -> dict[str, object]:
-        return {
-            "name": self.name,
-            "offset": self.offset,
-            "nbytes": self.nbytes,
-            "shape": list(self.shape),
-            "dtype": self.dtype,
-            "alignment": self.alignment,
-        }
-
-
-def select_fp8_layout(hardware: str | None = None, fp8_layout: str | None = None) -> str:
-    if fp8_layout is not None:
-        if fp8_layout not in ("kn", "nk"):
-            raise ValueError(f"fp8_layout must be 'kn' or 'nk', got {fp8_layout!r}")
-        return fp8_layout
-    if hardware == "rtx_sm89":
-        return "nk"
-    if hardware == "rtx_sm120":
-        return "kn"
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            major, minor = torch.cuda.get_device_capability()
-            if major == 8 and minor == 9:
-                return "nk"
-    except Exception:
-        pass
-    return "kn"
-
-
-class WeightPackageWriter:
-    """Write a devproc2 self-contained weight package."""
-
-    def __init__(
-        self,
-        output_dir: str | Path,
-        *,
-        model: str = "openpi0.5",
-        precision: str = BF16,
-        alignment: int = 256,
-    ) -> None:
-        self.output_dir = Path(output_dir)
-        self.model = model
-        self.precision = precision
-        self.alignment = int(alignment)
-        self._data = bytearray()
-        self.entries: list[WeightEntry] = []
-
-    def add_tensor(
-        self,
-        name: str,
-        tensor: Any,
-        *,
-        dtype: str | None = None,
-        kind: Literal["weight", "constant_tensor", "scale"] = "weight",
-        layout: str = "row_major",
-        transform: str | None = None,
-        tied_to: str | None = None,
-        quant: QuantSpec | None = None,
-    ) -> WeightEntry:
-        raw, shape, resolved_dtype = _tensor_to_bytes(tensor, dtype)
-        offset = self._align(len(self._data))
-        if offset > len(self._data):
-            self._data.extend(b"\x00" * (offset - len(self._data)))
-        self._data.extend(raw)
-        entry = WeightEntry(
-            name=name,
-            kind=kind,
-            shape=tuple(int(s) for s in shape),
-            dtype=resolved_dtype,
-            layout=layout,
-            offset=offset,
-            nbytes=len(raw),
-            alignment=self.alignment,
-            transform=transform,
-            tied_to=tied_to,
-            quant=quant,
-        )
-        self.entries.append(entry)
-        return entry
-
-    def write(self) -> None:
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / "weights.bin").write_bytes(bytes(self._data))
-        _write_json(self.output_dir / "manifest.json", {
-            "format": "devproc2.weights",
-            "format_version": 1,
-            "model": self.model,
-            "precision": self.precision,
-            "data_file": "weights.bin",
-            "index_file": "weights.index.json",
-            "weight_map_file": "weight_map.json",
-        })
-        _write_json(self.output_dir / "weights.index.json", {
-            "format_version": 1,
-            "data_file": "weights.bin",
-            "entries": [entry.to_index_obj() for entry in self.entries],
-        })
-        _write_json(self.output_dir / "weight_map.json", {
-            "format_version": 1,
-            "weights": [entry.to_weight_map_obj() for entry in self.entries],
-        })
-        _write_json(self.output_dir / "quantization.json", {
-            "format_version": 1,
-            "entries": [
-                {
-                    "name": entry.name,
-                    "shape": list(entry.shape),
-                    "dtype": entry.dtype,
-                    "quant": asdict(entry.quant),
-                }
-                for entry in self.entries
-                if entry.quant is not None
-            ],
-        })
-
-    def _align(self, value: int) -> int:
-        rem = value % self.alignment
-        return value if rem == 0 else value + (self.alignment - rem)
+from devproc2.weights import (
+    BF16,
+    FP16,
+    FP32,
+    FP8_E4M3,
+    QuantSpec,
+    WeightPackageWriter,
+    write_json,
+)
 
 
 def convert_pi05_weights(
@@ -222,7 +67,7 @@ def convert_pi05_weights(
         precision = "fp8"
     else:
         precision = BF16
-    writer = WeightPackageWriter(output_dir, precision=precision)
+    writer = WeightPackageWriter(output_dir, model=PI05_MODEL_NAME, precision=precision)
 
     if include_bf16:
         for name, tensor in weights.items():
@@ -274,7 +119,7 @@ def convert_pi05_weights(
             )
 
     writer.write()
-    _write_json(Path(output_dir) / "convert_report.json", {
+    write_json(Path(output_dir) / "convert_report.json", {
         "source": {"type": "safetensors", "path": str(safetensors_path)},
         "ruleset": "openpi05_hf_to_devproc2_flashrt_v1",
         "fp8_layout": layout,
@@ -589,53 +434,32 @@ def _torch_cat(a: Any, b: Any, *, dim: int):
     return torch.cat([a, b], dim=dim).contiguous()
 
 
-def _tensor_to_bytes(tensor: Any, dtype: str | None) -> tuple[bytes, tuple[int, ...], str]:
-    try:
-        import torch
-    except Exception:
-        torch = None
-
-    if torch is not None and isinstance(tensor, torch.Tensor):
-        t = tensor.detach().contiguous()
-        resolved = dtype or _torch_dtype_name(t)
-        if resolved == BF16:
-            raw = t.to(torch.bfloat16).view(torch.uint16).cpu().numpy().tobytes()
-        elif resolved == FP16:
-            raw = t.to(torch.float16).cpu().numpy().tobytes()
-        elif resolved == FP32:
-            raw = t.to(torch.float32).cpu().numpy().tobytes()
-        elif resolved == FP8_E4M3:
-            raw = t.view(torch.uint8).cpu().numpy().tobytes() if t.dtype == torch.float8_e4m3fn else t.to(torch.uint8).cpu().numpy().tobytes()
-        else:
-            raw = t.cpu().numpy().tobytes()
-        return raw, tuple(int(s) for s in t.shape), resolved
-
-    arr = np.asarray(tensor)
-    resolved = dtype or str(arr.dtype)
-    if resolved == BF16:
-        if arr.dtype != np.uint16:
-            raise TypeError("numpy bfloat16 payload must be provided as uint16 bit pattern")
-        raw = np.ascontiguousarray(arr).tobytes()
-    elif resolved == FP8_E4M3:
-        raw = np.ascontiguousarray(arr.astype(np.uint8, copy=False)).tobytes()
-    else:
-        raw = np.ascontiguousarray(arr).tobytes()
-    return raw, tuple(int(s) for s in arr.shape), resolved
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Convert Pi0.5 weights to a devproc2 package.")
+    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--hardware", default="rtx_sm89")
+    parser.add_argument("--fp8-layout", choices=("kn", "nk"), default=None)
+    parser.add_argument("--no-bf16", action="store_true")
+    parser.add_argument("--no-support-bf16", action="store_true")
+    parser.add_argument("--no-fp8", action="store_true")
+    parser.add_argument("--no-precomputed-styles", action="store_true")
+    parser.add_argument("--action-horizon", type=int, default=ACTION_HORIZON)
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args(argv)
+    convert_pi05_weights(
+        checkpoint_dir=args.checkpoint_dir,
+        output_dir=args.output_dir,
+        hardware=args.hardware,
+        fp8_layout=args.fp8_layout,
+        include_bf16=not args.no_bf16,
+        include_support_bf16=not args.no_support_bf16,
+        include_fp8=not args.no_fp8,
+        include_precomputed_styles=not args.no_precomputed_styles,
+        action_horizon=args.action_horizon,
+        device=args.device,
+    )
 
 
-def _torch_dtype_name(tensor: Any) -> str:
-    import torch
-
-    if tensor.dtype == torch.bfloat16:
-        return BF16
-    if tensor.dtype == torch.float16:
-        return FP16
-    if tensor.dtype == torch.float32:
-        return FP32
-    if tensor.dtype == torch.float8_e4m3fn:
-        return FP8_E4M3
-    return str(tensor.dtype).removeprefix("torch.")
-
-
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+if __name__ == "__main__":
+    main()

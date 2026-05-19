@@ -25,6 +25,18 @@ from devproc2.models.pi05.model import (
     PI05VisionEncoderLayer,
     PI05VisionPatchEmbedding,
 )
+from devproc2.models.pi05.recipe import (
+    loop,
+    paligemma_prefix_encoder,
+    paligemma_prefix_kv_encoder,
+    pi05_cuda_backend,
+    pi05_recipe,
+    sample_precomputed_prefix,
+    sample_precomputed_prefix_embs,
+    sample_tokens,
+    step,
+    vision_encoder,
+)
 from devproc2.models.pi05.weights import (
     PI05_MODEL_NAME,
     QuantSpec,
@@ -63,9 +75,19 @@ __all__ = [
     "QuantSpec",
     "WeightEntry",
     "WeightPackageWriter",
+    "loop",
+    "paligemma_prefix_encoder",
+    "paligemma_prefix_kv_encoder",
+    "pi05_cuda_backend",
+    "pi05_recipe",
     "pi05_act_scale_name",
     "pi05_deploy_quantization_manifest",
     "pi05_fp8_scale_name",
     "pi05_fp8_weight_name",
+    "sample_precomputed_prefix",
+    "sample_precomputed_prefix_embs",
+    "sample_tokens",
     "select_fp8_layout",
+    "step",
+    "vision_encoder",
 ]

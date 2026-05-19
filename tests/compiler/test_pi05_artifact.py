@@ -2,7 +2,13 @@ import json
 
 import numpy as np
 
-from devproc2.artifact.pi05 import Pi05ArtifactSummary, prepare_pi05_artifact
+from devproc2.artifact import (
+    ArtifactBuildSummary,
+    PackedBackendRecipe,
+    PackedFuncSpec,
+    ResourceSpec,
+    prepare_artifact,
+)
 from devproc2.models.pi05.weights import QuantSpec, WeightPackageWriter
 
 
@@ -33,35 +39,45 @@ def test_prepare_pi05_artifact_copies_weights_metadata_and_tokenizer(tmp_path):
     tokenizer.write_bytes(b"fake-tokenizer")
     artifact_dir = tmp_path / "artifact"
     (artifact_dir / "metadata").mkdir(parents=True)
-    (artifact_dir / "metadata" / "pi05_kernel_catalog.json").write_text("[]")
 
-    summary = prepare_pi05_artifact(
+    summary = prepare_artifact(
+        model_id="openpi0.5",
+        entrypoint="sample_tokens",
         weight_package_dir=weights_dir,
         artifact_dir=artifact_dir,
-        tokenizer_model_path=tokenizer,
+        resources=(
+            ResourceSpec(
+                name="tokenizer",
+                path=tokenizer,
+                target_path="resources/tokenizer.model",
+                metadata={"tokenizer_model": "paligemma"},
+            ),
+        ),
         sm_arch=89,
         compile_kernels=False,
     )
 
-    assert isinstance(summary, Pi05ArtifactSummary)
+    assert isinstance(summary, ArtifactBuildSummary)
     assert summary.weights_entries == 2
     assert summary.fp8_layout == "nk"
     assert (artifact_dir / "weights" / "weights.bin").exists()
     assert (artifact_dir / "weights" / "weights.index.json").exists()
     assert (artifact_dir / "metadata" / "weight_map.json").exists()
     assert (artifact_dir / "metadata" / "quantization.json").exists()
-    assert not (artifact_dir / "metadata" / "pi05_kernel_catalog.json").exists()
     assert (artifact_dir / "resources" / "tokenizer.model").read_bytes() == b"fake-tokenizer"
     assert not (artifact_dir / "metadata" / "kernel_table.json").exists()
 
-    pi05_manifest = json.loads((artifact_dir / "metadata" / "pi05_artifact.json").read_text())
-    assert pi05_manifest["weights"]["precision"] == "fp8"
-    assert pi05_manifest["weights"]["entries"] == 2
-    assert pi05_manifest["weights"]["fp8_layout"] == "nk"
-    assert pi05_manifest["tokenizer"] == "resources/tokenizer.model"
-    assert pi05_manifest["kernels"]["compiled"] is False
-    assert pi05_manifest["kernels"]["count"] == 0
-    assert pi05_manifest["kernels"]["table"] is None
+    manifest = json.loads((artifact_dir / "metadata" / "artifact.json").read_text())
+    assert manifest["format"] == "devproc2.artifact"
+    assert manifest["model_id"] == "openpi0.5"
+    assert manifest["entrypoint"] == "sample_tokens"
+    assert manifest["weights"]["precision"] == "fp8"
+    assert manifest["weights"]["entries"] == 2
+    assert manifest["weights"]["fp8_layout"] == "nk"
+    assert manifest["resources"][0]["path"] == "resources/tokenizer.model"
+    assert manifest["kernels"]["compiled"] is False
+    assert manifest["kernels"]["count"] == 0
+    assert manifest["kernels"]["table"] is None
 
 
 def test_prepare_pi05_artifact_uses_emitted_kernel_table(tmp_path):
@@ -88,16 +104,78 @@ def test_prepare_pi05_artifact_uses_emitted_kernel_table(tmp_path):
     ]
     (metadata_dir / "kernel_table.json").write_text(json.dumps(kernel_table))
 
-    summary = prepare_pi05_artifact(
+    summary = prepare_artifact(
+        model_id="openpi0.5",
+        entrypoint="sample_tokens",
         weight_package_dir=weights_dir,
         artifact_dir=artifact_dir,
-        tokenizer_model_path=None,
         sm_arch=89,
         compile_kernels=False,
     )
 
     assert summary.kernels == 1
     assert json.loads((metadata_dir / "kernel_table.json").read_text()) == kernel_table
-    pi05_manifest = json.loads((metadata_dir / "pi05_artifact.json").read_text())
-    assert pi05_manifest["kernels"]["count"] == 1
-    assert pi05_manifest["kernels"]["table"] == "metadata/kernel_table.json"
+    manifest = json.loads((metadata_dir / "artifact.json").read_text())
+    assert manifest["kernels"]["count"] == 1
+    assert manifest["kernels"]["table"] == "metadata/kernel_table.json"
+
+
+def test_prepare_artifact_writes_packed_backend_table(tmp_path):
+    weights_dir = _write_weight_package(tmp_path / "weights_pkg")
+    artifact_dir = tmp_path / "artifact"
+    backend = PackedBackendRecipe(
+        name="test.backend",
+        kind="linked_packed_backend",
+        sources=("src/backend.cc",),
+        register_symbol="devproc2_register_test_backend",
+        packed_funcs=(PackedFuncSpec("test.backend.echo", device="cuda"),),
+    )
+
+    prepare_artifact(
+        model_id="unit",
+        entrypoint="main",
+        weight_package_dir=weights_dir,
+        artifact_dir=artifact_dir,
+        sm_arch=89,
+        compile_kernels=False,
+        packed_backends=(backend,),
+    )
+
+    table = json.loads((artifact_dir / "metadata" / "packed_backend_table.json").read_text())
+    assert table[0]["kind"] == "linked_packed_backend"
+    assert table[0]["library"] is None
+    assert table[0]["packed_funcs"][0]["name"] == "test.backend.echo"
+    manifest = json.loads((artifact_dir / "metadata" / "artifact.json").read_text())
+    assert manifest["packed_backends"] == table
+
+
+def test_prepare_artifact_installs_compiled_packed_backend(tmp_path):
+    weights_dir = _write_weight_package(tmp_path / "weights_pkg")
+    artifact_dir = tmp_path / "artifact"
+    backend_dir = tmp_path / "backend_build"
+    backend_dir.mkdir()
+    backend_lib = backend_dir / "libdevproc2_test_backend_backend.so"
+    backend_lib.write_bytes(b"fake-shared-library")
+    backend = PackedBackendRecipe(
+        name="test.backend",
+        kind="compiled_packed_backend",
+        sources=("src/backend.cc",),
+        register_symbol="devproc2_register_test_backend",
+        packed_funcs=(PackedFuncSpec("test.backend.echo", device="cuda"),),
+    )
+
+    prepare_artifact(
+        model_id="unit",
+        entrypoint="main",
+        weight_package_dir=weights_dir,
+        artifact_dir=artifact_dir,
+        sm_arch=89,
+        compile_kernels=False,
+        backend_library_dirs=(backend_dir,),
+        packed_backends=(backend,),
+    )
+
+    assert (artifact_dir / "backends" / "test_backend.so").read_bytes() == b"fake-shared-library"
+    table = json.loads((artifact_dir / "metadata" / "packed_backend_table.json").read_text())
+    assert table[0]["kind"] == "compiled_packed_backend"
+    assert table[0]["library"] == "backends/test_backend.so"

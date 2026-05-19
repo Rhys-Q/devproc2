@@ -17,6 +17,13 @@
 #include "devproc2/runtime/tensor.h"
 #include "devproc2/runtime/vm.h"
 
+extern "C" void devproc2_register_test_backend(devproc2::PackedFuncRegistry* registry) {
+    auto* obj = new devproc2::PackedFuncObj();
+    obj->body = [](devproc2::PackedArgs) {};
+    registry->RegisterWithDevice(
+        "test.backend.echo", devproc2::PackedFunc(obj), "cuda");
+}
+
 namespace {
 
 int g_pass = 0;
@@ -164,9 +171,9 @@ void test_load_abi_version_mismatch() {
 void test_load_missing_packed_func() {
     std::string dir = make_artifact_dir("missing_pf",
         "{\n  \"devproc_abi_version\": \"0.1\",\n"
-        "  \"required_packed_funcs\": [\n    \"runtime.tokenizer.encode\"\n  ]\n}\n");
+        "  \"required_packed_funcs\": [\n    \"test.backend.missing\"\n  ]\n}\n");
     CHECK_THROWS_MSG(Executable::Load(dir),
-                     "PackedFunc 'runtime.tokenizer.encode' is required but not registered.");
+                     "PackedFunc 'test.backend.missing' is required but not registered.");
 }
 
 // ── test_load_valid_no_packed_funcs ───────────────────────────────────────────
@@ -178,6 +185,29 @@ void test_load_valid_no_packed_funcs() {
     CHECK(exe != nullptr);
     CHECK(exe->function_table.empty());
     CHECK(exe->instructions.empty());
+}
+
+void test_loads_artifact_declared_linked_packed_backend() {
+    std::string dir = make_artifact_dir("linked_backend",
+        "{\n  \"devproc_abi_version\": \"0.1\",\n"
+        "  \"required_packed_funcs\": [\"test.backend.echo\"]\n}\n");
+    std::filesystem::create_directories(dir + "/metadata");
+    write_file(dir + "/metadata/packed_backend_table.json",
+        "[\n"
+        "  {\n"
+        "    \"name\": \"test.backend\",\n"
+        "    \"kind\": \"linked_packed_backend\",\n"
+        "    \"library\": null,\n"
+        "    \"register_symbol\": \"devproc2_register_test_backend\",\n"
+        "    \"packed_funcs\": [\n"
+        "      {\"name\":\"test.backend.echo\",\"device\":\"cuda\"}\n"
+        "    ]\n"
+        "  }\n"
+        "]\n");
+    auto exe = Executable::Load(dir);
+    CHECK(exe != nullptr);
+    CHECK(PackedFuncRegistry::Global().Has("test.backend.echo"));
+    CHECK(PackedFuncRegistry::Global().Device("test.backend.echo") == "cuda");
 }
 
 // ── test_deserialize_minimal ──────────────────────────────────────────────────
@@ -276,6 +306,7 @@ int main() {
     RUN(test_deserialize_minimal);
     RUN(test_deserialize_bad_magic);
     RUN(test_load_valid_no_packed_funcs);
+    RUN(test_loads_artifact_declared_linked_packed_backend);
     RUN(test_load_abi_version_mismatch);
     RUN(test_load_missing_packed_func);
     RUN(test_load_missing_executable_vm);
