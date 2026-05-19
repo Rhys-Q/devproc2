@@ -1,12 +1,17 @@
 """ControlFlowVerifyPass — strict semantic checks after normalization."""
 from __future__ import annotations
 
-from devproc2.ir.nodes import Block, Function, IRModule, Op, Region
+from devproc2.ir.nodes import Block, Function, IRModule, IRStage, Op, Region
 from devproc2.ir.ops import ForOp, IfOp, YieldOp
 from devproc2.ir.verifier import IRVerificationError
 
 
 class ControlFlowVerifyPass:
+    input_stage = IRStage.normalized
+    output_stage = IRStage.normalized
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ()
+
     def run(self, module: IRModule) -> IRModule:
         for name, fn in module.functions.items():
             self._verify_fn(name, fn)

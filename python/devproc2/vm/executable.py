@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from devproc2.kernel.registry import KernelSpec
 
 
 class Opcode(IntEnum):
@@ -29,6 +32,9 @@ class Instruction:
     dst_reg:  int = -1        # -1 = no return value
     func_idx: int = 0
     arg_regs: list[int] = field(default_factory=list)
+    # Kernel CALL launch registers: grid_x/y/z, block_x/y/z, smem bytes.
+    # Kept separate from arg_regs so launch metadata is not part of kernel ABI.
+    launch_regs: list[int] = field(default_factory=list)
 
     # RET operands
     src_reg: int = -1         # -1 = void return
@@ -59,6 +65,7 @@ class FunctionEntry:
     num_regs:     int          # total registers for this function
     num_args:     int          # first num_args registers receive call args
     const_inits:  list[ConstInit] = field(default_factory=list)
+    param_names:  list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -68,6 +75,8 @@ class Executable:
     instructions:   list[Instruction]   = field(default_factory=list)
     constants:      list[Any]           = field(default_factory=list)
     # constants: Python scalars (int, float, bool, None) or tuples for shapes
+    # Python-side metadata used by artifact emission; not serialized into bytecode.
+    kernel_specs:   dict[str, "KernelSpec"] = field(default_factory=dict)
 
     def get_func_index(self, name: str) -> int:
         for i, fe in enumerate(self.function_table):

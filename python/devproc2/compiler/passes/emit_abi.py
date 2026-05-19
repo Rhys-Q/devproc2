@@ -10,11 +10,17 @@ from devproc2.compiler.pass_context import PassContext
 from devproc2.ir.nodes import (
     Function,
     IRModule,
+    ObjectStructInfo,
+    ScalarStructInfo,
     TensorStructInfo,
+    TupleStructInfo,
 )
 from devproc2.ir.prim_expr import (
     Add, CeilDiv, FloorDiv, IntImm, Max, Min, Mul, PrimVar, Sub,
 )
+from devproc2.ir.op_ref import KernelRef
+from devproc2.ir.ops import CallDPSOp, ForOp, IfOp
+from devproc2.kernel.registry import derive_kernel_params
 from devproc2.vm.executable import CalleeKind, Executable
 
 _ABI_VERSION = "0.1"
@@ -52,6 +58,21 @@ def _tensor_struct_info_to_dict(si: TensorStructInfo) -> dict[str, Any]:
     }
 
 
+def _struct_info_to_input_dict(si) -> dict[str, Any]:
+    if isinstance(si, TensorStructInfo):
+        entry = {"kind": "tensor"}
+        entry.update(_tensor_struct_info_to_dict(si))
+        return entry
+    if isinstance(si, ScalarStructInfo):
+        return {"kind": "scalar", "dtype": si.dtype}
+    if isinstance(si, ObjectStructInfo):
+        entry = {"kind": "object", "type_key": si.type_key}
+        if si.role is not None:
+            entry["role"] = si.role
+        return entry
+    return {"kind": "unknown"}
+
+
 def _function_entry_to_dict(fe) -> dict[str, Any]:
     return {
         "name": fe.name,
@@ -60,6 +81,7 @@ def _function_entry_to_dict(fe) -> dict[str, Any]:
         "instr_count": fe.instr_count,
         "num_regs": fe.num_regs,
         "num_args": fe.num_args,
+        "param_names": list(getattr(fe, "param_names", [])),
     }
 
 
@@ -117,11 +139,7 @@ class EmitABIPass:
         meta = os.path.join(output_dir, "metadata")
         function_table = [_function_entry_to_dict(fe) for fe in exe.function_table]
         self._write_json(meta, "function_table.json", function_table)
-        self._write_json(meta, "kernel_table.json", [
-            _function_entry_to_dict(fe)
-            for fe in exe.function_table
-            if fe.kind == CalleeKind.kernel
-        ])
+        self._write_json(meta, "kernel_table.json", self._extract_kernel_table(module, exe))
         self._write_json(meta, "packed_func_table.json", [
             _function_entry_to_dict(fe)
             for fe in exe.function_table
@@ -148,16 +166,22 @@ class EmitABIPass:
 
         for param in fn.params:
             si = param.struct_info
-            if isinstance(si, TensorStructInfo):
+            if si is not None:
                 entry = {"name": param.name}
-                entry.update(_tensor_struct_info_to_dict(si))
+                entry.update(_struct_info_to_input_dict(si))
                 inputs_json.append(entry)
+            if isinstance(si, TensorStructInfo):
                 shape_constraints.update(self._constraints_from_struct_info(si))
 
         ret = fn.ret_struct_info
         if isinstance(ret, TensorStructInfo):
             outputs_json.append(_tensor_struct_info_to_dict(ret))
             shape_constraints.update(self._constraints_from_struct_info(ret))
+        elif isinstance(ret, TupleStructInfo):
+            for field in ret.fields:
+                if isinstance(field, TensorStructInfo):
+                    outputs_json.append(_tensor_struct_info_to_dict(field))
+                    shape_constraints.update(self._constraints_from_struct_info(field))
 
         return inputs_json, outputs_json, shape_constraints
 
@@ -177,6 +201,48 @@ class EmitABIPass:
             for fe in exe.function_table
             if fe.kind == CalleeKind.packed_func
         ]
+
+    def _extract_kernel_table(self, module: IRModule, exe: Executable) -> list[dict[str, Any]]:
+        specs = dict(getattr(exe, "kernel_specs", {}))
+        for fn in module.functions.values():
+            for op in self._walk_ops(fn.body):
+                if isinstance(op, CallDPSOp) and isinstance(op.target_ref, KernelRef):
+                    spec = op.target_ref.spec
+                    if spec is not None:
+                        if not spec.params:
+                            spec = spec.with_params(derive_kernel_params(op.inputs, op.outputs))
+                        specs[op.target_ref.name] = spec
+
+        entries = []
+        for fe in exe.function_table:
+            if fe.kind != CalleeKind.kernel:
+                continue
+            spec = specs.get(fe.name)
+            if spec is None:
+                # A hand-written KernelRef without a KernelSpec has no runtime
+                # artifact metadata. Keep the function table entry authoritative
+                # and omit it from the artifact kernel table.
+                continue
+            entry = spec.to_json_obj()
+            entry.update({
+                "instr_offset": fe.instr_offset,
+                "instr_count": fe.instr_count,
+                "num_regs": fe.num_regs,
+                "num_args": fe.num_args,
+            })
+            entries.append(entry)
+        return entries
+
+    def _walk_ops(self, region):
+        for block in region.blocks:
+            for op in block.ops:
+                yield op
+                if isinstance(op, IfOp):
+                    yield from self._walk_ops(op.then_region)
+                    if op.else_region is not None:
+                        yield from self._walk_ops(op.else_region)
+                elif isinstance(op, ForOp):
+                    yield from self._walk_ops(op.body_region)
 
     def _storage_plan_to_json(self, plan) -> list[dict[str, Any]]:
         result = []

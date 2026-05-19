@@ -3,48 +3,55 @@ import pytest
 
 from devproc2.ir import (
     Add,
+    AliasAnalysis,
     Block,
+    BlockArg,
     CallDPSOp,
-    CalleeKind,
     CallOp,
     CeilDiv,
     Constant,
+    EffectSummary,
+    ExternalFuncRef,
+    ExternalCallOp,
     FloorDiv,
     ForOp,
     Function,
     GE,
     GT,
     IRModule,
+    IRStage,
     IRVerificationError,
     IntImm,
     IterArg,
+    KernelRef,
     LE,
     LT,
     Max,
     Min,
     Mul,
-    OpaqueEffect,
     Printer,
     PrimVar,
-    PureEffect,
     Range,
-    ReadOnlyEffect,
     Region,
     ReturnOp,
+    ShapeAssertOp,
+    StandardCallOp,
+    StandardOpRef,
     Sub,
     TensorCreateKind,
     TensorCreateOp,
     TensorStructInfo,
+    KnownShape,
     TupleGetItemOp,
     TupleOp,
     Value,
     Var,
-    WriteEffect,
     YieldOp,
     ceildiv,
     pmax,
     pmin,
     print_module,
+    make_call_op,
     verify,
 )
 
@@ -58,6 +65,14 @@ def _simple_fn(params: tuple[Var, ...], ops: tuple, name: str = "f") -> IRModule
     region = Region((block,))
     fn = Function(region)
     return IRModule({name: fn})
+
+
+def std(name: str) -> StandardOpRef:
+    return StandardOpRef(name)
+
+
+def kernel_ref(name: str) -> KernelRef:
+    return KernelRef(name)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +140,18 @@ def test_tensor_struct_info_int_coercion():
     assert si.shape == (B, IntImm(4096))
 
 
+def test_block_arg_is_var_compatible_without_block_mutation():
+    x = BlockArg("x")
+    block = Block(args=(x,), ops=(ReturnOp((x,)),))
+    rewritten_block = Block(args=block.args, ops=block.ops)
+
+    assert Var is BlockArg
+    assert x.owner is None
+    assert x.index == 0
+    assert rewritten_block.args[0] is x
+    assert x.owner is None
+
+
 # ---------------------------------------------------------------------------
 # Printer tests
 # ---------------------------------------------------------------------------
@@ -139,10 +166,10 @@ def test_print_basic_function():
     x = Var("x", x_si)
     w = Var("w", w_si)
 
-    matmul_op = CallOp(callee="@matmul", args=(x, w), result_name="y")
+    matmul_op = CallOp(std("matmul"), args=(x, w), result_name="y")
     y = matmul_op.results[0]
 
-    silu_op = CallOp(callee="@silu", args=(y,), result_name="z")
+    silu_op = CallOp(std("silu"), args=(y,), result_name="z")
     z = silu_op.results[0]
 
     block = Block(
@@ -168,11 +195,10 @@ def test_print_calldps_no_output():
     pos = Var("pos")
 
     calldps = CallDPSOp(
-        callee="@kernel.update_kvcache",
-        callee_kind=CalleeKind.kernel,
+        target_ref=kernel_ref("@kernel.update_kvcache"),
         inputs=(k_cache, v_cache, k, v, pos),
-        output=None,
-        effect=WriteEffect((k_cache, v_cache)),
+        outputs=(),
+        effect=EffectSummary.write(k_cache, v_cache),
     )
 
     block = Block(
@@ -184,8 +210,7 @@ def test_print_calldps_no_output():
 
     assert "call_dps @kernel.update_kvcache(" in text
     assert "inputs=[%k_cache, %v_cache, %k, %v, %pos]" in text
-    assert "output=None" in text
-    assert "callee_kind=kernel" in text
+    assert "outputs=[]" in text
     assert "effect=write(%k_cache, %v_cache)" in text
 
 
@@ -193,23 +218,75 @@ def test_print_calldps_with_output():
     x = Var("x")
     out = Var("out")
     calldps = CallDPSOp(
-        callee="@kernel.relu",
-        callee_kind=CalleeKind.kernel,
+        target_ref=kernel_ref("@kernel.relu"),
         inputs=(x,),
-        output=out,
-        effect=WriteEffect((out,)),
+        outputs=(out,),
+        effect=EffectSummary.write(out),
     )
     block = Block(args=(x, out), ops=(calldps, ReturnOp(values=(out,))))
     fn = Function(Region((block,)))
     text = print_module(IRModule({"f": fn}))
     assert "call_dps @kernel.relu(" in text
-    assert "output=%out" in text
+    assert "outputs=[%out]" in text
     assert "effect=write(%out)" in text
+
+
+def test_common_op_interface_for_calls_and_effects():
+    x = Var("x")
+    out = Var("out")
+
+    standard = CallOp(std("relu"), args=(x,), result_name="y")
+    external = CallOp(ExternalFuncRef("runtime.log"), args=(x,), result_name="ignored")
+    dps = CallDPSOp(
+        target_ref=kernel_ref("kernel.relu"),
+        inputs=(x,),
+        outputs=(out,),
+        effect=EffectSummary.opaque_call(),
+    )
+
+    assert standard.operands == (x,)
+    assert standard.effects.is_pure
+    assert external.operands == (x,)
+    assert external.effects.opaque
+    assert external.effects.external_state == "runtime.log"
+    assert dps.op_ref == dps.target_ref
+    assert dps.operands == (x, out)
+    assert out in dps.effects.writes
+
+
+def test_make_call_op_projects_ref_kind_to_call_subclass():
+    x = Var("x")
+
+    standard = make_call_op(std("relu"), args=(x,), result_name="y")
+    external = make_call_op(ExternalFuncRef("runtime.log"), args=(x,), result_name="z")
+
+    assert isinstance(standard, StandardCallOp)
+    assert isinstance(external, ExternalCallOp)
+
+
+def test_alias_analysis_resolves_tuple_forwarding():
+    x = Var("x")
+    y = Var("y")
+    tup = TupleOp(result_name="pair", elems=(x, y))
+    item = TupleGetItemOp(tup=tup.results[0], index=1, result_name="picked")
+
+    aliases = AliasAnalysis((tup, item))
+
+    assert aliases.sources(tup.results[0]) == (x, y)
+    assert aliases.resolve_matching(item.results[0], lambda v: v is y) == frozenset({y})
+
+
+def test_shape_assert_requires_block_arg_tensor():
+    x = Var("x")
+    tup = TupleOp(result_name="pair", elems=(x,))
+
+    with pytest.raises(TypeError, match="BlockArg"):
+        ShapeAssertOp(tensor=tup.results[0], dim_idx=0, upper=1)
 
 
 def test_print_multi_function_separator():
     x = Var("x")
-    call_op = CallOp(callee="@relu", args=(x,), result_name="y")
+    call_op = CallOp(std("relu"), args=(x,), result_name="y")
     y = call_op.results[0]
     block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
     fn = Function(Region((block,)))
@@ -230,7 +307,7 @@ def test_printer_reuse():
 def test_tuple_ir():
     x = Var("x")
 
-    qkv_op = CallOp(callee="@qkv_proj", args=(x,), result_name="qkv")
+    qkv_op = CallOp(std("qkv_proj"), args=(x,), result_name="qkv")
     qkv = qkv_op.results[0]
 
     tgi_op = TupleGetItemOp(tup=qkv, index=0, result_name="q")
@@ -274,29 +351,30 @@ def test_tensor_create_op_printer():
 # ---------------------------------------------------------------------------
 
 def test_verifier_rejects_alloc_storage():
-    x = Var("x")
-    call_op = CallOp(callee="@alloc_storage", args=(x,), result_name="y")
-    y = call_op.results[0]
-    block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
+    from devproc2.ir import AllocStorageOp
+
+    alloc = AllocStorageOp(result_name="s0", size_bytes=1, alignment=256, device="cpu")
+    block = Block(args=(), ops=(alloc, ReturnOp((alloc.results[0],))))
     fn = Function(Region((block,)))
-    with pytest.raises(IRVerificationError, match="alloc_storage"):
-        verify(IRModule({"bad": fn}))
+    with pytest.raises(IRVerificationError, match="AllocStorageOp"):
+        verify(IRModule({"bad": fn}), stage=IRStage.raw)
 
 
 def test_verifier_rejects_alloc_tensor():
-    x = Var("x")
-    call_op = CallOp(callee="@alloc_tensor", args=(x,), result_name="y")
-    y = call_op.results[0]
-    block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
+    from devproc2.ir import AllocStorageOp, AllocTensorOp
+
+    alloc = AllocStorageOp(result_name="s0", size_bytes=16, alignment=256, device="cpu")
+    tensor = AllocTensorOp(result_name="t0", storage=alloc.results[0], offset=0, shape=(1,), dtype="float32")
+    block = Block(args=(), ops=(alloc, tensor, ReturnOp((tensor.results[0],))))
     fn = Function(Region((block,)))
-    with pytest.raises(IRVerificationError, match="alloc_tensor"):
-        verify(IRModule({"bad": fn}))
+    with pytest.raises(IRVerificationError, match="AllocStorageOp"):
+        verify(IRModule({"bad": fn}), stage=IRStage.raw)
 
 
 def test_verifier_catches_use_before_def():
     x = Var("x")
     z = Var("z")  # never defined — Var as undefined operand
-    call_op = CallOp(callee="@foo", args=(z,), result_name="y")
+    call_op = CallOp(std("foo"), args=(z,), result_name="y")
     y = call_op.results[0]
     block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
     fn = Function(Region((block,)))
@@ -306,7 +384,7 @@ def test_verifier_catches_use_before_def():
 
 def test_verifier_catches_double_def():
     x = Var("x")
-    foo_op = CallOp(callee="@foo", args=(x,), result_name="y")
+    foo_op = CallOp(std("foo"), args=(x,), result_name="y")
     # Use same block arg twice — triggers double-def on block arg level
     block = Block(
         args=(x, x),  # x defined twice as block arg
@@ -318,18 +396,17 @@ def test_verifier_catches_double_def():
 
 
 def test_verifier_write_effect_not_false_positive():
-    """WriteEffect.vars are effect metadata — must not trigger use-before-def."""
+    """EffectSummary writes are effect metadata and are verified like operands."""
     k_cache = Var("k_cache")
     v_cache = Var("v_cache")
     k = Var("k")
     v = Var("v")
     pos = Var("pos")
     calldps = CallDPSOp(
-        callee="@kernel.update_kvcache",
-        callee_kind=CalleeKind.kernel,
+        target_ref=kernel_ref("@kernel.update_kvcache"),
         inputs=(k_cache, v_cache, k, v, pos),
-        output=None,
-        effect=WriteEffect((k_cache, v_cache)),
+        outputs=(),
+        effect=EffectSummary.write(k_cache, v_cache),
     )
     block = Block(args=(k_cache, v_cache, k, v, pos), ops=(calldps, ReturnOp((pos,))))
     fn = Function(Region((block,)))
@@ -346,7 +423,7 @@ def test_verifier_block_must_not_be_empty():
 
 def test_verifier_last_op_must_be_terminator():
     x = Var("x")
-    call_op = CallOp(callee="@relu", args=(x,), result_name="y")
+    call_op = CallOp(std("relu"), args=(x,), result_name="y")
     block = Block(args=(x,), ops=(call_op,))
     fn = Function(Region((block,)))
     with pytest.raises(IRVerificationError, match="TerminatorOp"):
@@ -355,7 +432,7 @@ def test_verifier_last_op_must_be_terminator():
 
 def test_verifier_terminator_not_at_end():
     x = Var("x")
-    call_op = CallOp(callee="@relu", args=(x,), result_name="y")
+    call_op = CallOp(std("relu"), args=(x,), result_name="y")
     y = call_op.results[0]
     block = Block(
         args=(x,),
@@ -372,11 +449,65 @@ def test_verifier_terminator_not_at_end():
 
 def test_verifier_accepts_valid_module():
     x = Var("x", TensorStructInfo((128,), "float16", "cuda"))
-    call_op = CallOp(callee="@relu", args=(x,), result_name="y")
+    call_op = CallOp(std("relu"), args=(x,), result_name="y")
     y = call_op.results[0]
     block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
     fn = Function(Region((block,)))
     verify(IRModule({"f": fn}))
+
+
+def test_stage_verifier_allows_tensor_create_before_memory_ir():
+    create = TensorCreateOp(
+        result_name="buf",
+        kind=TensorCreateKind.empty,
+        shape=(IntImm(4),),
+        dtype="float32",
+        device="cpu",
+    )
+    block = Block(args=(), ops=(create, ReturnOp((create.results[0],))))
+    fn = Function(Region((block,)))
+
+    verify(IRModule({"f": fn}), stage=IRStage.raw)
+
+
+def test_stage_verifier_keeps_tuple_ops_after_dps_lowering():
+    x = Var("x")
+    y = Var("y")
+    tup = TupleOp(result_name="pair", elems=(x, y))
+    block = Block(args=(x, y), ops=(tup, ReturnOp((tup.results[0],))))
+    fn = Function(Region((block,)))
+
+    verify(IRModule({"f": fn}), stage=IRStage.dps)
+
+
+def test_stage_verifier_rejects_unlowered_kernel_op_in_dps_ir():
+    x = Var("x", TensorStructInfo((IntImm(4),), "float32", "cpu"))
+    call_op = CallOp(StandardOpRef("relu"), args=(x,), result_name="y")
+    y = call_op.results[0]
+    block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
+    fn = Function(Region((block,)))
+
+    with pytest.raises(IRVerificationError, match="not allowed in DPSIR"):
+        verify(IRModule({"f": fn}), stage=IRStage.dps)
+
+
+def test_stage_verifier_rejects_missing_struct_info_in_inferred_ir():
+    x = Var("x")
+    call_op = CallOp(StandardOpRef("relu"), args=(x,), result_name="y")
+    y = call_op.results[0]
+    block = Block(args=(x,), ops=(call_op, ReturnOp((y,))))
+    fn = Function(Region((block,)))
+
+    with pytest.raises(IRVerificationError, match="without struct_info"):
+        verify(IRModule({"f": fn}), stage=IRStage.inferred)
+
+
+def test_known_shape_hash_matches_tuple_equality():
+    shape = (IntImm(2), IntImm(3))
+    known = KnownShape(shape)
+
+    assert known == shape
+    assert {known: "value"}[shape] == "value"
 
 
 # ---------------------------------------------------------------------------

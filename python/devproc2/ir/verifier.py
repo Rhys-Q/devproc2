@@ -1,34 +1,31 @@
 from __future__ import annotations
 
-from typing import Iterator, Optional
-
 from devproc2.ir.nodes import (
     Block,
-    Constant,
     Function,
     IRModule,
+    IRStage,
     Op,
     OpResult,
     Region,
     TerminatorOp,
     Value,
     Var,
-    WriteEffect,
+    allowed_dialects,
 )
+from devproc2.ir.op_ref import BuiltinOpRef, ExternalFuncRef, KernelRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
     CallOp,
+    CudaCallOp,
     ForOp,
     IfOp,
+    AllocStorageOp,
+    AllocTensorOp,
     ReturnOp,
-    ShapeAssertOp,
     TensorCreateOp,
-    TupleGetItemOp,
-    TupleOp,
     YieldOp,
 )
-
-_FORBIDDEN_CALLEES = frozenset({"@alloc_storage", "@alloc_tensor"})
 
 
 class IRVerificationError(Exception):
@@ -36,6 +33,11 @@ class IRVerificationError(Exception):
 
 
 class Verifier:
+    def __init__(self, stage: IRStage | str | None = None) -> None:
+        if isinstance(stage, str):
+            stage = IRStage(stage)
+        self.stage = stage
+
     def verify_module(self, module: IRModule) -> None:
         for name, fn in module.functions.items():
             self._verify_function(name, fn)
@@ -66,6 +68,11 @@ class Verifier:
         defined_results: set[int],
         expected_terminator: type[TerminatorOp] = YieldOp,
     ) -> None:
+        if len(region.blocks) != 1:
+            raise IRVerificationError(
+                f"In @{fn_name}: structured Region must contain exactly one block, "
+                f"got {len(region.blocks)}"
+            )
         for block in region.blocks:
             self._verify_block(fn_name, block, defined_names, defined_results, expected_terminator)
 
@@ -111,7 +118,18 @@ class Verifier:
 
             self._verify_op(fn_name, op, defined_names, defined_results)
 
-            for result in op.results:
+            for expected_index, result in enumerate(op.results):
+                if result.op is not op:
+                    raise IRVerificationError(
+                        f"In @{fn_name}: OpResult owner mismatch on "
+                        f"{type(op).__name__} result {expected_index}"
+                    )
+                if result.index != expected_index:
+                    raise IRVerificationError(
+                        f"In @{fn_name}: OpResult index mismatch on "
+                        f"{type(op).__name__}: expected {expected_index}, "
+                        f"got {result.index}"
+                    )
                 if id(result) in defined_results:
                     raise IRVerificationError(
                         f"In @{fn_name}: OpResult defined more than once"
@@ -152,47 +170,33 @@ class Verifier:
         defined_names: set[str],
         defined_results: set[int],
     ) -> None:
-        self._check_forbidden(fn_name, op)
+        self._check_stage(fn_name, op)
 
         def chk(v: Value) -> None:
             self._chk_value(fn_name, v, defined_names, defined_results)
 
-        if isinstance(op, CallOp):
-            for v in _value_refs(op.args):
+        for v in _value_refs(op.operands):
+            chk(v)
+        if not op.regions:
+            for v in _value_refs(op.effects.reads + op.effects.writes):
                 chk(v)
+            if op.effects.alias is not None and op.effects.alias.source is not None:
+                chk(op.effects.alias.source)
+
+        if isinstance(op, CallOp):
+            self._verify_call_op_schema(fn_name, op)
 
         elif isinstance(op, CallDPSOp):
-            for v in _value_refs(op.inputs):
-                chk(v)
-            if op.output is not None:
-                chk(op.output)
+            self._verify_dps_target(fn_name, op)
 
-        elif isinstance(op, TupleOp):
-            for v in _value_refs(op.elems):
-                chk(v)
-
-        elif isinstance(op, TupleGetItemOp):
-            chk(op.tup)
-
-        elif isinstance(op, ReturnOp):
-            for v in _value_refs(op.values):
-                chk(v)
-
-        elif isinstance(op, YieldOp):
-            for v in _value_refs(op.values):
-                chk(v)
+        elif isinstance(op, CudaCallOp):
+            self._verify_cuda_call(fn_name, op)
 
         elif isinstance(op, IfOp):
             self._verify_if_op(fn_name, op, defined_names, defined_results)
 
         elif isinstance(op, ForOp):
             self._verify_for_op(fn_name, op, defined_names, defined_results)
-
-        elif isinstance(op, ShapeAssertOp):
-            if op.tensor.name not in defined_names:
-                raise IRVerificationError(
-                    f"In @{fn_name}: ShapeAssert tensor '%{op.tensor.name}' used before definition"
-                )
 
     # ------------------------------------------------------------------
     # IfOp
@@ -205,10 +209,6 @@ class Verifier:
         defined_names: set[str],
         defined_results: set[int],
     ) -> None:
-        def chk(v: Value) -> None:
-            self._chk_value(fn_name, v, defined_names, defined_results)
-
-        chk(op.cond)
         self._verify_region(fn_name, op.then_region, set(defined_names), set(defined_results), YieldOp)
         if op.else_region is not None:
             self._verify_region(fn_name, op.else_region, set(defined_names), set(defined_results), YieldOp)
@@ -217,10 +217,14 @@ class Verifier:
         assert isinstance(then_yield, YieldOp)
         n = len(then_yield.values)
 
-        if op.results and len(op.results) != n:
+        if len(op.results) != n:
             raise IRVerificationError(
                 f"In @{fn_name}: IfOp has {len(op.results)} results but "
                 f"then_region yields {n} values"
+            )
+        if op.results and op.else_region is None:
+            raise IRVerificationError(
+                f"In @{fn_name}: IfOp with results requires an else_region"
             )
         if op.else_region is not None:
             else_yield = _region_terminator(op.else_region)
@@ -242,14 +246,6 @@ class Verifier:
         defined_names: set[str],
         defined_results: set[int],
     ) -> None:
-        def chk(v: Value) -> None:
-            self._chk_value(fn_name, v, defined_names, defined_results)
-
-        for v in _value_refs((op.range_.start, op.range_.end, op.range_.step)):
-            chk(v)
-        for ia in op.iter_args:
-            chk(ia.init)
-
         n = len(op.iter_args)
         body_yield = _region_terminator(op.body_region)
         assert isinstance(body_yield, YieldOp)
@@ -279,27 +275,124 @@ class Verifier:
     # ------------------------------------------------------------------
 
     def _check_forbidden(self, fn_name: str, op: Op) -> None:
-        callee: Optional[str] = None
-        if isinstance(op, CallOp):
-            callee = op.callee
-        elif isinstance(op, CallDPSOp):
-            callee = op.callee
-        if callee and callee in _FORBIDDEN_CALLEES:
-            node_name = callee.lstrip("@")
+        raise AssertionError("_check_forbidden has been replaced by stage verification")
+
+    def _check_stage(self, fn_name: str, op: Op) -> None:
+        if self.stage is None:
+            return
+        dialect = op.dialect
+        if dialect not in allowed_dialects(self.stage):
             raise IRVerificationError(
-                f"In @{fn_name}: {node_name} is forbidden in high-level IR "
-                f"(use TensorCreateOp instead)"
+                f"In @{fn_name}: {type(op).__name__} dialect {dialect.value!r} "
+                f"is not allowed in {self.stage.value}"
             )
+        if self.stage in (IRStage.raw, IRStage.normalized, IRStage.inferred):
+            if isinstance(op, (AllocStorageOp, AllocTensorOp)):
+                raise IRVerificationError(
+                    f"In @{fn_name}: {type(op).__name__} is forbidden before MemoryIR"
+                )
+        if self.stage == IRStage.inferred:
+            if op.results and any(result.struct_info is None for result in op.results):
+                raise IRVerificationError(
+                    f"In @{fn_name}: {type(op).__name__} result without struct_info "
+                    "is not allowed in InferredIR"
+                )
+            if isinstance(op, CallOp) and isinstance(op.op_ref, StandardOpRef) and op.results:
+                if any(result.struct_info is None for result in op.results):
+                    raise IRVerificationError(
+                        f"In @{fn_name}: inferred StandardOp {op.op_ref.display_name()} "
+                        "has result without struct_info"
+                    )
+        if self.stage == IRStage.dps:
+            if isinstance(op, CudaCallOp):
+                raise IRVerificationError(
+                    f"In @{fn_name}: CudaCallOp must be lowered before {self.stage.value}"
+                )
+            if isinstance(op, (AllocStorageOp, AllocTensorOp)):
+                raise IRVerificationError(
+                    f"In @{fn_name}: {type(op).__name__} is forbidden before MemoryIR"
+                )
+            if isinstance(op, CallOp) and isinstance(op.op_ref, StandardOpRef):
+                op_def = op.op_ref.resolve()
+                lowering_kind = getattr(getattr(op_def, "lowering", None), "kind", None)
+                if op_def is None or getattr(lowering_kind, "value", None) == "kernel":
+                    raise IRVerificationError(
+                        f"In @{fn_name}: high-level tensor op {op.op_ref.display_name()} "
+                        f"is not allowed in {self.stage.value}"
+                    )
+        if self.stage in (IRStage.memory, IRStage.vm):
+            if isinstance(op, TensorCreateOp):
+                raise IRVerificationError(
+                    f"In @{fn_name}: TensorCreateOp is forbidden after DPSIR"
+                )
+            if isinstance(op, CallOp):
+                raise IRVerificationError(
+                    f"In @{fn_name}: CallOp {op.op_ref.display_name()} "
+                    f"is not allowed in {self.stage.value}"
+                )
+            if isinstance(op, CudaCallOp):
+                raise IRVerificationError(
+                    f"In @{fn_name}: CudaCallOp is not allowed in {self.stage.value}"
+                )
+
+    def _verify_call_op_schema(self, fn_name: str, op: CallOp) -> None:
+        if isinstance(op.op_ref, StandardOpRef):
+            op_def = op.op_ref.resolve()
+            if op_def is None:
+                raise IRVerificationError(
+                    f"In @{fn_name}: unknown standard op {op.op_ref.name!r}; "
+                    "use ExternalFuncRef for opaque runtime calls"
+                )
+            try:
+                op_def.validate_call(op.args, op.attrs)
+            except (TypeError, ValueError) as err:
+                raise IRVerificationError(f"In @{fn_name}: {err}") from err
+            if op.results and not op_def.outputs:
+                raise IRVerificationError(
+                    f"In @{fn_name}: {op.op_ref.display_name()} produces no schema outputs "
+                    f"but CallOp has {len(op.results)} result(s)"
+                )
+            return
+        if isinstance(op.op_ref, (ExternalFuncRef, BuiltinOpRef)):
+            return
+        raise IRVerificationError(
+            f"In @{fn_name}: invalid CallOp op_ref {type(op.op_ref).__name__}"
+        )
+
+    def _verify_dps_target(self, fn_name: str, op: CallDPSOp) -> None:
+        if not isinstance(op.target_ref, (KernelRef, PackedFuncRef, BuiltinOpRef)):
+            raise IRVerificationError(
+                f"In @{fn_name}: invalid CallDPSOp target_ref "
+                f"{type(op.target_ref).__name__}"
+            )
+        missing_writes = tuple(v for v in op.outputs if v not in op.effect.writes)
+        if missing_writes:
+            raise IRVerificationError(
+                f"In @{fn_name}: CallDPSOp outputs must be listed in write effect"
+            )
+
+    def _verify_cuda_call(self, fn_name: str, op: CudaCallOp) -> None:
+        if not op.source_path:
+            raise IRVerificationError(f"In @{fn_name}: CudaCallOp requires source_path")
+        if not op.symbol:
+            raise IRVerificationError(f"In @{fn_name}: CudaCallOp requires symbol")
+        for idx in op.output_indices:
+            if idx < 0 or idx >= len(op.args):
+                raise IRVerificationError(
+                    f"In @{fn_name}: CudaCallOp output index {idx} is out of range"
+                )
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
-def _value_refs(vals: tuple) -> Iterator[Value]:
+def _value_refs(vals: tuple) -> tuple[Value, ...]:
+    refs: list[Value] = []
     for v in vals:
         if isinstance(v, (Var, OpResult)):
-            yield v
+            refs.append(v)
+    return tuple(refs)
 
 
 def _region_terminator(region: Region) -> TerminatorOp:
@@ -310,5 +403,5 @@ def _region_terminator(region: Region) -> TerminatorOp:
     return last
 
 
-def verify(module: IRModule) -> None:
-    Verifier().verify_module(module)
+def verify(module: IRModule, stage: IRStage | str | None = None) -> None:
+    Verifier(stage).verify_module(module)

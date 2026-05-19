@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from functools import reduce as _reduce
 from math import prod
 from typing import Optional
 
@@ -33,30 +32,23 @@ from devproc2.ir.prim_expr import (
     Sub,
     prim_expr_structural_eq,
 )
+from devproc2.ir.analysis import AliasAnalysis, iter_ops
 from devproc2.ir.nodes import (
-    Block,
     Function,
     IRModule,
-    OpaqueEffect,
+    IRStage,
     OpResult,
     Region,
     TensorStructInfo,
     Value,
-    Var,
-    WriteEffect,
+    shape_values,
 )
 from devproc2.ir.ops import (
-    AllocTensorOp,
     CallDPSOp,
-    ForOp,
-    IfOp,
     Op,
     ReturnOp,
     TensorCreateKind,
     TensorCreateOp,
-    TupleGetItemOp,
-    TupleOp,
-    YieldOp,
 )
 
 _MAX_INT = sys.maxsize
@@ -198,89 +190,53 @@ def _compute_size_expr(shape: tuple[PrimExpr, ...], dtype: str) -> PrimExpr:
 
 def _collect_ops_linear(region: Region, out: list[Op]) -> None:
     """DFS linearisation: appends every Op (including nested-region ops)."""
-    for block in region.blocks:
-        for op in block.ops:
-            out.append(op)
-            for attr in ("then_region", "else_region", "body_region"):
-                sub: Optional[Region] = getattr(op, attr, None)
-                if sub is not None:
-                    _collect_ops_linear(sub, out)
+    out.extend(iter_ops(region))
 
 
-def _collect_return_values(fn: Function, create_ops: list) -> set[int]:
-    """Return id() of every TensorCreateOp result that flows into a ReturnOp.
+def _collect_return_values(
+    all_ops: list[Op],
+    create_results: set[OpResult],
+    aliases: AliasAnalysis,
+) -> set[OpResult]:
+    """Return TensorCreateOp result ids that flow into function returns.
 
-    Traces through TupleOp so that `return a, b` (which the DSL lowers to
-    TupleOp([a, b]) → ReturnOp(tuple_result)) correctly marks both a and b
-    as non-reusable.
+    Return values may be wrapped in TupleOp or produced by structured control
+    flow.  For example, `return if_result` must keep the tensors yielded from
+    the selected IfOp branch alive for the caller.  This function resolves those
+    value aliases back to the underlying TensorCreateOp results.
     """
-    ids: set[int] = set()
-
-    def _add_value(v: object) -> None:
-        if isinstance(v, OpResult):
-            ids.add(id(v))
-            if isinstance(v.op, TupleOp):
-                for e in v.op.elems:
-                    _add_value(e)
-
-    for op in fn.body.entry_block.ops:
+    results: set[OpResult] = set()
+    for op in all_ops:
         if isinstance(op, ReturnOp):
             for v in op.values:
-                _add_value(v)
-    return ids
+                results.update(_resolve_create_results(v, create_results, aliases))
+    return results
 
 
 def _operand_results(op: Op) -> list[OpResult]:
-    """Collect all OpResult operands referenced by op (not its own results).
-
-    Explicit cases are listed for all known Op types.  The generic fallback
-    at the end handles unknown types by inspecting common field names, but it
-    will silently miss any Value fields with non-standard names.  When adding
-    a new Op type that has Value-typed fields, add an explicit case here.
-    """
+    """Collect all OpResult operands referenced by public op semantics."""
     refs: list[OpResult] = []
 
     def _add(v: Value) -> None:
         if isinstance(v, OpResult):
             refs.append(v)
 
-    if isinstance(op, CallDPSOp):
-        for v in op.inputs:
-            _add(v)
-        if op.output is not None:
-            _add(op.output)
-    elif isinstance(op, ReturnOp):
-        for v in op.values:
-            _add(v)
-    elif isinstance(op, YieldOp):
-        for v in op.values:
-            _add(v)
-    elif isinstance(op, TupleOp):
-        for v in op.elems:
-            _add(v)
-    elif isinstance(op, TupleGetItemOp):
-        _add(op.tup)
-    elif isinstance(op, AllocTensorOp):
-        _add(op.storage)
-    elif isinstance(op, IfOp):
-        _add(op.cond)
-    elif isinstance(op, ForOp):
-        _add(op.range_.start)
-        _add(op.range_.end)
-        _add(op.range_.step)
-        for ia in op.iter_args:
-            _add(ia.init)
-    else:
-        # Generic fallback: inspect common field names.  Safe for TensorCreateOp,
-        # ShapeAssertOp, AllocStorageOp (no Value operands), CallOp (args field).
-        for fname in ("args", "inputs", "values", "elems"):
-            for v in getattr(op, fname, ()):
-                _add(v)
-        for fname in ("output", "tup", "storage"):
-            v = getattr(op, fname, None)
-            if v is not None:
-                _add(v)
+    effect = op.effects
+    for value in op.operands + effect.reads + effect.writes:
+        _add(value)
     return refs
+
+
+def _resolve_create_results(
+    value: Value,
+    create_results: set[OpResult],
+    aliases: AliasAnalysis,
+) -> frozenset[OpResult]:
+    return frozenset(
+        result
+        for result in aliases.resolve_matching(value, lambda v: v in create_results)
+        if isinstance(result, OpResult)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +245,10 @@ def _operand_results(op: Op) -> list[OpResult]:
 
 class MemoryPlanningPass:
     """Analysis-only pass; writes StoragePlan to PassContext."""
+    input_stage = IRStage.dps
+    output_stage = IRStage.dps
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ("storage_plan",)
 
     def run(self, module: IRModule, ctx: PassContext) -> IRModule:
         for fn_name, fn in module.functions.items():
@@ -312,29 +272,35 @@ class MemoryPlanningPass:
             op for op in all_ops if isinstance(op, TensorCreateOp)
         ]
 
+        _check_unique_tensor_create_names(create_ops)
+
         # Phase A: identify non-reusable (output) tensors
-        return_result_ids = _collect_return_values(fn, create_ops)
+        create_results = {cop.results[0] for cop in create_ops}
+        aliases = AliasAnalysis(all_ops)
+        return_result_ids = _collect_return_values(
+            all_ops, create_results, aliases
+        )
 
         # Phase B: build op→index map and compute live intervals
         op_index: dict[int, int] = {id(op): i for i, op in enumerate(all_ops)}
 
         # result_id → defining TensorCreateOp result_name
-        result_to_name: dict[int, str] = {}
+        result_to_name: dict[OpResult, str] = {}
         for cop in create_ops:
-            result_to_name[id(cop.results[0])] = cop.result_name
+            result_to_name[cop.results[0]] = cop.result_name
 
         # first_def per tensor (index of TensorCreateOp in linear order)
         first_def: dict[str, int] = {}
         for cop in create_ops:
             first_def[cop.result_name] = op_index[id(cop)]
 
-        # Phase B step 1: explicit last_use from data flow only (no OpaqueEffect yet)
+        # Phase B step 1: explicit last_use from data flow only.
         explicit_last_use: dict[str, int] = {n: first_def[n] for n in first_def}
         for op in all_ops:
             idx = op_index[id(op)]
             for ref in _operand_results(op):
-                name = result_to_name.get(id(ref))
-                if name is not None:
+                for result in _resolve_create_results(ref, create_results, aliases):
+                    name = result_to_name[result]
                     explicit_last_use[name] = max(explicit_last_use[name], idx)
 
         # Phase B step 2: apply effect-based extensions
@@ -342,12 +308,21 @@ class MemoryPlanningPass:
         for op in all_ops:
             idx = op_index[id(op)]
             if isinstance(op, CallDPSOp):
-                if isinstance(op.effect, WriteEffect):
-                    for var in op.effect.vars:
-                        name = result_to_name.get(id(var))
-                        if name is not None:
+                if op.effect.reads:
+                    for value in op.effect.reads:
+                        for result in _resolve_create_results(
+                            value, create_results, aliases
+                        ):
+                            name = result_to_name[result]
                             last_use[name] = max(last_use[name], idx)
-                elif isinstance(op.effect, OpaqueEffect):
+                if op.effect.writes:
+                    for value in op.effect.writes:
+                        for result in _resolve_create_results(
+                            value, create_results, aliases
+                        ):
+                            name = result_to_name[result]
+                            last_use[name] = max(last_use[name], idx)
+                if op.effect.opaque:
                     # Conservative: extend tensors that are ALREADY live at this point.
                     # "Already live" = defined before AND last-used (explicitly) at or after
                     # this index.  This avoids resurrecting tensors that have already been
@@ -365,7 +340,7 @@ class MemoryPlanningPass:
             size_bytes = _compute_size_bytes(shape, dtype)   # None if unbounded
             size_expr = (IntImm(size_bytes) if size_bytes is not None
                          else _compute_size_expr(shape, dtype))
-            is_ret = (id(cop.results[0]) in return_result_ids)
+            is_ret = (cop.results[0] in return_result_ids)
             # Not reusable only if the tensor is returned (must stay alive for
             # the caller).  Dynamic (unbounded) tensors are reusable as long as
             # they are not returned — two dynamic tensors with the same size_expr
@@ -397,12 +372,23 @@ def _get_shape_dtype_device(
     if cop.kind == TensorCreateKind.empty_like:
         si = cop.like.struct_info if cop.like is not None else None
         if isinstance(si, TensorStructInfo):
-            return si.shape, si.dtype, si.device
+            return shape_values(si.shape), si.dtype, si.device
         raise ValueError(
             f"TensorCreateOp(empty_like) '{cop.result_name}': "
             "cannot determine shape; ensure InferStructInfoPass ran first"
         )
     return cop.shape, cop.dtype, cop.device
+
+
+def _check_unique_tensor_create_names(create_ops: list[TensorCreateOp]) -> None:
+    seen: set[str] = set()
+    for op in create_ops:
+        if op.result_name in seen:
+            raise ValueError(
+                "MemoryPlanningPass requires unique TensorCreateOp result_name "
+                f"within a function, got duplicate {op.result_name!r}"
+            )
+        seen.add(op.result_name)
 
 
 def _greedy_plan(tensors: list[TensorInfo]) -> StoragePlan:

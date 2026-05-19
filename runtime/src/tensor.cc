@@ -52,6 +52,7 @@ Tensor Tensor::FromStorage(ObjectRef storage,
                            DLDataType dtype) {
     auto* sobj = storage.as<StorageObj>();
     if (!sobj) throw std::runtime_error("Tensor::FromStorage: invalid storage");
+    if (byte_offset < 0) throw std::runtime_error("Tensor::FromStorage: negative byte offset");
 
     auto* tobj = new TensorObj();
     tobj->storage               = storage;
@@ -59,6 +60,48 @@ Tensor Tensor::FromStorage(ObjectRef storage,
     tobj->dl_tensor.data        =
         static_cast<char*>(sobj->data) + byte_offset;
     tobj->dl_tensor.device      = sobj->device;
+    tobj->dl_tensor.ndim        = static_cast<int>(shape.size());
+    tobj->dl_tensor.dtype       = dtype;
+    tobj->dl_tensor.shape       = tobj->shape_storage_.data();
+    tobj->dl_tensor.strides     = nullptr;
+    tobj->dl_tensor.byte_offset = 0;
+    return Tensor(tobj);
+}
+
+Tensor Tensor::View(Tensor base,
+                    int64_t byte_offset,
+                    const std::vector<int64_t>& shape) {
+    if (!base.defined()) throw std::runtime_error("Tensor::View: invalid base tensor");
+    if (byte_offset < 0) throw std::runtime_error("Tensor::View: negative byte offset");
+
+    auto* base_obj = base.operator->();
+    const auto dtype = base_obj->dl_tensor.dtype;
+    size_t payload_bytes = 1;
+    for (auto dim : shape) payload_bytes *= static_cast<size_t>(dim);
+    payload_bytes = (payload_bytes * dtype.bits * dtype.lanes + 7) / 8;
+
+    if (base_obj->storage.defined()) {
+        auto* sobj = base_obj->storage.as<StorageObj>();
+        if (sobj && sobj->nbytes > 0) {
+            const char* storage_base = static_cast<const char*>(sobj->data);
+            const char* base_ptr = static_cast<const char*>(base_obj->dl_tensor.data)
+                                   + base_obj->dl_tensor.byte_offset;
+            const auto base_delta = static_cast<int64_t>(base_ptr - storage_base);
+            const auto end = base_delta + byte_offset + static_cast<int64_t>(payload_bytes);
+            if (base_delta < 0 || end > static_cast<int64_t>(sobj->nbytes)) {
+                throw std::runtime_error("Tensor::View: view exceeds storage bounds");
+            }
+        }
+    }
+
+    auto* tobj = new TensorObj();
+    tobj->storage               = base_obj->storage;
+    tobj->base                  = base;
+    tobj->shape_storage_        = shape;
+    tobj->dl_tensor.data        =
+        static_cast<char*>(base_obj->dl_tensor.data) +
+        base_obj->dl_tensor.byte_offset + byte_offset;
+    tobj->dl_tensor.device      = base_obj->dl_tensor.device;
     tobj->dl_tensor.ndim        = static_cast<int>(shape.size());
     tobj->dl_tensor.dtype       = dtype;
     tobj->dl_tensor.shape       = tobj->shape_storage_.data();

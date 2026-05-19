@@ -12,10 +12,10 @@ from devproc2.compiler.passes.memory_planning import (
     StoragePlan,
 )
 from devproc2.ir import (
+    EffectSummary,
     IRModule,
-    OpaqueEffect,
+    KernelRef,
     TensorStructInfo,
-    WriteEffect,
     print_module,
     verify,
 )
@@ -24,7 +24,6 @@ from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
     CallDPSOp,
-    CalleeKind,
     TensorCreateKind,
     TensorCreateOp,
 )
@@ -218,12 +217,12 @@ def test_dynamic_shape_tensors_can_share_storage():
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # same shape as a; intervals don't overlap
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -276,16 +275,16 @@ def test_reuse_intermediate_tensors():
 
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
-        a = dp.ops.relu(x)       # intermediate: a used only by layernorm
-        b = dp.ops.layernorm(a)  # b is returned
+        a = dp.ops.relu(x)       # intermediate: a used only by silu
+        b = dp.ops.silu(a)  # b is returned
         return b
 
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
 
-    # a is intermediate (live: relu → layernorm); b is returned
+    # a is intermediate (live: relu → silu); b is returned
     # a is reusable, b is not → they get different storage
     assert len(plan.entries) == 2
     a_id = plan.tensor_to_storage["a"]
@@ -302,14 +301,14 @@ def test_reuse_three_sequential_intermediates():
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.silu(b)
         return c
 
     silu_spec = KernelSpec(op_name="silu", device="cuda",
                            input_dtypes=("float16",),
                            kernel_name="kernel.silu_fp16")
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"), silu_spec)
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"), silu_spec)
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -335,12 +334,12 @@ def test_at_least_two_tensors_share_storage():
     @dp.function
     def f(x: dp.Tensor[(B, 512), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # c is intermediate; same shape as a
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(f.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(f.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -357,7 +356,7 @@ def test_at_least_two_tensors_share_storage():
 # ---------------------------------------------------------------------------
 
 def test_opaque_effect_extends_live_ranges():
-    """An OpaqueEffect CallDPS must extend the live range of all live tensors."""
+    """An opaque CallDPS must extend the live range of all live tensors."""
     B = dp.symbolic_dim("B", upper=8)
 
     @dp.function
@@ -367,20 +366,19 @@ def test_opaque_effect_extends_live_ranges():
         return a
 
     module = _lowered(f.lower_module(), _spec("relu"))
-    # Manually inject a no-output CallDPS with OpaqueEffect after relu
+    # Manually inject a no-output CallDPS with opaque EffectSummary after relu
     fn = module.functions["f"]
     from devproc2.ir.nodes import Block, Region, Function
     entry = fn.body.entry_block
-    # Insert a CallDPS(effect=opaque, output=None) between TensorCreateOp and ReturnOp
+    # Insert a CallDPS(effect=opaque) between TensorCreateOp and ReturnOp
     relu_create = entry.ops[0]  # TensorCreateOp
     relu_dps = entry.ops[1]     # CallDPSOp
     ret = entry.ops[2]          # ReturnOp
     opaque_call = CallDPSOp(
-        callee="kernel.side_effect",
-        callee_kind=CalleeKind.kernel,
+        target_ref=KernelRef("kernel.side_effect"),
         inputs=(relu_create.results[0],),
-        output=None,
-        effect=OpaqueEffect(),
+        outputs=(),
+        effect=EffectSummary.opaque_call(),
     )
     new_entry = Block(entry.args, (relu_create, relu_dps, opaque_call, ret))
     new_fn = Function(Region((new_entry,)), fn.ret_struct_info)
@@ -394,7 +392,7 @@ def test_opaque_effect_extends_live_ranges():
 
 
 def test_write_effect_extends_var_live_range():
-    """WriteEffect(vars=[k_cache]) should extend k_cache lifetime."""
+    """EffectSummary.write should extend a tensor lifetime."""
     # This test builds the IR manually to precisely control effects.
     B = dp.symbolic_dim("B", upper=8)
 
@@ -404,24 +402,18 @@ def test_write_effect_extends_var_live_range():
         return a
 
     module = _lowered(f.lower_module(), _spec("relu"))
-    # Insert a CallDPS with WriteEffect on the tensor 'a'
+    # Insert a CallDPS with an explicit write effect on the tensor 'a'
     fn = module.functions["f"]
     entry = fn.body.entry_block
     create_op = next(op for op in entry.ops if isinstance(op, TensorCreateOp))
     a_result = create_op.results[0]
 
-    from devproc2.ir.nodes import Block, Region, Function, Var, TensorStructInfo
-    from devproc2.ir.prim_expr import IntImm
-    # Create a dummy var with same struct_info
-    dummy_var = Var(name="buf", struct_info=TensorStructInfo(
-        shape=(IntImm(8), IntImm(512)), dtype="float16", device="cuda"
-    ))
+    from devproc2.ir.nodes import Block, Region, Function
     write_call = CallDPSOp(
-        callee="kernel.write_something",
-        callee_kind=CalleeKind.kernel,
+        target_ref=KernelRef("kernel.write_something"),
         inputs=(a_result,),
-        output=None,
-        effect=WriteEffect(vars=(dummy_var,)),
+        outputs=(),
+        effect=EffectSummary.write(a_result),
     )
     ret = next(op for op in entry.ops if not isinstance(op, (TensorCreateOp, CallDPSOp)))
     new_ops = tuple(op for op in entry.ops if not isinstance(op, type(ret)))
@@ -434,6 +426,54 @@ def test_write_effect_extends_var_live_range():
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
     assert plan is not None
+
+
+def test_read_effect_counts_as_tensor_use_for_reuse():
+    from devproc2.ir.nodes import Block, Function, Region
+    from devproc2.ir.ops import ReturnOp
+
+    shape = (IntImm(4),)
+    create_a = TensorCreateOp("a", TensorCreateKind.empty, shape, "float16", "cuda")
+    create_b = TensorCreateOp("b", TensorCreateKind.empty, shape, "float16", "cuda")
+    read_call = CallDPSOp(
+        KernelRef("kernel.read_effect"),
+        inputs=(),
+        outputs=(),
+        effect=EffectSummary.readonly(create_a.results[0]),
+    )
+    block = Block(args=(), ops=(create_a, create_b, read_call, ReturnOp(values=())))
+    module = IRModule({"f": Function(Region((block,)))})
+
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+
+    assert plan.tensor_to_storage["a"] != plan.tensor_to_storage["b"]
+
+
+def test_lowering_substitutes_calldps_effect_values():
+    from devproc2.ir.nodes import Block, Function, Region
+    from devproc2.ir.ops import AllocTensorOp, ReturnOp
+
+    create = TensorCreateOp("a", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    write_call = CallDPSOp(
+        KernelRef("kernel.write_effect"),
+        inputs=(),
+        outputs=(),
+        effect=EffectSummary.write(create.results[0]),
+    )
+    block = Block(args=(), ops=(create, write_call, ReturnOp((create.results[0],))))
+    module = IRModule({"f": Function(Region((block,)))})
+
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    lowered = LowerTensorCreateToAllocPass(ctx).run(module)
+    ops = lowered.functions["f"].body.entry_block.ops
+    alloc_tensor = next(op for op in ops if isinstance(op, AllocTensorOp))
+    lowered_call = next(op for op in ops if isinstance(op, CallDPSOp))
+
+    assert lowered_call.effect.writes == (alloc_tensor.results[0],)
+    verify(lowered, stage="MemoryIR")
 
 
 # ---------------------------------------------------------------------------
@@ -583,14 +623,14 @@ def test_per_function_plan_keys():
 
     @dp.function
     def g(x: dp.Tensor[(B, 512), "float16", "cuda"]):
-        y = dp.ops.layernorm(x)
+        y = dp.ops.silu(x)
         return y
 
     module = IRModule()
     module.functions["f"] = f.lower_module().functions["f"]
     module.functions["g"] = g.lower_module().functions["g"]
     module = InferStructInfoPass().run(module)
-    module = DPSLoweringPass(_reg(_spec("relu"), _spec("layernorm"))).run(module)
+    module = DPSLoweringPass(_reg(_spec("relu"), _spec("silu"))).run(module)
 
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
@@ -616,12 +656,12 @@ def test_acceptance_storage_plan_json_shape():
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # intermediate; reuses a's storage
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(main.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(main.lower_module(), _spec("relu"), _spec("silu"))
     ctx = PassContext()
     MemoryPlanningPass().run(module, ctx)
     plan = ctx.get("storage_plan")
@@ -651,12 +691,12 @@ def test_acceptance_lower_alloc_ir():
     @dp.function
     def main(x: dp.Tensor[(B, S, 4096), "float16", "cuda"]):
         a = dp.ops.relu(x)
-        b = dp.ops.layernorm(a)
+        b = dp.ops.silu(a)
         c = dp.ops.relu(b)       # c reuses a's storage
-        d = dp.ops.layernorm(c)  # returned
+        d = dp.ops.silu(c)  # returned
         return d
 
-    module = _lowered(main.lower_module(), _spec("relu"), _spec("layernorm"))
+    module = _lowered(main.lower_module(), _spec("relu"), _spec("silu"))
 
     # MemoryPlanningPass: IRModule unchanged
     ctx = PassContext()
@@ -754,9 +794,9 @@ def test_dynamic_reuse_with_reconstructed_primvars():
     from devproc2.ir.nodes import Block, Region, Function
     from devproc2.ir.prim_expr import IntImm, PrimVar
     from devproc2.ir.ops import (
-        TensorCreateOp, TensorCreateKind, CallDPSOp, CalleeKind, ReturnOp,
+        TensorCreateOp, TensorCreateKind, CallDPSOp, ReturnOp,
     )
-    from devproc2.ir.nodes import OpaqueEffect, Var, TensorStructInfo
+    from devproc2.ir.nodes import Var, TensorStructInfo
 
     # Two *different* PrimVar objects with the same name/upper
     B1 = PrimVar("B", upper=None)
@@ -769,14 +809,14 @@ def test_dynamic_reuse_with_reconstructed_primvars():
     x = Var("x", struct_info=TensorStructInfo(shape1, "float16", "cuda"))
 
     create_a = TensorCreateOp("a", TensorCreateKind.empty, shape1, "float16", "cuda")
-    dps_a = CallDPSOp("k.relu", CalleeKind.kernel, (x,), create_a.results[0], OpaqueEffect())
+    dps_a = CallDPSOp(KernelRef("k.relu"), (x,), (create_a.results[0],), EffectSummary.opaque_call())
     create_b = TensorCreateOp("b", TensorCreateKind.empty, shape2, "float16", "cuda")
-    dps_b = CallDPSOp("k.layernorm", CalleeKind.kernel, (create_a.results[0],), create_b.results[0], OpaqueEffect())
+    dps_b = CallDPSOp(KernelRef("k.silu"), (create_a.results[0],), (create_b.results[0],), EffectSummary.opaque_call())
     # Manufacture two more ops so a and b don't overlap
     create_c = TensorCreateOp("c", TensorCreateKind.empty, shape1, "float16", "cuda")
-    dps_c = CallDPSOp("k.relu", CalleeKind.kernel, (create_b.results[0],), create_c.results[0], OpaqueEffect())
+    dps_c = CallDPSOp(KernelRef("k.relu"), (create_b.results[0],), (create_c.results[0],), EffectSummary.opaque_call())
     create_d = TensorCreateOp("d", TensorCreateKind.empty, shape2, "float16", "cuda")
-    dps_d = CallDPSOp("k.layernorm", CalleeKind.kernel, (create_c.results[0],), create_d.results[0], OpaqueEffect())
+    dps_d = CallDPSOp(KernelRef("k.silu"), (create_c.results[0],), (create_d.results[0],), EffectSummary.opaque_call())
     ret = ReturnOp((create_d.results[0],))
 
     block = Block(args=(x,), ops=(
@@ -850,6 +890,72 @@ def test_dsl_tuple_return_marks_both_tensors_non_reusable():
     a_sid = plan.tensor_to_storage["a"]
     b_sid = plan.tensor_to_storage["b"]
     assert a_sid != b_sid
+
+
+def test_if_result_return_keeps_branch_tensors_alive():
+    """Tensors yielded through IfOp results must remain live until return.
+
+    Regression: memory planning used to only inspect direct ReturnOp operands.
+    `return if_result` therefore missed the branch TensorCreateOps and allowed
+    a later tensor to reuse their storage even though the selected branch output
+    escapes to the caller.
+    """
+    from devproc2.ir.nodes import Block, Function, Region, ScalarStructInfo, Var
+    from devproc2.ir.ops import IfOp, ReturnOp, YieldOp
+
+    cond = Var("cond", ScalarStructInfo("bool"))
+    create_y = TensorCreateOp("y", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    create_z = TensorCreateOp("z", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    create_tmp = TensorCreateOp("tmp", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+
+    if_op = IfOp(
+        cond=cond,
+        then_region=Region((Block(args=(), ops=(create_y, YieldOp((create_y.results[0],)))),)),
+        else_region=Region((Block(args=(), ops=(create_z, YieldOp((create_z.results[0],)))),)),
+        result_names=("out",),
+    )
+    block = Block(args=(cond,), ops=(if_op, create_tmp, ReturnOp((if_op.results[0],))))
+    module = IRModule({"f": Function(Region((block,)))})
+
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+
+    tmp_sid = plan.tensor_to_storage["tmp"]
+    assert plan.tensor_to_storage["y"] != tmp_sid
+    assert plan.tensor_to_storage["z"] != tmp_sid
+
+
+def test_tuple_get_item_of_if_result_keeps_projected_branch_tensors_alive():
+    from devproc2.ir.nodes import Block, Function, Region, ScalarStructInfo, Var
+    from devproc2.ir.ops import IfOp, ReturnOp, TupleGetItemOp, TupleOp, YieldOp
+
+    cond = Var("cond", ScalarStructInfo("bool"))
+    y0 = TensorCreateOp("y0", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    y1 = TensorCreateOp("y1", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    z0 = TensorCreateOp("z0", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    z1 = TensorCreateOp("z1", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+    tmp = TensorCreateOp("tmp", TensorCreateKind.empty, (IntImm(4),), "float16", "cuda")
+
+    then_tuple = TupleOp("then_pair", (y0.results[0], y1.results[0]))
+    else_tuple = TupleOp("else_pair", (z0.results[0], z1.results[0]))
+    if_op = IfOp(
+        cond=cond,
+        then_region=Region((Block(args=(), ops=(y0, y1, then_tuple, YieldOp((then_tuple.results[0],)))),)),
+        else_region=Region((Block(args=(), ops=(z0, z1, else_tuple, YieldOp((else_tuple.results[0],)))),)),
+        result_names=("pair",),
+    )
+    picked = TupleGetItemOp(if_op.results[0], 0, "picked")
+    block = Block(args=(cond,), ops=(if_op, picked, tmp, ReturnOp((picked.results[0],))))
+    module = IRModule({"f": Function(Region((block,)))})
+
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    plan = ctx.get("storage_plan")
+
+    tmp_sid = plan.tensor_to_storage["tmp"]
+    assert plan.tensor_to_storage["y0"] != tmp_sid
+    assert plan.tensor_to_storage["z0"] != tmp_sid
 
 
 # ---------------------------------------------------------------------------

@@ -16,9 +16,11 @@ from devproc2.compiler.passes.memory_planning import MemoryPlanningPass
 from devproc2.compiler.passes.vm_codegen import VMCodegenPass
 from devproc2.ir import (
     Block,
+    EffectSummary,
     Function,
     IRModule,
-    OpaqueEffect,
+    KernelRef,
+    PackedFuncRef,
     Region,
     ReturnOp,
     TensorStructInfo,
@@ -28,10 +30,9 @@ from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
     CallDPSOp,
-    CalleeKind as IRCalleeKind,
 )
 from devproc2.ir.prim_expr import IntImm, PrimVar
-from devproc2.kernel.registry import KernelRegistry, KernelSpec
+from devproc2.kernel.registry import KernelLaunchSpec, KernelRegistry, KernelSpec
 from devproc2.vm import Executable, serializer
 
 
@@ -78,8 +79,12 @@ def _simple_tensor_module() -> IRModule:
     x = Var("x", TensorStructInfo((IntImm(4),), "float16", "cpu"))
     s0 = AllocStorageOp("s0", IntImm(8), 256, "cpu")
     y = AllocTensorOp("y", s0.results[0], 0, (IntImm(4),), "float16")
-    dps = CallDPSOp("kernel.relu_fp16", IRCalleeKind.kernel,
-                    (x,), y.results[0], OpaqueEffect())
+    dps = CallDPSOp(
+        KernelRef("kernel.relu_fp16"),
+        (x,),
+        (y.results[0],),
+        EffectSummary.opaque_call(),
+    )
     ret = ReturnOp(values=(y.results[0],))
     si = TensorStructInfo((IntImm(4),), "float16", "cpu")
     fn = Function(body=Region(blocks=(Block(args=(x,), ops=(s0, y, dps, ret)),)),
@@ -105,8 +110,12 @@ def _packed_func_module() -> IRModule:
     x = Var("x", TensorStructInfo((IntImm(4),), "float16", "cpu"))
     s0 = AllocStorageOp("s0", IntImm(8), 256, "cpu")
     out = AllocTensorOp("out", s0.results[0], 0, (IntImm(4),), "float16")
-    pf_call = CallDPSOp("runtime.tokenizer.encode", IRCalleeKind.packed_func,
-                        (x,), out.results[0], OpaqueEffect())
+    pf_call = CallDPSOp(
+        PackedFuncRef("runtime.tokenizer.encode"),
+        (x,),
+        (out.results[0],),
+        EffectSummary.opaque_call(),
+    )
     ret = ReturnOp(values=(out.results[0],))
     si = TensorStructInfo((IntImm(4),), "float16", "cpu")
     fn = Function(body=Region(blocks=(Block(args=(x,), ops=(s0, out, pf_call, ret)),)),
@@ -336,6 +345,48 @@ def test_kernel_table_json_only_kernels(tmp_dir):
         kt = json.load(f)
     for entry in kt:
         assert entry["kind"] == "kernel"
+
+
+def test_kernel_table_json_uses_kernel_spec_metadata(tmp_dir):
+    @dp.function
+    def main(x: dp.Tensor[(4,), "float16", "cpu"]):
+        y = dp.ops.relu(x)
+        return y
+
+    spec = _spec(
+        "relu",
+        backend="cuda",
+        symbol="relu_symbol",
+        launch=KernelLaunchSpec(grid=(2, 1, 1), block=(128, 1, 1), shared_memory_bytes=64),
+    )
+    reg = KernelRegistry()
+    reg.register(spec)
+
+    inferred = InferStructInfoPass().run(main.lower_module())
+    module = DPSLoweringPass(reg).run(inferred)
+    ctx = PassContext()
+    MemoryPlanningPass().run(module, ctx)
+    module = LowerTensorCreateToAllocPass(ctx).run(module)
+    exe = VMCodegenPass().run(module)
+    assert "kernel.relu_fp16" in exe.kernel_specs
+
+    # ABI extraction intentionally uses the inferred module, matching the
+    # documented pipeline that preserves high-level function signatures.
+    EmitABIPass().run(inferred, exe, ctx, tmp_dir)
+
+    with open(os.path.join(tmp_dir, "metadata", "kernel_table.json")) as f:
+        kt = json.load(f)
+
+    assert len(kt) == 1
+    entry = kt[0]
+    assert entry["name"] == "kernel.relu_fp16"
+    assert entry["backend"] == "cuda"
+    assert entry["symbol"] == "relu_symbol"
+    assert entry["cubin"] == "kernels/relu_fp16.cubin"
+    assert entry["launch"]["grid"] == [2, 1, 1]
+    assert entry["launch"]["block"] == [128, 1, 1]
+    assert entry["launch"]["shared_memory_bytes"] == 64
+    assert [param["kind"] for param in entry["params"]] == ["tensor", "tensor"]
 
 
 def test_packed_func_table_json_only_packed_funcs(tmp_dir):

@@ -1,12 +1,17 @@
 """ShapeAssertionInsertPass — insert ShapeAssertOp at function entry."""
 from __future__ import annotations
 
-from devproc2.ir.nodes import Block, Function, IRModule, Region, TensorStructInfo
+from devproc2.ir.nodes import Block, Function, IRModule, IRStage, Region, TensorStructInfo
 from devproc2.ir.ops import ShapeAssertOp
 from devproc2.ir.prim_expr import PrimVar
 
 
 class ShapeAssertionInsertPass:
+    input_stage = IRStage.inferred
+    output_stage = IRStage.inferred
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ()
+
     def run(self, module: IRModule) -> IRModule:
         return IRModule({name: self._insert_fn(fn) for name, fn in module.functions.items()})
 

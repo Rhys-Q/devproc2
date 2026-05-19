@@ -1,21 +1,33 @@
 #include <devproc2/runtime/vm.h>
+#include <devproc2/runtime/packed_backend.h>
 #include <devproc2/runtime/packed_func.h>
 #include <devproc2/runtime/stream.h>
+#include <devproc2/runtime/tokenizer.h>
 #ifdef DEVPROC2_WITH_CUDA
 #include <devproc2/runtime/cuda_kernel_registry.h>
 // Forward declaration for CUDAKernelLauncher_Launch (defined in cuda_kernel.cc)
 namespace devproc2 {
     class KernelObj;
-    void CUDAKernelLauncher_Launch(const KernelObj*, std::vector<VMValue>&, void*);
+    void CUDAKernelLauncher_Launch(
+        const KernelObj*,
+        std::vector<VMValue>&,
+        const std::vector<int64_t>&,
+        void*);
 }
 #endif
 #include <nlohmann/json.hpp>
+#include <array>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace devproc2 {
+
+void RegisterCoreBuiltins();
 
 // ── Binary deserialization helpers ────────────────────────────────────────────
 
@@ -53,7 +65,7 @@ struct ByteReader {
 };
 
 static constexpr uint8_t _MAGIC[4] = {'D', 'V', '2', 'E'};
-static constexpr uint32_t _VERSION  = 1;
+static constexpr uint32_t _VERSION  = 3;
 static constexpr uint8_t _TAG_NULL  = 0;
 static constexpr uint8_t _TAG_INT   = 1;
 static constexpr uint8_t _TAG_FLOAT = 2;
@@ -80,11 +92,175 @@ static std::vector<uint8_t> read_file_binary(const std::string& path) {
     return buf;
 }
 
+static bool file_exists(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return f.good();
+}
+
+static std::string artifact_file_path(
+    const std::string& artifact_dir,
+    const std::string& rel
+) {
+    if (!rel.empty() && rel[0] == '/') return rel;
+    return artifact_dir + "/" + rel;
+}
+
+using PackedBackendRegisterFn = void (*)(PackedFuncRegistry*);
+
+static std::vector<void*>& packed_backend_handles() {
+    static std::vector<void*> handles;
+    return handles;
+}
+
+static void load_packed_backend_table(const std::string& artifact_dir) {
+    std::string path = artifact_dir + "/metadata/packed_backend_table.json";
+    if (!file_exists(path)) return;
+
+    auto table = nlohmann::json::parse(read_file_text(path));
+    if (!table.is_array()) {
+        throw std::runtime_error("metadata/packed_backend_table.json must be an array");
+    }
+
+    for (const auto& entry : table) {
+        if (!entry.is_object()) {
+            throw std::runtime_error("packed_backend_table entries must be objects");
+        }
+        std::string name = entry.value("name", std::string{"<unknown>"});
+        std::string library;
+        if (entry.contains("library") && entry["library"].is_string()) {
+            library = entry["library"].get<std::string>();
+        }
+        void* handle = nullptr;
+        if (library.empty()) {
+            handle = RTLD_DEFAULT;
+        } else {
+            std::string library_path = artifact_file_path(artifact_dir, library);
+            handle = dlopen(library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (!handle) {
+                const char* err = dlerror();
+                throw std::runtime_error(
+                    "Failed to load packed backend '" + name + "' from " +
+                    library_path + ": " + (err ? err : "unknown dlopen error"));
+            }
+            packed_backend_handles().push_back(handle);
+        }
+        std::string register_symbol = entry.value(
+            "register_symbol",
+            std::string{"devproc2_register_packed_backend"});
+        dlerror();
+        auto* register_fn = reinterpret_cast<PackedBackendRegisterFn>(
+            dlsym(handle, register_symbol.c_str()));
+        const char* err = dlerror();
+        if (err || !register_fn) {
+            throw std::runtime_error(
+                "Failed to resolve packed backend register symbol '" +
+                register_symbol + "' for '" + name + "': " +
+                (err ? err : "missing symbol"));
+        }
+        register_fn(&PackedFuncRegistry::Global());
+
+        if (entry.contains("packed_funcs") && entry["packed_funcs"].is_array()) {
+            for (const auto& func : entry["packed_funcs"]) {
+                if (!func.is_object() || !func.contains("name") || !func["name"].is_string()) {
+                    continue;
+                }
+                if (func.contains("device") && func["device"].is_string()) {
+                    PackedFuncRegistry::Global().SetDevice(
+                        func["name"].get<std::string>(),
+                        func["device"].get<std::string>());
+                }
+            }
+        }
+    }
+}
+
+#ifdef DEVPROC2_WITH_CUDA
+static std::string artifact_path_join(
+    const std::string& artifact_dir,
+    const std::string& rel
+) {
+    if (!rel.empty() && rel[0] == '/') return rel;
+    return artifact_dir + "/" + rel;
+}
+
+static std::string require_string_field(
+    const nlohmann::json& obj,
+    const std::string& field,
+    const std::string& kernel_name
+) {
+    if (!obj.contains(field) || !obj[field].is_string()) {
+        throw std::runtime_error(
+            "kernel_table entry for '" + kernel_name
+            + "' missing string field '" + field + "'");
+    }
+    return obj[field].get<std::string>();
+}
+
+static std::array<int32_t, 3> read_i32_triple(
+    const nlohmann::json& obj,
+    const std::string& field,
+    std::array<int32_t, 3> defaults,
+    bool allow_dynamic
+) {
+    if (!obj.contains(field)) return defaults;
+    const auto& arr = obj[field];
+    if (!arr.is_array() || arr.size() != 3) {
+        throw std::runtime_error("kernel_table field '" + field + "' must be a 3-element array");
+    }
+    std::array<int32_t, 3> out = defaults;
+    for (size_t i = 0; i < 3; ++i) {
+        if (arr[i].is_number_integer()) {
+            out[i] = arr[i].get<int32_t>();
+        } else if (!allow_dynamic) {
+            throw std::runtime_error(
+                "kernel_table field '" + field + "' must contain integer values");
+        }
+    }
+    return out;
+}
+
+static void load_kernel_table_into_cuda_registry(const std::string& artifact_dir) {
+    std::string path = artifact_dir + "/metadata/kernel_table.json";
+    if (!file_exists(path)) return;
+
+    auto table = nlohmann::json::parse(read_file_text(path));
+    if (!table.is_array()) {
+        throw std::runtime_error("metadata/kernel_table.json must be an array");
+    }
+
+    for (const auto& entry : table) {
+        if (!entry.is_object()) {
+            throw std::runtime_error("kernel_table entries must be objects");
+        }
+        std::string name = require_string_field(entry, "name", "<unknown>");
+        std::string cubin = require_string_field(entry, "cubin", name);
+        std::string symbol = require_string_field(entry, "symbol", name);
+        std::string cubin_path = artifact_path_join(artifact_dir, cubin);
+        if (!file_exists(cubin_path)) {
+            throw std::runtime_error(
+                "Kernel '" + name + "' cubin not found: " + cubin_path);
+        }
+
+        const nlohmann::json& launch =
+            entry.contains("launch") && entry["launch"].is_object()
+                ? entry["launch"]
+                : entry;
+        auto grid = read_i32_triple(launch, "grid", {1, 1, 1}, /*allow_dynamic=*/true);
+        auto block = read_i32_triple(launch, "block", {256, 1, 1}, /*allow_dynamic=*/false);
+        int32_t smem = launch.value("shared_memory_bytes", 0);
+
+        CUDAKernelRegistry::Global().Register(
+            name, read_file_binary(cubin_path), symbol, grid, block, smem);
+    }
+}
+#endif
+
 }  // namespace
 
 // ── Executable::Deserialize ───────────────────────────────────────────────────
 
 std::shared_ptr<Executable> Executable::Deserialize(const uint8_t* data, size_t size) {
+    RegisterCoreBuiltins();
     ByteReader r{data, size};
 
     // Magic
@@ -120,6 +296,11 @@ std::shared_ptr<Executable> Executable::Deserialize(const uint8_t* data, size_t 
             fe.const_inits[j].reg_idx   = r.read<int32_t>();
             fe.const_inits[j].const_idx = r.read<int32_t>();
         }
+        uint32_t n_param_names = r.read<uint32_t>();
+        fe.param_names.resize(n_param_names);
+        for (uint32_t j = 0; j < n_param_names; ++j) {
+            fe.param_names[j] = r.read_string();
+        }
     }
 
     // Instructions
@@ -138,6 +319,10 @@ std::shared_ptr<Executable> Executable::Deserialize(const uint8_t* data, size_t 
         ins.arg_regs.resize(nargs);
         for (uint32_t j = 0; j < nargs; ++j)
             ins.arg_regs[j] = r.read<int32_t>();
+        uint32_t nlaunch = r.read<uint32_t>();
+        ins.launch_regs.resize(nlaunch);
+        for (uint32_t j = 0; j < nlaunch; ++j)
+            ins.launch_regs[j] = r.read<int32_t>();
     }
 
     // Constants: each is 1 tag byte + 8 value bytes
@@ -198,6 +383,11 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
     }
 
     // 4. PackedFunc dependency check
+    if (file_exists(artifact_dir + "/resources/tokenizer.model")) {
+        SetPaligemmaTokenizerModelPath(artifact_dir + "/resources/tokenizer.model");
+    }
+    RegisterTokenizerPackedFuncs();
+    load_packed_backend_table(artifact_dir);
     for (const auto& name : abi.value("required_packed_funcs",
                                        nlohmann::json::array())) {
         std::string fn = name.get<std::string>();
@@ -207,11 +397,31 @@ std::shared_ptr<Executable> Executable::Load(const std::string& artifact_dir) {
         }
     }
 
+    if (file_exists(artifact_dir + "/weights/weights.index.json") ||
+        file_exists(artifact_dir + "/weights.index.json")) {
+        exe->weights = WeightStore::Load(artifact_dir);
+    }
+
+#ifdef DEVPROC2_WITH_CUDA
+    load_kernel_table_into_cuda_registry(artifact_dir);
+#else
+    std::string kernel_table_path = artifact_dir + "/metadata/kernel_table.json";
+    if (file_exists(kernel_table_path)) {
+        auto table = nlohmann::json::parse(read_file_text(kernel_table_path));
+        if (table.is_array() && !table.empty()) {
+            throw std::runtime_error(
+                "Artifact contains CUDA kernels but runtime was built without DEVPROC2_WITH_CUDA");
+        }
+    }
+#endif
+
     return exe;
 }
 
 VMState::VMState(std::shared_ptr<Executable> exec)
-    : exec_(std::move(exec)) {}
+    : exec_(std::move(exec)) {
+    RegisterCoreBuiltins();
+}
 
 void* VMState::GetDefaultStream(const Device& dev) {
     if (dev.device_type == kDLCPU) return nullptr;
@@ -234,6 +444,40 @@ void* VMState::GetDefaultStream(const Device& dev) {
 
 VMValue VMState::Invoke(const std::string& func_name, std::vector<VMValue> args) {
     int32_t func_idx = exec_->GetFuncIndex(func_name);
+    const FunctionEntry& fe = exec_->function_table[static_cast<size_t>(func_idx)];
+    if (fe.kind != VMCalleeKind::kVMFunc) {
+        throw std::runtime_error("Invoke target is not a VM function: " + func_name);
+    }
+    if (static_cast<int32_t>(args.size()) > fe.num_args) {
+        throw std::runtime_error("Invoke got too many arguments for '" + func_name + "'");
+    }
+    if (static_cast<int32_t>(args.size()) < fe.num_args) {
+        if (!exec_->weights) {
+            throw std::runtime_error(
+                "Invoke missing arguments for '" + func_name +
+                "' and executable has no WeightStore");
+        }
+        if (fe.param_names.size() != static_cast<size_t>(fe.num_args)) {
+            throw std::runtime_error(
+                "Invoke cannot bind missing weights for '" + func_name +
+                "': bytecode has no complete parameter name table");
+        }
+#ifdef DEVPROC2_WITH_CUDA
+        DLDevice weight_device{kDLCUDA, 0};
+#else
+        DLDevice weight_device{kDLCPU, 0};
+#endif
+        while (static_cast<int32_t>(args.size()) < fe.num_args) {
+            const std::string& name = fe.param_names[args.size()];
+            if (!exec_->weights->Has(name)) {
+                throw std::runtime_error(
+                    "Invoke missing argument '" + name +
+                    "' and no matching artifact weight was found");
+            }
+            args.push_back(VMValue::ObjRef(
+                exec_->weights->GetTensorOnDevice(name, weight_device)));
+        }
+    }
     regs_.clear();
     frames_.clear();
     PushFrame(func_idx, args, /*caller_dst_reg=*/-1, /*caller_reg_base=*/-1);
@@ -277,6 +521,12 @@ VMValue VMState::ExecuteLoop() {
             for (int32_t r : instr.arg_regs) {
                 call_args.push_back(regs_[static_cast<size_t>(frame.reg_base + r)]);
             }
+            std::vector<int64_t> launch_args;
+            launch_args.reserve(instr.launch_regs.size());
+            for (int32_t r : instr.launch_regs) {
+                launch_args.push_back(
+                    regs_[static_cast<size_t>(frame.reg_base + r)].AsInt());
+            }
 
             if (callee.kind == VMCalleeKind::kVMFunc) {
                 // Advance pc before pushing new frame (caller resumes at pc+1)
@@ -285,7 +535,7 @@ VMValue VMState::ExecuteLoop() {
                           instr.dst_reg, frame.reg_base);
                 continue;  // no extra ++pc
             } else {
-                VMValue result = DispatchExternal(callee, call_args);
+                VMValue result = DispatchExternal(callee, call_args, launch_args);
                 if (instr.dst_reg >= 0) {
                     regs_[static_cast<size_t>(frame.reg_base + instr.dst_reg)] =
                         std::move(result);
@@ -336,8 +586,11 @@ VMValue VMState::ExecuteLoop() {
     return VMValue{};
 }
 
-VMValue VMState::DispatchExternal(const FunctionEntry& callee,
-                                  std::vector<VMValue>& args) {
+VMValue VMState::DispatchExternal(
+    const FunctionEntry& callee,
+    std::vector<VMValue>& args,
+    const std::vector<int64_t>& launch_args
+) {
     switch (callee.kind) {
     case VMCalleeKind::kBuiltin: {
         auto fn = BuiltinRegistry::Global().Get(callee.name);
@@ -353,7 +606,28 @@ VMValue VMState::DispatchExternal(const FunctionEntry& callee,
                 "PackedFunc '" + callee.name + "' not registered");
         }
         PackedArgs pa(args);
+#ifdef DEVPROC2_WITH_CUDA
+        void* previous_cuda_stream = nullptr;
+        bool scoped_cuda_stream = PackedFuncRegistry::Global().Device(callee.name) == "cuda";
+        if (scoped_cuda_stream) {
+            Device cuda_dev{kDLCUDA, 0};
+            previous_cuda_stream = CurrentCUDAPackedFuncStream();
+            SetCUDAPackedFuncStream(GetDefaultStream(cuda_dev));
+        }
+        try {
+            pf->Call(pa);
+        } catch (...) {
+            if (scoped_cuda_stream) {
+                SetCUDAPackedFuncStream(previous_cuda_stream);
+            }
+            throw;
+        }
+        if (scoped_cuda_stream) {
+            SetCUDAPackedFuncStream(previous_cuda_stream);
+        }
+#else
         pf->Call(pa);
+#endif
         // Return convention: PackedFunc body writes its result into args[0].
         // A void PackedFunc (no dst_reg caller) is called with an empty args
         // vector, so guard before accessing.
@@ -368,7 +642,7 @@ VMValue VMState::DispatchExternal(const FunctionEntry& callee,
         }
         Device cuda_dev{kDLCUDA, 0};
         void* stream = GetDefaultStream(cuda_dev);
-        CUDAKernelLauncher_Launch(k, args, stream);
+        CUDAKernelLauncher_Launch(k, args, launch_args, stream);
         return VMValue{};
 #else
         throw std::runtime_error(
@@ -379,6 +653,21 @@ VMValue VMState::DispatchExternal(const FunctionEntry& callee,
         throw std::runtime_error(
             "DispatchExternal: unexpected callee kind for " + callee.name);
     }
+}
+
+ModelSession::ModelSession(std::shared_ptr<Executable> exec)
+    : exec_(std::move(exec)), vm_(exec_) {}
+
+ModelSession ModelSession::LoadArtifact(const std::string& artifact_dir) {
+    return ModelSession(Executable::Load(artifact_dir));
+}
+
+VMValue ModelSession::Invoke(const std::string& func_name, std::vector<VMValue> args) {
+    return vm_.Invoke(func_name, std::move(args));
+}
+
+void* ModelSession::GetDefaultStream(const Device& dev) {
+    return vm_.GetDefaultStream(dev);
 }
 
 }  // namespace devproc2

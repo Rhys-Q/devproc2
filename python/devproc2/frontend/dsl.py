@@ -10,20 +10,18 @@ from typing import Optional
 from devproc2.ir.nodes import (
     Block,
     Constant,
+    EffectSummary,
     Function,
     IRModule,
-    OpaqueEffect,
     Op,
-    OpResult,
     Region,
     TensorStructInfo,
     Value,
     Var,
 )
+from devproc2.ir.op_ref import ExternalFuncRef, KernelRef, PackedFuncRef, StandardOpRef
 from devproc2.ir.ops import (
     CallDPSOp,
-    CalleeKind,
-    CallOp,
     ForOp,
     IfOp,
     IterArg,
@@ -31,13 +29,20 @@ from devproc2.ir.ops import (
     ReturnOp,
     TensorCreateKind,
     TensorCreateOp,
-    TupleGetItemOp,
+    TensorViewOp,
     TupleOp,
     YieldOp,
+    make_call_op,
 )
 from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
+from devproc2.compiler.op import get_op
 from devproc2.frontend.scope import ScopeStack
-from devproc2.kernel.registry import KernelRegistry, KernelSpec
+from devproc2.kernel.registry import (
+    KernelLaunchSpec,
+    KernelParamSpec,
+    KernelRegistry,
+    KernelSpec,
+)
 
 
 class DSLError(Exception):
@@ -110,28 +115,195 @@ ops = _OpsStub()
 
 def empty(shape, dtype: str = "float32", device: str = "cpu"):
     """Runtime stub — real tensor creation happens via DSL AST compilation."""
-    pass
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_empty"):
+        return emitter.emit_empty(shape, dtype=dtype, device=device)
+    return None
 
 
-def call_dps_packed(name: str, inputs=None, output=None, effect: str = "opaque"):
+def call_dps_packed(
+    name: str,
+    inputs=None,
+    output=None,
+    effect: str = "opaque",
+    output_like=None,
+    output_shape=None,
+    output_dtype: str | None = None,
+    output_device: str | None = None,
+    output_spec=None,
+):
     """Runtime stub — real op emission happens via DSL AST compilation."""
-    pass
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_dps_packed"):
+        return emitter.emit_dps_packed(
+            name,
+            inputs=inputs,
+            output_like=output_like if output_like is not None else output,
+            output_shape=output_shape,
+            output_dtype=output_dtype,
+            output_device=output_device,
+            output_spec=output_spec,
+            effect=effect,
+        )
+    return None
 
 
-def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
-           dtype: str = "", dtypes: list = None, grid=None, sm_arches=(),
-           num_warps: int = 4, num_stages: int = 3, block_size: int = 256,
-           smem_bytes: int = 0, launch_kwargs: dict = None):
+def call_dps_kernel(
+    name: str,
+    inputs=None,
+    output=None,
+    effect: str = "opaque",
+    launch: KernelLaunchSpec | None = None,
+    output_like=None,
+    output_shape=None,
+    output_dtype: str | None = None,
+    output_device: str | None = None,
+    output_spec=None,
+    output_specs=None,
+):
+    """Runtime stub — real kernel DPS emission happens via DSL AST compilation."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_dps_kernel"):
+        return emitter.emit_dps_kernel(
+            name,
+            inputs=inputs,
+            launch=launch,
+            output_like=output_like if output_like is not None else output,
+            output_shape=output_shape,
+            output_dtype=output_dtype,
+            output_device=output_device,
+            output_spec=output_spec,
+            output_specs=output_specs,
+            effect=effect,
+        )
+    return None
+
+
+def cuda_call(
+    source_symbol: str,
+    *args,
+    attrs: dict | None = None,
+    metadata: dict | None = None,
+):
+    """Runtime stub for unregistered CUDA source-symbol custom calls."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_cuda_call"):
+        return emitter.emit_cuda_call(
+            source_symbol,
+            args=args,
+            attrs=attrs,
+            metadata=metadata,
+        )
+    return None
+
+
+def tensor_view(
+    base,
+    byte_offset,
+    shape,
+    *,
+    dtype: str | None = None,
+    device: str | None = None,
+    byte_stride: int = 1,
+    base_offset: int = 0,
+):
+    """Runtime stub — emits a no-copy tensor view inside tracing/DSL builds."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_view"):
+        return emitter.emit_tensor_view(
+            base,
+            byte_offset,
+            shape,
+            dtype=dtype,
+            device=device,
+            byte_stride=byte_stride,
+            base_offset=base_offset,
+        )
+    return None
+
+
+def select(base, *, axis: int, index):
+    """Runtime stub — emits a semantic single-axis tensor selection."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_select"):
+        return emitter.emit_tensor_select(base, axis=axis, index=index)
+    return None
+
+
+def slice(base, *, starts, sizes, strides=None):
+    """Runtime stub — emits a semantic tensor slice view."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_slice"):
+        return emitter.emit_tensor_slice(base, starts=starts, sizes=sizes, strides=strides)
+    return None
+
+
+def index(base, selectors):
+    """Runtime stub — emits select/slice sugar without advanced indexing."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_index"):
+        return emitter.emit_tensor_index(base, selectors)
+    return None
+
+
+def split(base, sections, *, axis: int = 0):
+    """Runtime stub — emits a tuple of semantic tensor slice views."""
+    from devproc2.compiler.op.emit import get_current_emitter
+
+    emitter = get_current_emitter()
+    if emitter is not None and hasattr(emitter, "emit_tensor_split"):
+        return emitter.emit_tensor_split(base, sections=sections, axis=axis)
+    return None
+
+
+def kernel(
+    *,
+    op: str,
+    backend: str,
+    device: str = "cuda",
+    dtype: str = "",
+    dtypes: list | tuple | None = None,
+    output_dtype: str | None = None,
+    symbol: str | None = None,
+    sm_arches=(),
+    priority: int = 0,
+    attr_constraints=None,
+    layout_constraints=(),
+    shape_constraints=(),
+    launch: KernelLaunchSpec | None = None,
+    params: tuple[KernelParamSpec, ...] = (),
+    cubin_path: str | None = None,
+    ptx_path: str | None = None,
+    source_path: str | None = None,
+    include_dirs=(),
+    extra_nvcc_flags=(),
+    compile_options: dict | None = None,
+):
     """Decorator to register a kernel implementation.
 
     Parameters
     ----------
     op : str
         High-level operator name (e.g. "relu", "matmul").  Matched against
-        ``dp.ops.relu(x)`` → ``CallOp(@relu)`` during DPS lowering.
+        ``dp.ops.relu(x)`` → ``CallOp(StandardOpRef("relu"))`` during DPS lowering.
     backend : str
-        Compiler backend: "triton" | "cuda_c" | "python" | "llvm".
-        Determines how the kernel function is AOT-compiled.
+        Compiler backend: "triton" | "cutedsl" | "cuda" | "python" | "llvm".
     device : str
         Target device: "cuda", "cpu", etc.
     dtype : str
@@ -141,34 +313,30 @@ def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
     dtypes : list[str]
         Explicit per-input dtype list for multi-input kernels (e.g. matmul
         needs ``["float16", "float16"]``).  Takes precedence over ``dtype``.
-    grid : callable
-        Returns ``(grid_x, grid_y, grid_z)``.  Called at codegen time.
-        When all input shapes are static (known at compile time), receives
-        ``shapes: list[tuple[int,...]]`` — one tuple per input tensor.
-        Falls back to no-arg call for dynamic shapes or backward compat.
-        Example: ``grid=lambda shapes: (shapes[0][0] // 256 + 1, 1, 1)``
+    launch : KernelLaunchSpec
+        Explicit runtime launch metadata. Dynamic entries can use PrimExpr.
     sm_arches : tuple[int]
         Supported SM compute capabilities, e.g. ``(80, 90)``.  Empty = any SM.
-    num_warps : int
-        Warps per thread block (block_threads / 32).
-    num_stages : int
-        Triton software pipeline depth.
-    block_size : int
-        Tiling size (BLOCK_SIZE constexpr).
-    smem_bytes : int
-        Dynamic shared memory bytes for cuLaunchKernel.
-    launch_kwargs : dict
-        Extra kwargs forwarded to the backend compiler (e.g. triton.compile).
+    params : tuple[KernelParamSpec, ...]
+        Explicit kernel ABI parameters. Empty means artifact emission derives
+        a conservative inputs+outputs tensor ABI from the selected CallDPSOp.
+    compile_options : dict
+        Backend-specific compile options for the provider.
 
     Example::
 
-        @dp.kernel(op="relu", backend="triton", device="cuda", dtype="float16",
-                   grid=lambda: (128, 1, 1))
+        @dp.kernel(
+            op="relu",
+            backend="triton",
+            device="cuda",
+            dtype="float16",
+            launch=KernelLaunchSpec(grid=(128, 1, 1), block=(256, 1, 1)),
+        )
         def relu_kernel(x, out):
             ...  # Triton kernel body
 
-        @dp.kernel(op="matmul", backend="triton", device="cuda",
-                   dtypes=["float16", "float16"], grid=lambda: (32, 32, 1))
+        @dp.kernel(op="matmul", backend="cutedsl", device="cuda",
+                   dtypes=["float16", "float16"])
         def matmul_kernel(a, b, out):
             ...
     """
@@ -189,13 +357,21 @@ def kernel(*, op: str, backend: str = "triton", device: str = "cuda",
             input_dtypes=resolved_dtypes,
             kernel_name=f"kernel.{fn.__name__}",
             backend=backend,
+            output_dtype=output_dtype,
+            symbol=symbol,
             sm_arches=sm_arches,
-            grid_fn=grid,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            block_size=block_size,
-            smem_bytes=smem_bytes,
-            launch_kwargs=launch_kwargs or {},
+            priority=priority,
+            attr_constraints=attr_constraints or {},
+            layout_constraints=tuple(layout_constraints),
+            shape_constraints=tuple(shape_constraints),
+            launch=launch or KernelLaunchSpec(),
+            params=tuple(params),
+            cubin_path=cubin_path,
+            ptx_path=ptx_path,
+            source_path=source_path,
+            include_dirs=tuple(include_dirs),
+            extra_nvcc_flags=tuple(extra_nvcc_flags),
+            compile_options=compile_options or {},
         )
         _kernel_registry.register(spec)
         fn._kernel_spec = spec
@@ -303,10 +479,19 @@ class DSLBuilder:
                     create_op = self._build_empty(val_expr, result_name)
                     self.scope.define(name, create_op.results[0])
                     return [create_op]
+                if callee_str in ("dp.tensor_view", "tensor_view"):
+                    result_name = self._pick_name(name)
+                    view_op = self._build_tensor_view(val_expr, result_name)
+                    self.scope.define(name, view_op.results[0])
+                    return [view_op]
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
                 result_name = self._pick_name(name)
-                call_op = CallOp(callee=callee, args=args, result_name=result_name)
+                call_op = make_call_op(
+                    op_ref=self._op_ref_for_callee(callee, produces_result=True),
+                    args=args,
+                    result_name=result_name,
+                )
                 self.scope.define(name, call_op.results[0])
                 return pre_ops + [call_op]
             elif isinstance(val_expr, ast.If):
@@ -314,7 +499,11 @@ class DSLBuilder:
             else:
                 pre_ops, val = self._materialize_value(val_expr)
                 result_name = self._pick_name(name)
-                call_op = CallOp(callee="@identity", args=(val,), result_name=result_name)
+                call_op = make_call_op(
+                    op_ref=StandardOpRef("identity", get_op("identity")),
+                    args=(val,),
+                    result_name=result_name,
+                )
                 self.scope.define(name, call_op.results[0])
                 return pre_ops + [call_op]
 
@@ -324,9 +513,16 @@ class DSLBuilder:
                 callee_str = ast.unparse(val_expr.func)
                 if "call_dps_packed" in callee_str:
                     return [self._build_call_dps_packed(val_expr)]
+                if "call_dps_kernel" in callee_str:
+                    return [self._build_call_dps_kernel(val_expr)]
                 callee = self._extract_callee(val_expr.func)
                 pre_ops, args = self._materialize_args(val_expr.args)
-                return pre_ops + [CallOp(callee=callee, args=args)]
+                return pre_ops + [
+                    make_call_op(
+                        op_ref=self._op_ref_for_callee(callee, produces_result=False),
+                        args=args,
+                    )
+                ]
             return []
 
         if isinstance(stmt, ast.If):
@@ -470,11 +666,35 @@ class DSLBuilder:
     # ------------------------------------------------------------------
 
     def _build_call_dps_packed(self, node: ast.Call) -> CallDPSOp:
+        callee, inputs, output = self._parse_dps_call(node, "call_dps_packed")
+        return CallDPSOp(
+            target_ref=PackedFuncRef(callee),
+            inputs=inputs,
+            outputs=() if output is None else (output,),
+            effect=EffectSummary.opaque_call(),
+        )
+
+    def _build_call_dps_kernel(self, node: ast.Call) -> CallDPSOp:
+        callee, inputs, output = self._parse_dps_call(node, "call_dps_kernel")
+        kernel_name = callee if callee.startswith("kernel.") else f"kernel.{callee}"
+        spec = _kernel_registry.get_by_kernel_name(kernel_name)
+        return CallDPSOp(
+            target_ref=KernelRef(kernel_name, spec),
+            inputs=inputs,
+            outputs=() if output is None else (output,),
+            effect=EffectSummary.opaque_call(),
+        )
+
+    def _parse_dps_call(
+        self,
+        node: ast.Call,
+        api_name: str,
+    ) -> tuple[str, tuple[Value, ...], Optional[Value]]:
         if not node.args:
-            raise DSLError("call_dps_packed requires function name as first arg")
+            raise DSLError(f"{api_name} requires function name as first arg")
         name_expr = node.args[0]
         if not isinstance(name_expr, ast.Constant) or not isinstance(name_expr.value, str):
-            raise DSLError("call_dps_packed: first arg must be a string literal")
+            raise DSLError(f"{api_name}: first arg must be a string literal")
         callee = name_expr.value
         kwargs = {kw.arg: kw.value for kw in node.keywords}
         inputs: tuple[Value, ...] = ()
@@ -488,13 +708,7 @@ class DSLBuilder:
             if not (isinstance(out_node, ast.Constant) and out_node.value is None):
                 out_val = self._build_value(kwargs["output"])
                 output = out_val
-        return CallDPSOp(
-            callee=callee,
-            callee_kind=CalleeKind.packed_func,
-            inputs=inputs,
-            output=output,
-            effect=OpaqueEffect(),
-        )
+        return callee, inputs, output
 
     # ------------------------------------------------------------------
     # dp.empty()
@@ -517,6 +731,48 @@ class DSLBuilder:
             shape=shape,
             dtype=dtype,
             device=device,
+        )
+
+    def _build_tensor_view(self, node: ast.Call, result_name: str) -> TensorViewOp:
+        if len(node.args) < 3:
+            raise DSLError("dp.tensor_view requires base, byte_offset, and shape")
+        base = self._build_value(node.args[0])
+        byte_offset = self._build_value(node.args[1])
+        shape_node = node.args[2]
+        if isinstance(shape_node, ast.Tuple):
+            shape = tuple(self._build_prim_expr(e) for e in shape_node.elts)
+        else:
+            shape = (self._build_prim_expr(shape_node),)
+        kwargs = {kw.arg: kw.value for kw in node.keywords}
+        dtype = (
+            kwargs["dtype"].value
+            if "dtype" in kwargs and isinstance(kwargs["dtype"], ast.Constant)
+            else None
+        )
+        device = (
+            kwargs["device"].value
+            if "device" in kwargs and isinstance(kwargs["device"], ast.Constant)
+            else None
+        )
+        byte_stride = (
+            int(kwargs["byte_stride"].value)
+            if "byte_stride" in kwargs and isinstance(kwargs["byte_stride"], ast.Constant)
+            else 1
+        )
+        base_offset = (
+            int(kwargs["base_offset"].value)
+            if "base_offset" in kwargs and isinstance(kwargs["base_offset"], ast.Constant)
+            else 0
+        )
+        return TensorViewOp(
+            result_name=result_name,
+            base=base,
+            byte_offset=byte_offset,
+            shape=shape,
+            dtype=dtype,
+            device=device,
+            byte_stride=byte_stride,
+            base_offset=base_offset,
         )
 
     def _build_prim_expr(self, node: ast.expr) -> PrimExpr:
@@ -553,10 +809,19 @@ class DSLBuilder:
         if isinstance(node, ast.Constant):
             return [], Constant(node.value)
         if isinstance(node, ast.Call):
+            callee_str = ast.unparse(node.func)
+            if callee_str in ("dp.tensor_view", "tensor_view"):
+                tmp_name = self._fresh("view")
+                view_op = self._build_tensor_view(node, tmp_name)
+                return [view_op], view_op.results[0]
             callee = self._extract_callee(node.func)
             pre_ops, args = self._materialize_args(node.args)
             tmp_name = self._fresh("tmp")
-            call_op = CallOp(callee=callee, args=args, result_name=tmp_name)
+            call_op = make_call_op(
+                op_ref=self._op_ref_for_callee(callee, produces_result=True),
+                args=args,
+                result_name=tmp_name,
+            )
             return pre_ops + [call_op], call_op.results[0]
         if isinstance(node, ast.Compare):
             lhs_pre, lhs = self._materialize_value(node.left)
@@ -568,7 +833,11 @@ class DSLBuilder:
                 }.get(type(node.ops[0]), "__cmp__")
                 rhs_pre, rhs = self._materialize_value(node.comparators[0])
                 cmp_name = self._fresh("cmp")
-                cmp_op = CallOp(callee=f"@{op_name}", args=(lhs, rhs), result_name=cmp_name)
+                cmp_op = make_call_op(
+                    op_ref=StandardOpRef(op_name, get_op(op_name)),
+                    args=(lhs, rhs),
+                    result_name=cmp_name,
+                )
                 return lhs_pre + rhs_pre + [cmp_op], cmp_op.results[0]
             raise DSLError(f"Complex comparison not supported: {ast.dump(node)}")
         return [], Var(ast.unparse(node))
@@ -600,10 +869,18 @@ class DSLBuilder:
 
     def _extract_callee(self, node: ast.expr) -> str:
         if isinstance(node, ast.Attribute):
-            return f"@{node.attr}"
+            return node.attr
         if isinstance(node, ast.Name):
-            return f"@{node.id}"
-        return f"@{ast.unparse(node)}"
+            return node.id
+        return ast.unparse(node)
+
+    def _op_ref_for_callee(self, callee: str, *, produces_result: bool):
+        op_def = get_op(callee)
+        if op_def is not None:
+            return StandardOpRef(callee, op_def)
+        if produces_result:
+            return StandardOpRef(callee)
+        return ExternalFuncRef(callee)
 
     def _pick_name(self, python_name: str) -> str:
         """Return a unique SSA name for python_name (fresh if already in scope)."""

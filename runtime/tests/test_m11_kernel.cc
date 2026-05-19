@@ -49,13 +49,12 @@ void test_registry_register_and_get() {
     const std::string name = "test.m11_relu_kernel";
     std::vector<uint8_t> fake_cubin = {0x00, 0x01, 0x02, 0x03};
     std::string func_name = "relu_fp16";
+    std::array<int32_t, 3> grid_dims = {8, 1, 1};
     std::array<int32_t, 3> block_dims = {128, 1, 1};
     int32_t smem = 4096;
-    int32_t warps = 8;
-    int32_t stages = 4;
 
     CUDAKernelRegistry::Global().Register(
-        name, fake_cubin, func_name, block_dims, smem, warps, stages);
+        name, fake_cubin, func_name, grid_dims, block_dims, smem);
 
     CHECK(CUDAKernelRegistry::Global().Has(name));
 
@@ -64,10 +63,9 @@ void test_registry_register_and_get() {
     CHECK(k->name == name);
     CHECK(k->func_name == func_name);
     CHECK(k->cubin_data == fake_cubin);
+    CHECK(k->grid_dims == grid_dims);
     CHECK(k->block_dims == block_dims);
-    CHECK(k->smem_bytes == smem);
-    CHECK(k->num_warps == warps);
-    CHECK(k->num_stages == stages);
+    CHECK(k->shared_memory_bytes == smem);
 }
 
 // ── Test 2: missing key returns nullptr ──────────────────────────────────────
@@ -82,8 +80,8 @@ void test_registry_missing_returns_nullptr() {
 
 void test_registry_overwrite() {
     const std::string name = "test.m11_overwrite";
-    CUDAKernelRegistry::Global().Register(name, {0xAA}, "fn_v1", {32, 1, 1});
-    CUDAKernelRegistry::Global().Register(name, {0xBB}, "fn_v2", {64, 1, 1});
+    CUDAKernelRegistry::Global().Register(name, {0xAA}, "fn_v1", {1, 1, 1}, {32, 1, 1});
+    CUDAKernelRegistry::Global().Register(name, {0xBB}, "fn_v2", {2, 1, 1}, {64, 1, 1});
 
     KernelObj* k = CUDAKernelRegistry::Global().Get(name);
     CHECK(k != nullptr);
@@ -95,8 +93,8 @@ void test_registry_overwrite() {
 // ── Test 4: multiple kernels coexist ─────────────────────────────────────────
 
 void test_registry_multiple_kernels() {
-    CUDAKernelRegistry::Global().Register("test.m11_k1", {0x01}, "fn1", {128, 1, 1});
-    CUDAKernelRegistry::Global().Register("test.m11_k2", {0x02}, "fn2", {256, 1, 1});
+    CUDAKernelRegistry::Global().Register("test.m11_k1", {0x01}, "fn1", {1, 1, 1}, {128, 1, 1});
+    CUDAKernelRegistry::Global().Register("test.m11_k2", {0x02}, "fn2", {1, 1, 1}, {256, 1, 1});
 
     CHECK(CUDAKernelRegistry::Global().Has("test.m11_k1"));
     CHECK(CUDAKernelRegistry::Global().Has("test.m11_k2"));

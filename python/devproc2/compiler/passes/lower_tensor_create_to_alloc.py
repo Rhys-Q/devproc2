@@ -18,10 +18,11 @@ from devproc2.ir.nodes import (
     Block,
     Function,
     IRModule,
+    IRStage,
     Op,
     Region,
     TensorStructInfo,
-    Value,
+    shape_values,
 )
 from devproc2.ir.ops import (
     AllocStorageOp,
@@ -33,6 +34,10 @@ from devproc2.ir.ops import (
 
 class LowerTensorCreateToAllocPass(IRRewriter):
     """Reads StoragePlan from PassContext and rewrites TensorCreateOp."""
+    input_stage = IRStage.dps
+    output_stage = IRStage.memory
+    required_analysis: tuple[str, ...] = ("storage_plan",)
+    preserved_analysis: tuple[str, ...] = ()
 
     def __init__(self, ctx: PassContext) -> None:
         super().__init__()
@@ -107,7 +112,7 @@ def _resolve_shape_dtype(op: TensorCreateOp):
     if op.kind == TensorCreateKind.empty_like:
         si = op.like.struct_info if op.like is not None else None
         if isinstance(si, TensorStructInfo):
-            return si.shape, si.dtype
+            return shape_values(si.shape), si.dtype
         raise ValueError(
             f"TensorCreateOp(empty_like) '{op.result_name}': "
             "cannot resolve shape; ensure InferStructInfoPass ran first"

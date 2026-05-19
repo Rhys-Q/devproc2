@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Optional, Union
+from enum import Enum
+from typing import ClassVar, Iterator, Optional, Union
 
 from devproc2.ir.prim_expr import IntImm, PrimExpr
 
@@ -12,14 +12,25 @@ from devproc2.ir.prim_expr import IntImm, PrimExpr
 # ---------------------------------------------------------------------------
 
 class Value:
-    """Base class for Op operands (Var, OpResult, or Constant)."""
+    """Base class for Op operands (BlockArg, OpResult, or Constant)."""
 
 
 @dataclass(frozen=True, eq=False)
-class Var(Value):
-    """Block argument — defined at block entry (function params, iter args)."""
+class BlockArg(Value):
+    """SSA value defined at block entry (function params, iter args).
+
+    ``Var`` remains a public compatibility alias for older frontend and tests,
+    but the semantic name is BlockArg: this value is defined by a block, not by
+    a globally meaningful string name.
+    """
     name: str
     struct_info: Optional[StructInfo] = None
+    owner: Optional["Block"] = None
+    index: int = 0
+
+
+# Compatibility name used throughout the existing frontend and tests.
+Var = BlockArg
 
 
 @dataclass(frozen=True)
@@ -57,45 +68,261 @@ class StructInfo:
     """Base class for structural type info (shape + dtype + device)."""
 
 
+class ShapeInfo:
+    """Base class for tensor shape descriptors."""
+
+
+@dataclass(frozen=True)
+class KnownShape(ShapeInfo):
+    values: tuple[PrimExpr, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "values",
+            tuple(IntImm(s) if isinstance(s, int) else s for s in self.values),
+        )
+
+    def __iter__(self) -> Iterator[PrimExpr]:
+        return iter(self.values)
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+    def __bool__(self) -> bool:
+        return bool(self.values)
+
+    def __add__(self, other):
+        return self.values + tuple(other)
+
+    def __radd__(self, other):
+        return tuple(other) + self.values
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, KnownShape):
+            return self.values == other.values
+        if isinstance(other, tuple):
+            return self.values == other
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self.values)
+
+
+@dataclass(frozen=True)
+class UnknownShape(ShapeInfo):
+    ndim: Optional[int] = None
+
+    def __iter__(self) -> Iterator[PrimExpr]:
+        raise TypeError("UnknownShape has no concrete dimensions")
+
+    def __len__(self) -> int:
+        if self.ndim is None:
+            raise TypeError("UnknownShape rank is unknown")
+        return self.ndim
+
+    def __bool__(self) -> bool:
+        return self.ndim not in (None, 0)
+
+
 @dataclass(frozen=True)
 class TensorStructInfo(StructInfo):
-    shape: tuple[PrimExpr, ...]
+    shape: ShapeInfo | tuple[PrimExpr, ...]
     dtype: str
     device: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "shape",
-            tuple(IntImm(s) if isinstance(s, int) else s for s in self.shape),
+        if isinstance(self.shape, (KnownShape, UnknownShape)):
+            return
+        object.__setattr__(self, "shape", KnownShape(tuple(self.shape)))
+
+
+@dataclass(frozen=True)
+class ScalarStructInfo(StructInfo):
+    dtype: str
+
+
+@dataclass(frozen=True)
+class ObjectStructInfo(StructInfo):
+    type_key: str
+    role: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ShapeStructInfo(StructInfo):
+    ndim: Optional[int] = None
+    values: ShapeInfo | None = None
+
+
+@dataclass(frozen=True)
+class TupleStructInfo(StructInfo):
+    fields: tuple[StructInfo, ...]
+
+
+@dataclass(frozen=True)
+class FuncStructInfo(StructInfo):
+    params: tuple[StructInfo, ...]
+    ret: StructInfo | None
+    effects: "EffectSummary | None" = None
+
+
+# ---------------------------------------------------------------------------
+# Effect / alias model
+# ---------------------------------------------------------------------------
+
+class AliasKind(Enum):
+    no_alias = "no_alias"
+    may_alias = "may_alias"
+    must_alias = "must_alias"
+    view_of = "view_of"
+
+
+@dataclass(frozen=True)
+class AliasInfo:
+    kind: AliasKind
+    source: Value | None = None
+
+
+@dataclass(frozen=True)
+class EffectSummary:
+    """Side-effect summary attached to runtime and external operations."""
+
+    reads: tuple[Value, ...] = ()
+    writes: tuple[Value, ...] = ()
+    allocates: bool = False
+    frees: bool = False
+    opaque: bool = False
+    external_state: Optional[str] = None
+    alias: AliasInfo | None = None
+
+    @classmethod
+    def pure(cls) -> "EffectSummary":
+        return cls()
+
+    @classmethod
+    def readonly(cls, *values: Value) -> "EffectSummary":
+        return cls(reads=tuple(values))
+
+    @classmethod
+    def write(cls, *values: Value) -> "EffectSummary":
+        return cls(writes=tuple(values))
+
+    @classmethod
+    def opaque_call(cls, external_state: str | None = None) -> "EffectSummary":
+        return cls(opaque=True, external_state=external_state)
+
+    @property
+    def is_pure(self) -> bool:
+        return (
+            not self.reads
+            and not self.writes
+            and not self.allocates
+            and not self.frees
+            and not self.opaque
+            and self.external_state is None
+            and self.alias is None
         )
 
 
 # ---------------------------------------------------------------------------
-# EffectInfo — side-effect annotation for CallDPSOp
+# Dialect / stage model
 # ---------------------------------------------------------------------------
 
-class EffectInfo:
-    """Base class for effect annotations."""
+class DialectKind(Enum):
+    tensor = "tensor"
+    shape = "shape"
+    object = "object"
+    memory = "memory"
+    runtime = "runtime"
+    control = "control"
 
 
-@dataclass(frozen=True)
-class PureEffect(EffectInfo):
-    pass
+class IRStage(Enum):
+    raw = "RawIR"
+    normalized = "NormalizedIR"
+    inferred = "InferredIR"
+    dps = "DPSIR"
+    memory = "MemoryIR"
+    vm = "VMIR"
 
 
-@dataclass(frozen=True)
-class ReadOnlyEffect(EffectInfo):
-    pass
+_STAGE_DIALECTS: dict[IRStage, frozenset[DialectKind]] = {
+    IRStage.raw: frozenset(
+        {
+            DialectKind.tensor,
+            DialectKind.shape,
+            DialectKind.object,
+            DialectKind.memory,
+            DialectKind.control,
+            DialectKind.runtime,
+        }
+    ),
+    IRStage.normalized: frozenset(
+        {
+            DialectKind.tensor,
+            DialectKind.shape,
+            DialectKind.object,
+            DialectKind.memory,
+            DialectKind.control,
+            DialectKind.runtime,
+        }
+    ),
+    IRStage.inferred: frozenset(
+        {
+            DialectKind.tensor,
+            DialectKind.shape,
+            DialectKind.object,
+            DialectKind.memory,
+            DialectKind.control,
+            DialectKind.runtime,
+        }
+    ),
+    IRStage.dps: frozenset(
+        {
+            DialectKind.tensor,
+            DialectKind.memory,
+            DialectKind.shape,
+            DialectKind.object,
+            DialectKind.control,
+            DialectKind.runtime,
+        }
+    ),
+    IRStage.memory: frozenset(
+        {
+            DialectKind.tensor,
+            DialectKind.memory,
+            DialectKind.shape,
+            DialectKind.object,
+            DialectKind.control,
+            DialectKind.runtime,
+        }
+    ),
+    IRStage.vm: frozenset(
+        {
+            DialectKind.tensor,
+            DialectKind.memory,
+            DialectKind.shape,
+            DialectKind.object,
+            DialectKind.control,
+            DialectKind.runtime,
+        }
+    ),
+}
 
 
-@dataclass(frozen=True)
-class WriteEffect(EffectInfo):
-    vars: tuple[Var, ...]
+def allowed_dialects(stage: IRStage) -> frozenset[DialectKind]:
+    return _STAGE_DIALECTS[stage]
 
 
-@dataclass(frozen=True)
-class OpaqueEffect(EffectInfo):
-    pass
+def shape_values(shape: ShapeInfo | tuple[PrimExpr, ...]) -> tuple[PrimExpr, ...]:
+    if isinstance(shape, KnownShape):
+        return shape.values
+    if isinstance(shape, UnknownShape):
+        raise TypeError("UnknownShape has no concrete dimensions")
+    return tuple(shape)
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +337,57 @@ class Op:
     Subclasses store result names in result_name / result_names fields;
     the printer reads those to assign display names.
     """
+    dialect: ClassVar[DialectKind] = DialectKind.tensor
     results: tuple[OpResult, ...] = field(default_factory=tuple, init=False)
+
+    @property
+    def operands(self) -> tuple[Value, ...]:
+        """SSA values consumed by this operation.
+
+        Effect metadata is intentionally exposed separately through ``effects``;
+        callers that need all value references should combine both.
+        """
+        return ()
+
+    @property
+    def regions(self) -> tuple["Region", ...]:
+        return ()
+
+    @property
+    def effects(self) -> EffectSummary:
+        return EffectSummary.pure()
+
+    def replace_operands(
+        self,
+        operands: tuple[Value, ...],
+        *,
+        regions: tuple["Region", ...] | None = None,
+        effects: EffectSummary | None = None,
+    ) -> "Op":
+        """Return an equivalent op with substituted public operands.
+
+        Concrete ops with operands or regions override this method.  The base
+        implementation covers leaf ops with no Value operands.
+        """
+        if operands:
+            raise NotImplementedError(
+                f"{type(self).__name__}.replace_operands must be implemented"
+            )
+        if regions not in (None, ()):
+            raise NotImplementedError(
+                f"{type(self).__name__}.replace_operands must handle regions"
+            )
+        return self
+
+
+# Compatibility name matching the design document terminology.
+Operation = Op
 
 
 @dataclass(frozen=True, eq=False)
 class TerminatorOp(Op):
     """Marker base class for block-terminating ops (ReturnOp, YieldOp)."""
+    dialect: ClassVar[DialectKind] = DialectKind.control
 
 
 # ---------------------------------------------------------------------------

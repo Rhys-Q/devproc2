@@ -8,12 +8,15 @@ to Value operands when rebuilding each op.
 from __future__ import annotations
 
 from devproc2.ir.nodes import (
-    Block, Function, IRModule, Op, OpResult, Region, Value, Var,
-)
-from devproc2.ir.ops import (
-    AllocStorageOp, AllocTensorOp,
-    CallDPSOp, CallOp, ForOp, IfOp, IterArg, Range,
-    ReturnOp, ShapeAssertOp, TensorCreateOp, TupleGetItemOp, TupleOp, YieldOp,
+    AliasInfo,
+    Block,
+    EffectSummary,
+    Function,
+    IRModule,
+    Op,
+    OpResult,
+    Region,
+    Value,
 )
 
 
@@ -84,60 +87,25 @@ class IRRewriter:
 
     def _subst_op(self, op: Op) -> Op:
         """Rebuild op with substituted operands, preserving structure."""
-        if isinstance(op, ReturnOp):
-            return ReturnOp(values=self.svs(op.values))
-        if isinstance(op, YieldOp):
-            return YieldOp(values=self.svs(op.values))
-        if isinstance(op, CallOp):
-            return CallOp(callee=op.callee, args=self.svs(op.args),
-                         result_name=op.result_name,
-                         result_struct_info=op.result_struct_info)
-        if isinstance(op, CallDPSOp):
-            return CallDPSOp(callee=op.callee, callee_kind=op.callee_kind,
-                            inputs=self.svs(op.inputs),
-                            output=self.sv(op.output) if op.output is not None else None,
-                            effect=op.effect)
-        if isinstance(op, TupleOp):
-            return TupleOp(result_name=op.result_name, elems=self.svs(op.elems))
-        if isinstance(op, TupleGetItemOp):
-            return TupleGetItemOp(tup=self.sv(op.tup), index=op.index,
-                                  result_name=op.result_name)
-        if isinstance(op, IfOp):
-            return IfOp(
-                cond=self.sv(op.cond),
-                then_region=self.rewrite_region(op.then_region),
-                else_region=self.rewrite_region(op.else_region) if op.else_region else None,
-                result_names=op.result_names,
-            )
-        if isinstance(op, ForOp):
-            new_range = Range(self.sv(op.range_.start), self.sv(op.range_.end),
-                             self.sv(op.range_.step))
-            new_iter = tuple(IterArg(var=ia.var, init=self.sv(ia.init)) for ia in op.iter_args)
-            return ForOp(
-                loop_var=op.loop_var, range_=new_range, iter_args=new_iter,
-                body_region=self.rewrite_region(op.body_region),
-                result_names=op.result_names,
-            )
-        if isinstance(op, TensorCreateOp):
-            return op  # shape is PrimExpr, not Value; no substitution needed
-        if isinstance(op, AllocStorageOp):
-            return op  # no Value operands
-        if isinstance(op, AllocTensorOp):
-            return AllocTensorOp(
-                result_name=op.result_name,
-                storage=self.sv(op.storage),
-                offset=op.offset,
-                shape=op.shape,
-                dtype=op.dtype,
-            )
-        if isinstance(op, ShapeAssertOp):
-            return op  # tensor is a Var (block arg), no substitution needed
-        # Unknown op type returned as-is.  Safe only when the op carries no
-        # Value-typed operands that might reference substituted OpResults.
-        # If a new Op with Value fields is added, add an explicit case above —
-        # omitting it will cause "OpResult used before definition" in verify().
-        assert not op.results, (
-            f"Unhandled Op type with results in IRRewriter._subst_op: "
-            f"{type(op).__name__}. Add an explicit case to preserve operand substitution."
+        operands = self.svs(op.operands)
+        regions = tuple(self.rewrite_region(region) for region in op.regions)
+        return op.replace_operands(
+            operands,
+            regions=regions,
+            effects=self._subst_effect(op.effects),
         )
-        return op
+
+    def _subst_effect(self, effect: EffectSummary) -> EffectSummary:
+        return EffectSummary(
+            reads=self.svs(effect.reads),
+            writes=self.svs(effect.writes),
+            allocates=effect.allocates,
+            frees=effect.frees,
+            opaque=effect.opaque,
+            external_state=effect.external_state,
+            alias=(
+                AliasInfo(effect.alias.kind, self.sv(effect.alias.source))
+                if effect.alias is not None and effect.alias.source is not None
+                else effect.alias
+            ),
+        )

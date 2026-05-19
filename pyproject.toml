@@ -6,13 +6,6 @@ dependencies = [
     "numpy>=1.26",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.3",
-    "pytest-xdist>=3.6",
-    "ruff>=0.9",
-]
-
 [build-system]
 requires = ["setuptools>=70", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -38,5 +31,5 @@ ignore = ["E501"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
-    "pytest-xdist>=3.8.0",
+    "ruff>=0.9",
 ]

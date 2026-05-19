@@ -11,7 +11,12 @@ DTYPE_BYTES: dict[str, int] = {
     "int16":    2,
     "int32":    4,
     "int64":    8,
+    "uint8":    1,
+    "uint16":   2,
+    "uint32":   4,
+    "uint64":   8,
     "bool":     1,
+    "fp8_e4m3": 1,
 }
 
 # DLPack DLDataType encoding: dtype_str → (code, bits, lanes)
@@ -29,6 +34,7 @@ DTYPE_DL_ENCODING: dict[str, tuple[int, int, int]] = {
     "float32":  (2,  32, 1),
     "float64":  (2,  64, 1),
     "bfloat16": (4,  16, 1),   # kDLBfloat
+    "fp8_e4m3": (8,  8,  1),   # kDLFloat8_e4m3
 }
 
 # DLPack DLDeviceType encoding: device_name → type_int

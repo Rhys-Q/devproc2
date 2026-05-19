@@ -11,6 +11,7 @@
 #include "device_api.h"
 #include "stream.h"
 #include "vm_value.h"
+#include "weight_store.h"
 
 namespace devproc2 {
 
@@ -43,6 +44,9 @@ struct Instruction {
     int32_t offset = 0;
     // CALL arg registers
     std::vector<int32_t> arg_regs;
+    // Kernel CALL launch registers: grid_x/y/z, block_x/y/z, shared_memory.
+    // Not part of arg_regs, so launch metadata does not affect kernel ABI.
+    std::vector<int32_t> launch_regs;
 };
 
 // ── FunctionEntry ─────────────────────────────────────────────────────────────
@@ -60,6 +64,7 @@ struct FunctionEntry {
     int32_t         num_regs;
     int32_t         num_args;
     std::vector<ConstInit> const_inits;
+    std::vector<std::string> param_names;
 };
 
 // ── Executable ────────────────────────────────────────────────────────────────
@@ -69,6 +74,7 @@ public:
     std::vector<FunctionEntry> function_table;
     std::vector<Instruction>   instructions;
     std::vector<VMValue>       constants;
+    std::shared_ptr<WeightStore> weights;
 
     int32_t GetFuncIndex(const std::string& name) const {
         for (int32_t i = 0; i < static_cast<int32_t>(function_table.size()); ++i) {
@@ -185,7 +191,31 @@ private:
                       int32_t caller_dst_reg, int32_t caller_reg_base);
     VMValue ExecuteLoop();
     VMValue DispatchExternal(const FunctionEntry& callee,
-                             std::vector<VMValue>& args);
+                             std::vector<VMValue>& args,
+                             const std::vector<int64_t>& launch_args);
+};
+
+// Thin deployment wrapper around Executable + VMState. It keeps artifact
+// resources alive and provides the stable runtime entry used by tests/tools.
+class ModelSession {
+public:
+    explicit ModelSession(std::shared_ptr<Executable> exec);
+
+    static ModelSession LoadArtifact(const std::string& artifact_dir);
+
+    VMValue Invoke(const std::string& func_name, std::vector<VMValue> args = {});
+
+    // Return the VM's default stream for the given device. This is primarily
+    // used by deployment tools that need to enqueue side kernels in-order with
+    // VM kernels or capture the stream into a CUDA graph.
+    void* GetDefaultStream(const Device& dev);
+
+    std::shared_ptr<Executable> executable() const { return exec_; }
+    std::shared_ptr<WeightStore> weights() const { return exec_ ? exec_->weights : nullptr; }
+
+private:
+    std::shared_ptr<Executable> exec_;
+    VMState vm_;
 };
 
 

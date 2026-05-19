@@ -5,7 +5,7 @@ violated. Raises RuntimeShapeError on the first violation found.
 """
 from __future__ import annotations
 
-from devproc2.ir.nodes import Function, IRModule, TensorStructInfo
+from devproc2.ir.nodes import Function, IRModule, IRStage, TensorStructInfo
 from devproc2.ir.ops import ShapeAssertOp
 from devproc2.ir.prim_expr import PrimVar
 
@@ -15,6 +15,11 @@ class RuntimeShapeError(Exception):
 
 
 class ShapeConstraintVerifyPass:
+    input_stage = IRStage.inferred
+    output_stage = IRStage.inferred
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ()
+
     def run(self, module: IRModule, bindings: dict[str, int] | None = None) -> IRModule:
         if bindings:
             for name, fn in module.functions.items():

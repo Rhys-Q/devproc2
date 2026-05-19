@@ -43,7 +43,7 @@ class _Tensor:
 # ---------------------------------------------------------------------------
 
 def _builtin_alloc_storage(args: list) -> _Storage:
-    size_bytes, alignment, device_type, device_id = \
+    size_bytes, _, device_type, device_id = \
         int(args[0]), int(args[1]), int(args[2]), int(args[3])
     return _Storage(bytearray(size_bytes), device_type, device_id)
 

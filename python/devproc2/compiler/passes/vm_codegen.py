@@ -7,27 +7,26 @@ from devproc2.ir.nodes import (
     Block,
     Function,
     IRModule,
+    IRStage,
     Op,
     Value,
-    Var,
     Constant,
-    OpResult,
 )
 from devproc2.ir.ops import (
     AllocStorageOp,
     AllocTensorOp,
     CallDPSOp,
-    CalleeKind as IRCalleeKind,
     ForOp,
     IfOp,
-    IterArg,
     ReturnOp,
     ShapeAssertOp,
+    TensorViewOp,
     TupleGetItemOp,
     TupleOp,
     YieldOp,
 )
-from devproc2.ir.prim_expr import IntImm, PrimExpr, PrimVar
+from devproc2.ir.op_ref import BuiltinOpRef, KernelRef, PackedFuncRef
+from devproc2.ir.prim_expr import IntImm, PrimVar
 from devproc2.compiler.passes.shape_expr_lowering import ShapeExprLoweringPass, _PrimExprLowerer
 from devproc2.vm.executable import (
     CalleeKind,
@@ -37,16 +36,18 @@ from devproc2.vm.executable import (
     Instruction,
     Opcode,
 )
+from devproc2.kernel.registry import derive_kernel_params
 from devproc2.utils.dtype import parse_dtype, parse_device
 
 
-def _ir_callee_kind(kind: IRCalleeKind) -> CalleeKind:
-    return {
-        IRCalleeKind.vm_func:     CalleeKind.vm_func,
-        IRCalleeKind.builtin:     CalleeKind.builtin,
-        IRCalleeKind.packed_func: CalleeKind.packed_func,
-        IRCalleeKind.kernel:      CalleeKind.kernel,
-    }[kind]
+def _target_callee_kind(ref) -> CalleeKind:
+    if isinstance(ref, KernelRef):
+        return CalleeKind.kernel
+    if isinstance(ref, PackedFuncRef):
+        return CalleeKind.packed_func
+    if isinstance(ref, BuiltinOpRef):
+        return CalleeKind.builtin
+    raise TypeError(f"unsupported CallDPS target ref {type(ref).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +151,9 @@ class _FnCtx:
     def identity_builtin(self) -> int:
         return self.builtin("vm.builtin.identity")
 
+    def register_kernel_spec(self, name: str, spec) -> None:
+        self._exec.kernel_specs[name] = spec
+
 
 # ---------------------------------------------------------------------------
 # VMCodegenPass
@@ -167,10 +171,14 @@ class VMCodegenPass:
     Parameters
     ----------
     kernel_specs : dict[str, KernelSpec], optional
-        Map from kernel callee name (e.g. "kernel.relu_fp16") to its
-        KernelSpec. When provided, grid dims from spec.grid_fn are emitted
-        as constant args appended to the kernel CALL instruction.
+        Map from kernel callee name (e.g. "kernel.relu_fp16") to its KernelSpec.
+        Launch expressions are emitted into Instruction.launch_regs, separate
+        from the ordinary kernel ABI arg_regs.
     """
+    input_stage = IRStage.memory
+    output_stage = IRStage.vm
+    required_analysis: tuple[str, ...] = ()
+    preserved_analysis: tuple[str, ...] = ()
 
     def __init__(self, kernel_specs=None) -> None:
         self._kernel_specs: dict = kernel_specs or {}
@@ -205,6 +213,7 @@ class VMCodegenPass:
             num_regs=ctx.next_reg,
             num_args=len(fn.params),
             const_inits=ctx.const_inits,
+            param_names=[param.name for param in fn.params],
         )
         exec_.function_table.append(fe)
         exec_.instructions.extend(ctx.instrs)
@@ -222,6 +231,8 @@ class VMCodegenPass:
             self._lower_alloc_storage(op, ctx)
         elif isinstance(op, AllocTensorOp):
             self._lower_alloc_tensor(op, ctx)
+        elif isinstance(op, TensorViewOp):
+            self._lower_tensor_view(op, ctx)
         elif isinstance(op, CallDPSOp):
             self._lower_calldps(op, ctx)
         elif isinstance(op, ShapeAssertOp):
@@ -308,59 +319,109 @@ class VMCodegenPass:
                       code_reg, bits_reg, lanes_reg],
         ))
 
+    # ---- TensorViewOp ------------------------------------------------------
+
+    def _lower_tensor_view(self, op: TensorViewOp, ctx: _FnCtx) -> None:
+        base_reg = ctx.reg_of(op.base)
+        offset_reg = ctx.reg_of(op.byte_offset)
+        if op.byte_stride != 1:
+            stride_reg = ctx.reg_for_int(op.byte_stride)
+            scaled_reg = ctx.alloc_reg()
+            ctx.emit(Instruction(
+                opcode=Opcode.CALL,
+                dst_reg=scaled_reg,
+                func_idx=ctx.builtin("vm.builtin.mul_i64"),
+                arg_regs=[offset_reg, stride_reg],
+            ))
+            offset_reg = scaled_reg
+        if op.base_offset != 0:
+            base_offset_reg = ctx.reg_for_int(op.base_offset)
+            adjusted_reg = ctx.alloc_reg()
+            ctx.emit(Instruction(
+                opcode=Opcode.CALL,
+                dst_reg=adjusted_reg,
+                func_idx=ctx.builtin("vm.builtin.add_i64"),
+                arg_regs=[offset_reg, base_offset_reg],
+            ))
+            offset_reg = adjusted_reg
+
+        shape_regs: list[int] = []
+        for dim in op.shape:
+            if isinstance(dim, IntImm):
+                shape_regs.append(ctx.reg_for_int(dim.value))
+            elif isinstance(dim, PrimVar):
+                reg = ctx._value_reg.get(id(dim))
+                if reg is None:
+                    raise RuntimeError(
+                        f"PrimVar shape dim '{dim.name}' not in register; "
+                        "ensure ShapeExprLoweringPass.setup_fn ran first."
+                    )
+                shape_regs.append(reg)
+            else:
+                shape_regs.append(ctx.prim_lowerer.materialize(dim))
+
+        shape_reg = ctx.alloc_reg()
+        ctx.emit(Instruction(
+            opcode=Opcode.CALL,
+            dst_reg=shape_reg,
+            func_idx=ctx.builtin("vm.builtin.make_shape"),
+            arg_regs=shape_regs,
+        ))
+
+        result_reg = ctx.alloc_reg()
+        ctx.bind(op.results[0], result_reg)
+        ctx.emit(Instruction(
+            opcode=Opcode.CALL,
+            dst_reg=result_reg,
+            func_idx=ctx.builtin("vm.builtin.tensor_view"),
+            arg_regs=[base_reg, offset_reg, shape_reg],
+        ))
+
     # ---- CallDPSOp ---------------------------------------------------------
 
     def _lower_calldps(self, op: CallDPSOp, ctx: _FnCtx) -> None:
         arg_regs = [ctx.reg_of(v) for v in op.inputs]
-        if op.output is not None:
-            arg_regs.append(ctx.reg_of(op.output))
-        # For kernel callees: emit static grid dims (gx, gy, gz) as extra args.
-        if op.callee_kind == IRCalleeKind.kernel:
-            spec = self._kernel_specs.get(op.callee)
-            if spec is not None and spec.grid_fn is not None:
-                grid = self._compute_grid(spec.grid_fn, op.inputs)
-                for g in grid:
-                    arg_regs.append(ctx.reg_for_int(int(g)))
-        func_idx = ctx.intern_func(op.callee, _ir_callee_kind(op.callee_kind))
+        for output in op.outputs:
+            arg_regs.append(ctx.reg_of(output))
+        launch_regs: list[int] = []
+        if isinstance(op.target_ref, KernelRef):
+            spec = op.target_ref.spec or self._kernel_specs.get(op.target_ref.name)
+            if spec is not None:
+                if not spec.params:
+                    spec = spec.with_params(derive_kernel_params(op.inputs, op.outputs))
+                ctx.register_kernel_spec(op.target_ref.name, spec)
+                launch_regs = self._materialize_launch(spec.launch, ctx)
+        func_idx = ctx.intern_func(op.target_ref.name, _target_callee_kind(op.target_ref))
         ctx.emit(Instruction(
             opcode=Opcode.CALL,
             dst_reg=-1,  # DPS ops produce no SSA result
             func_idx=func_idx,
             arg_regs=arg_regs,
+            launch_regs=launch_regs,
         ))
 
     @staticmethod
-    def _compute_grid(grid_fn, inputs: tuple) -> tuple[int, int, int]:
-        """Compute static grid dims from input shapes when possible.
-
-        Extracts concrete shapes from each input's struct_info.  If all dims
-        are IntImm (static), passes ``[(d0,d1,...), ...]`` to grid_fn.
-        Falls back to no-arg call for backward compatibility or when shapes
-        contain dynamic PrimVars.
-        """
-        shapes = []
-        all_static = True
-        for v in inputs:
-            si = getattr(v, "struct_info", None)
-            if si is not None and hasattr(si, "shape"):
-                dims = []
-                for d in si.shape:
-                    if isinstance(d, IntImm):
-                        dims.append(d.value)
-                    else:
-                        all_static = False
-                        break
-                shapes.append(tuple(dims))
+    def _materialize_launch(launch, ctx: _FnCtx) -> list[int]:
+        regs: list[int] = []
+        values = tuple(launch.grid) + tuple(launch.block) + (launch.shared_memory_bytes,)
+        for value in values:
+            if isinstance(value, int):
+                regs.append(ctx.reg_for_int(value))
+            elif isinstance(value, IntImm):
+                regs.append(ctx.reg_for_int(value.value))
+            elif isinstance(value, PrimVar):
+                reg = ctx._value_reg.get(id(value))
+                if reg is None:
+                    raise RuntimeError(f"PrimVar launch dim '{value.name}' is not bound")
+                regs.append(reg)
+            elif isinstance(value, str):
+                raise NotImplementedError(
+                    "string launch expressions are artifact metadata only; "
+                    "use PrimExpr for VM-materialized dynamic launch"
+                )
             else:
-                all_static = False
-                break
-
-        if all_static:
-            try:
-                return tuple(grid_fn(shapes))
-            except TypeError:
-                pass  # fall through to no-arg call
-        return tuple(grid_fn())
+                regs.append(ctx.prim_lowerer.materialize(value))
+        return regs
 
     # ---- ShapeAssertOp -----------------------------------------------------
 

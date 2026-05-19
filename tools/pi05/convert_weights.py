@@ -1,0 +1,507 @@
+"""Pi0.5 weight package conversion and FP8 quantization."""
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from devproc2.models.pi05.weights import (
+    ACTION_HORIZON,
+    DEC_D,
+    DEC_L,
+    ENC_L,
+    NUM_STEPS_DEFAULT,
+    PI05_MODEL_NAME,
+    VIS_L,
+    select_fp8_layout,
+)
+from devproc2.quantization import common_fp8_scale
+from devproc2.weights import (
+    BF16,
+    FP8_E4M3,
+    FP32,
+    QuantSpec,
+    WeightPackageWriter,
+    write_json,
+)
+
+
+def convert_pi05_weights(
+    checkpoint_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    hardware: str | None = "rtx_sm89",
+    fp8_layout: str | None = None,
+    activation_scales: str = "missing",
+    shape_profile: str = "pi05_libero_base_3v200",
+    include_bf16: bool = True,
+    include_support_bf16: bool = True,
+    include_fp8: bool = True,
+    include_precomputed_styles: bool = True,
+    action_horizon: int = ACTION_HORIZON,
+    num_steps: int = NUM_STEPS_DEFAULT,
+    device: str = "cuda",
+) -> None:
+    """Convert the local Pi0.5 safetensors checkpoint to a devproc2 package."""
+
+    checkpoint_dir = Path(checkpoint_dir)
+    safetensors_path = checkpoint_dir / "model.safetensors"
+    if not safetensors_path.exists():
+        raise FileNotFoundError(safetensors_path)
+
+    layout = select_fp8_layout(hardware, fp8_layout)
+    weights = _convert_pi05_safetensors(safetensors_path)
+    if include_bf16 and include_fp8:
+        precision = "bf16+fp8"
+    elif include_fp8:
+        precision = "fp8"
+    else:
+        precision = BF16
+    writer = WeightPackageWriter(output_dir, model=PI05_MODEL_NAME, precision=precision)
+
+    if include_bf16:
+        for name, tensor in weights.items():
+            writer.add_tensor(name, tensor, dtype=BF16, layout="row_major")
+    elif include_support_bf16:
+        for name, tensor in _iter_bf16_support_tensors(weights):
+            writer.add_tensor(
+                name,
+                tensor,
+                dtype=BF16,
+                kind="constant_tensor" if name.startswith("constant.") else "weight",
+                layout="row_major",
+            )
+
+    if include_precomputed_styles:
+        styles = _precompute_decoder_styles(
+            weights,
+            chunk_size=action_horizon,
+            num_steps=num_steps,
+            device=device,
+        )
+        for name, tensor in styles.items():
+            writer.add_tensor(
+                f"precomputed.{name}",
+                tensor,
+                dtype=BF16,
+                kind="constant_tensor",
+                layout="row_major",
+            )
+
+    if include_fp8:
+        for name, tensor in _iter_fp8_targets(weights):
+            q_bytes, scale, q_shape = _quantize_fp8_e4m3(tensor, layout=layout, device=device)
+            scale_name = f"fp8.{name}.scale"
+            weight_name = f"fp8.{name}.weight"
+            writer.add_tensor(scale_name, scale, dtype=FP32, kind="scale", layout="scalar")
+            writer.add_tensor(
+                weight_name,
+                q_bytes.reshape(q_shape),
+                dtype=FP8_E4M3,
+                layout=layout,
+                quant=QuantSpec(
+                    scheme="fp8_e4m3_per_tensor",
+                    storage_dtype=FP8_E4M3,
+                    compute_dtype=BF16,
+                    scale_name=scale_name,
+                    packed_layout=layout,
+                ),
+            )
+
+    writer.write()
+    has_act_scales = any(entry.name.startswith("act_scale.") for entry in writer.entries)
+    requested_static = activation_scales == "static"
+    resolved_activation_scales = (
+        "static"
+        if has_act_scales
+        else "missing"
+        if requested_static or activation_scales == "missing"
+        else "dynamic"
+    )
+    _update_weight_manifest(Path(output_dir) / "manifest.json", {
+        "target_hardware": hardware,
+        "shape_profile": shape_profile,
+        "activation_scales": resolved_activation_scales,
+        "supports_static_act_scales": has_act_scales,
+        "entrypoints_supported": [
+            "step",
+            "loop",
+            "sample_precomputed_prefix",
+            "sample_precomputed_prefix_embs",
+            "sample_tokens",
+            "vision_encoder",
+            "paligemma_prefix_encoder",
+            "paligemma_prefix_kv_encoder",
+        ],
+    })
+    write_json(Path(output_dir) / "convert_report.json", {
+        "source": {"type": "safetensors", "path": str(safetensors_path)},
+        "ruleset": "openpi05_hf_to_devproc2_flashrt_v1",
+        "target_hardware": hardware,
+        "shape_profile": shape_profile,
+        "fp8_layout": layout,
+        "activation_scales": resolved_activation_scales,
+        "supports_static_act_scales": has_act_scales,
+        "include_bf16": include_bf16,
+        "include_support_bf16": include_support_bf16,
+        "include_fp8": include_fp8,
+        "include_precomputed_styles": include_precomputed_styles,
+        "action_horizon": int(action_horizon),
+        "num_steps": int(num_steps),
+        "num_entries": len(writer.entries),
+    })
+
+
+def _update_weight_manifest(path: Path, extra: dict[str, Any]) -> None:
+    manifest = {}
+    if path.exists():
+        import json
+
+        manifest = json.loads(path.read_text())
+    manifest.update(extra)
+    write_json(path, manifest)
+
+
+def _convert_pi05_safetensors(safetensors_path: Path) -> dict[str, Any]:
+    import torch
+    from safetensors import safe_open
+
+    bf16 = torch.bfloat16
+    f = safe_open(str(safetensors_path), framework="pt")
+    keys = set(f.keys())
+    strip = "model." if all(k.startswith("model.") for k in keys) else ""
+
+    def g(key: str):
+        return f.get_tensor(strip + key).to(bf16).contiguous()
+
+    def g_raw(key: str):
+        return f.get_tensor(strip + key)
+
+    ckpt: dict[str, Any] = {}
+
+    vp = "paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+    ckpt["vision_patch_embedding_w"] = (
+        g(f"{vp}.embeddings.patch_embedding.weight").permute(2, 3, 1, 0).contiguous()
+    )
+    ckpt["vision_patch_embedding_b"] = g(f"{vp}.embeddings.patch_embedding.bias")
+    ckpt["vision_position_embedding"] = g(f"{vp}.embeddings.position_embedding.weight")
+
+    qkv_w, qkv_b, o_w, o_b = [], [], [], []
+    up_w, up_b, down_w, down_b = [], [], [], []
+    ln1_w, ln1_b, ln2_w, ln2_b = [], [], [], []
+    for i in range(VIS_L):
+        lp = f"{vp}.encoder.layers.{i}"
+        q = g(f"{lp}.self_attn.q_proj.weight")
+        k = g(f"{lp}.self_attn.k_proj.weight")
+        v = g(f"{lp}.self_attn.v_proj.weight")
+        qkv_w.append(torch.cat([q, k, v], dim=0).t().contiguous())
+        qkv_b.append(torch.cat([
+            g(f"{lp}.self_attn.q_proj.bias"),
+            g(f"{lp}.self_attn.k_proj.bias"),
+            g(f"{lp}.self_attn.v_proj.bias"),
+        ]).contiguous())
+        o_w.append(g(f"{lp}.self_attn.out_proj.weight").t().contiguous())
+        o_b.append(g(f"{lp}.self_attn.out_proj.bias"))
+        up_w.append(g(f"{lp}.mlp.fc1.weight").t().contiguous())
+        up_b.append(g(f"{lp}.mlp.fc1.bias"))
+        down_w.append(g(f"{lp}.mlp.fc2.weight").t().contiguous())
+        down_b.append(g(f"{lp}.mlp.fc2.bias"))
+        ln1_w.append(g(f"{lp}.layer_norm1.weight"))
+        ln1_b.append(g(f"{lp}.layer_norm1.bias"))
+        ln2_w.append(g(f"{lp}.layer_norm2.weight"))
+        ln2_b.append(g(f"{lp}.layer_norm2.bias"))
+
+    ckpt["vision_attn_qkv_w"] = torch.stack(qkv_w)
+    ckpt["vision_attn_qkv_b"] = torch.stack(qkv_b)
+    ckpt["vision_attn_o_w"] = torch.stack(o_w)
+    ckpt["vision_attn_o_b"] = torch.stack(o_b)
+    ckpt["vision_ffn_up_w"] = torch.stack(up_w)
+    ckpt["vision_ffn_up_b"] = torch.stack(up_b)
+    ckpt["vision_ffn_down_w"] = torch.stack(down_w)
+    ckpt["vision_ffn_down_b"] = torch.stack(down_b)
+    ckpt["vision_pre_attn_norm_w"] = torch.stack(ln1_w)
+    ckpt["vision_pre_attn_norm_b"] = torch.stack(ln1_b)
+    ckpt["vision_pre_ffn_norm_w"] = torch.stack(ln2_w)
+    ckpt["vision_pre_ffn_norm_b"] = torch.stack(ln2_b)
+    ckpt["vision_final_norm_w"] = g(f"{vp}.post_layernorm.weight")
+    ckpt["vision_final_norm_b"] = g(f"{vp}.post_layernorm.bias")
+
+    mp = "paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
+    ckpt["encoder_multi_modal_projector_w"] = g(f"{mp}.weight").t().contiguous()
+    ckpt["encoder_multi_modal_projector_b"] = g(f"{mp}.bias")
+
+    ep = "paligemma_with_expert.paligemma.model.language_model.layers"
+    enc_qkv, enc_o, enc_gate, enc_up, enc_down = [], [], [], [], []
+    for i in range(ENC_L):
+        attn_scale = g_raw(f"{ep}.{i}.input_layernorm.weight").float()
+        fuse_attn = 1.0 + attn_scale
+        q = _interleave_qk(g_raw(f"{ep}.{i}.self_attn.q_proj.weight").float(), 8)
+        k = _interleave_qk(g_raw(f"{ep}.{i}.self_attn.k_proj.weight").float(), 1)
+        v = g_raw(f"{ep}.{i}.self_attn.v_proj.weight").float()
+        enc_qkv.append(torch.cat([
+            q * fuse_attn.unsqueeze(0),
+            k * fuse_attn.unsqueeze(0),
+            v * fuse_attn.unsqueeze(0),
+        ], dim=0).t().to(bf16).contiguous())
+        enc_o.append(g(f"{ep}.{i}.self_attn.o_proj.weight").t().contiguous())
+        ffn_scale = g_raw(f"{ep}.{i}.post_attention_layernorm.weight").float()
+        fuse_ffn = 1.0 + ffn_scale
+        enc_gate.append((g_raw(f"{ep}.{i}.mlp.gate_proj.weight").float() * fuse_ffn.unsqueeze(0)).t().to(bf16).contiguous())
+        enc_up.append((g_raw(f"{ep}.{i}.mlp.up_proj.weight").float() * fuse_ffn.unsqueeze(0)).t().to(bf16).contiguous())
+        enc_down.append(g(f"{ep}.{i}.mlp.down_proj.weight").t().contiguous())
+    ckpt["encoder_attn_qkv_w"] = torch.stack(enc_qkv)
+    ckpt["encoder_attn_o_w"] = torch.stack(enc_o)
+    ckpt["encoder_ffn_gate_w"] = torch.stack(enc_gate)
+    ckpt["encoder_ffn_up_w"] = torch.stack(enc_up)
+    ckpt["encoder_ffn_down_w"] = torch.stack(enc_down)
+
+    dp = "paligemma_with_expert.gemma_expert.model.layers"
+    dec_qkv, dec_o, dec_gate, dec_up, dec_down = [], [], [], [], []
+    dec_attn_mod_w, dec_attn_mod_b, dec_ffn_mod_w, dec_ffn_mod_b = [], [], [], []
+    for i in range(DEC_L):
+        dec_attn_mod_w.append(g(f"{dp}.{i}.input_layernorm.dense.weight").t().contiguous())
+        dec_attn_mod_b.append(g(f"{dp}.{i}.input_layernorm.dense.bias"))
+        q = _interleave_qk(g(f"{dp}.{i}.self_attn.q_proj.weight").float(), 8).to(bf16)
+        k = _interleave_qk(g(f"{dp}.{i}.self_attn.k_proj.weight").float(), 1).to(bf16)
+        v = g(f"{dp}.{i}.self_attn.v_proj.weight")
+        dec_qkv.append(torch.cat([q, k, v], dim=0).t().contiguous())
+        dec_o.append(g(f"{dp}.{i}.self_attn.o_proj.weight").t().contiguous())
+        dec_ffn_mod_w.append(g(f"{dp}.{i}.post_attention_layernorm.dense.weight").t().contiguous())
+        dec_ffn_mod_b.append(g(f"{dp}.{i}.post_attention_layernorm.dense.bias"))
+        dec_gate.append(g(f"{dp}.{i}.mlp.gate_proj.weight").t().contiguous())
+        dec_up.append(g(f"{dp}.{i}.mlp.up_proj.weight").t().contiguous())
+        dec_down.append(g(f"{dp}.{i}.mlp.down_proj.weight").t().contiguous())
+    ckpt["decoder_attn_qkv_w"] = torch.stack(dec_qkv)
+    ckpt["decoder_attn_o_w"] = torch.stack(dec_o)
+    ckpt["decoder_ffn_gate_w"] = torch.stack(dec_gate)
+    ckpt["decoder_ffn_up_w"] = torch.stack(dec_up)
+    ckpt["decoder_ffn_down_w"] = torch.stack(dec_down)
+    ckpt["decoder_pre_attn_norm_mod_w"] = torch.stack(dec_attn_mod_w)
+    ckpt["decoder_pre_attn_norm_mod_b"] = torch.stack(dec_attn_mod_b)
+    ckpt["decoder_pre_ffn_norm_mod_w"] = torch.stack(dec_ffn_mod_w)
+    ckpt["decoder_pre_ffn_norm_mod_b"] = torch.stack(dec_ffn_mod_b)
+    ckpt["decoder_final_norm_mod_w"] = g("paligemma_with_expert.gemma_expert.model.norm.dense.weight").t().contiguous()
+    ckpt["decoder_final_norm_mod_b"] = g("paligemma_with_expert.gemma_expert.model.norm.dense.bias")
+
+    ckpt["decoder_time_mlp_in_w"] = g("time_mlp_in.weight").t().contiguous()
+    ckpt["decoder_time_mlp_in_b"] = g("time_mlp_in.bias")
+    ckpt["decoder_time_mlp_out_w"] = g("time_mlp_out.weight").t().contiguous()
+    ckpt["decoder_time_mlp_out_b"] = g("time_mlp_out.bias")
+    ckpt["decoder_time_embeds"] = _build_time_embeddings()
+    ckpt["decoder_action_in_proj_w"] = g("action_in_proj.weight").t().contiguous()
+    ckpt["decoder_action_in_proj_b"] = g("action_in_proj.bias")
+    ckpt["decoder_action_out_proj_w"] = (g("action_out_proj.weight").t().contiguous() * (-1.0 / NUM_STEPS_DEFAULT))
+    ckpt["decoder_action_out_proj_b"] = g("action_out_proj.bias") * (-1.0 / NUM_STEPS_DEFAULT)
+    ckpt["embedding_weight"] = g("paligemma_with_expert.paligemma.lm_head.weight")
+    return ckpt
+
+
+def _iter_fp8_targets(weights: dict[str, Any]):
+    for i in range(VIS_L):
+        yield f"vision_attn_qkv_w_{i}", weights["vision_attn_qkv_w"][i]
+        yield f"vision_attn_o_w_{i}", weights["vision_attn_o_w"][i]
+        yield f"vision_ffn_up_w_{i}", weights["vision_ffn_up_w"][i]
+        yield f"vision_ffn_down_w_{i}", weights["vision_ffn_down_w"][i]
+    yield "vision_projector_w", weights["encoder_multi_modal_projector_w"]
+    for i in range(ENC_L):
+        yield f"encoder_attn_qkv_w_{i}", weights["encoder_attn_qkv_w"][i]
+        yield f"encoder_attn_o_w_{i}", weights["encoder_attn_o_w"][i]
+        yield f"encoder_ffn_gate_up_w_{i}", _torch_cat(
+            weights["encoder_ffn_gate_w"][i], weights["encoder_ffn_up_w"][i], dim=1
+        )
+        yield f"encoder_ffn_down_w_{i}", weights["encoder_ffn_down_w"][i]
+    for i in range(DEC_L):
+        yield f"decoder_attn_qkv_w_{i}", weights["decoder_attn_qkv_w"][i]
+        yield f"decoder_attn_o_w_{i}", weights["decoder_attn_o_w"][i]
+        yield f"decoder_ffn_gate_up_w_{i}", _torch_cat(
+            weights["decoder_ffn_gate_w"][i], weights["decoder_ffn_up_w"][i], dim=1
+        )
+        yield f"decoder_ffn_down_w_{i}", weights["decoder_ffn_down_w"][i]
+
+
+def _iter_bf16_support_tensors(weights: dict[str, Any]):
+    """Tensors still needed by the FP8 fast path.
+
+    These are intentionally not a full BF16 duplicate of quantized matmul
+    weights. They cover embeddings, biases, norms, small action projections and
+    constants that are not represented by the FP8 weight set.
+    """
+
+    support_names = (
+        "vision_patch_embedding_w",
+        "vision_patch_embedding_b",
+        "vision_position_embedding",
+        "vision_attn_qkv_b",
+        "vision_attn_o_b",
+        "vision_ffn_up_b",
+        "vision_ffn_down_b",
+        "vision_pre_attn_norm_w",
+        "vision_pre_attn_norm_b",
+        "vision_pre_ffn_norm_w",
+        "vision_pre_ffn_norm_b",
+        "vision_final_norm_w",
+        "vision_final_norm_b",
+        "encoder_multi_modal_projector_b",
+        "embedding_weight",
+        "decoder_action_in_proj_w",
+        "decoder_action_in_proj_b",
+        "decoder_action_out_proj_w",
+        "decoder_action_out_proj_b",
+    )
+    for name in support_names:
+        yield name, weights[name]
+    yield "constant.decoder_adarms_weight", np.full((DEC_D,), 0x3F80, dtype=np.uint16)
+
+
+def _quantize_fp8_e4m3(tensor: Any, *, layout: str, device: str):
+    import torch
+
+    w = tensor
+    if layout == "nk" and getattr(w, "ndim", 0) == 2:
+        w = w.t().contiguous()
+    else:
+        w = w.contiguous()
+    w_dev = w.to(device=device)
+    amax = w_dev.float().abs().max().item()
+    scale = common_fp8_scale([amax])
+    q = (w_dev.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    q_u8 = q.contiguous().view(torch.uint8).cpu().numpy().copy()
+    scale_np = np.asarray([scale], dtype=np.float32)
+    del w_dev, q
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return q_u8, scale_np, tuple(int(s) for s in w.shape)
+
+
+def _interleave_qk(w: Any, num_heads: int):
+    out_dim, in_dim = w.shape
+    head_dim = out_dim // num_heads
+    return (
+        w.reshape(num_heads, head_dim, in_dim)
+        .reshape(num_heads, 2, head_dim // 2, in_dim)
+        .permute(0, 2, 1, 3)
+        .reshape(out_dim, in_dim)
+    )
+
+
+def _build_time_embeddings():
+    import torch
+
+    t = torch.tensor(1.0, dtype=torch.float32)
+    fraction = torch.linspace(0.0, 1.0, DEC_D // 2)
+    period = 4e-3 * (4.0 / 4e-3) ** fraction
+    items = []
+    for _ in range(NUM_STEPS_DEFAULT):
+        sinusoid_input = t.unsqueeze(-1) * (1.0 / period).unsqueeze(0) * 2 * math.pi
+        items.append(torch.cat([torch.sin(sinusoid_input), torch.cos(sinusoid_input)], dim=-1).to(torch.bfloat16))
+        t = t - 1.0 / NUM_STEPS_DEFAULT
+    return torch.cat(items, dim=0).contiguous()
+
+
+def _precompute_decoder_styles(
+    weights: dict[str, Any],
+    *,
+    chunk_size: int,
+    num_steps: int,
+    device: str,
+) -> dict[str, np.ndarray]:
+    import torch
+
+    target_device = device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+    bf16 = torch.bfloat16
+
+    def w(name: str) -> torch.Tensor:
+        return weights[name].to(device=target_device, dtype=bf16)
+
+    time_emb_schedule = w("decoder_time_embeds")
+    t_in_w = w("decoder_time_mlp_in_w")
+    t_in_b = w("decoder_time_mlp_in_b")
+    t_out_w = w("decoder_time_mlp_out_w")
+    t_out_b = w("decoder_time_mlp_out_b")
+    attn_mod_w = w("decoder_pre_attn_norm_mod_w")
+    attn_mod_b = w("decoder_pre_attn_norm_mod_b")
+    ffn_mod_w = w("decoder_pre_ffn_norm_mod_w")
+    ffn_mod_b = w("decoder_pre_ffn_norm_mod_b")
+    final_mod_w = w("decoder_final_norm_mod_w")
+    final_mod_b = w("decoder_final_norm_mod_b")
+
+    time_emb_out = torch.empty(num_steps, chunk_size, DEC_D, dtype=bf16, device=target_device)
+    style_attn = torch.empty(num_steps, DEC_L, chunk_size, 3 * DEC_D, dtype=bf16, device=target_device)
+    style_ffn = torch.empty(num_steps, DEC_L, chunk_size, 3 * DEC_D, dtype=bf16, device=target_device)
+    style_final = torch.empty(num_steps, chunk_size, 3 * DEC_D, dtype=bf16, device=target_device)
+
+    for step in range(num_steps):
+        te = time_emb_schedule[step:step + 1]
+        tmp = te @ t_in_w + t_in_b[None, :]
+        tmp = (tmp.float() * torch.sigmoid(tmp.float())).to(bf16)
+        tmp = tmp @ t_out_w + t_out_b[None, :]
+        tmp = (tmp.float() * torch.sigmoid(tmp.float())).to(bf16)
+        te_expanded = tmp.expand(chunk_size, -1).contiguous()
+        time_emb_out[step] = te_expanded
+
+        for layer in range(DEC_L):
+            style_attn[step, layer] = te_expanded @ attn_mod_w[layer] + attn_mod_b[layer][None, :]
+            style_ffn[step, layer] = te_expanded @ ffn_mod_w[layer] + ffn_mod_b[layer][None, :]
+        style_final[step] = te_expanded @ final_mod_w + final_mod_b[None, :]
+
+    def to_bf16_bits(t: torch.Tensor) -> np.ndarray:
+        return t.contiguous().view(torch.uint16).cpu().numpy().copy()
+
+    out = {
+        "decoder_time_emb": to_bf16_bits(time_emb_out),
+        "decoder_style_attn": to_bf16_bits(style_attn),
+        "decoder_style_ffn": to_bf16_bits(style_ffn),
+        "decoder_style_final": to_bf16_bits(style_final),
+    }
+    if target_device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return out
+
+
+def _torch_cat(a: Any, b: Any, *, dim: int):
+    import torch
+
+    return torch.cat([a, b], dim=dim).contiguous()
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Convert Pi0.5 weights to a devproc2 package.")
+    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--hardware", default="rtx_sm89")
+    parser.add_argument("--fp8-layout", choices=("kn", "nk"), default=None)
+    parser.add_argument(
+        "--activation-scales",
+        choices=("missing", "dynamic", "static"),
+        default="missing",
+    )
+    parser.add_argument("--shape-profile", default="pi05_libero_base_3v200")
+    parser.add_argument("--no-bf16", action="store_true")
+    parser.add_argument("--no-support-bf16", action="store_true")
+    parser.add_argument("--no-fp8", action="store_true")
+    parser.add_argument("--no-precomputed-styles", action="store_true")
+    parser.add_argument("--action-horizon", type=int, default=ACTION_HORIZON)
+    parser.add_argument("--num-steps", type=int, default=NUM_STEPS_DEFAULT)
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args(argv)
+    convert_pi05_weights(
+        checkpoint_dir=args.checkpoint_dir,
+        output_dir=args.output_dir,
+        hardware=args.hardware,
+        fp8_layout=args.fp8_layout,
+        activation_scales=args.activation_scales,
+        shape_profile=args.shape_profile,
+        include_bf16=not args.no_bf16,
+        include_support_bf16=not args.no_support_bf16,
+        include_fp8=not args.no_fp8,
+        include_precomputed_styles=not args.no_precomputed_styles,
+        action_horizon=args.action_horizon,
+        num_steps=args.num_steps,
+        device=args.device,
+    )
+
+
+if __name__ == "__main__":
+    main()

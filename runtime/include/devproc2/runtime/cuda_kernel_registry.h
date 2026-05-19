@@ -29,10 +29,9 @@ public:
         const std::string&          name,
         const std::vector<uint8_t>& cubin_data,
         const std::string&          func_name,
-        std::array<int32_t, 3>      block_dims = {128, 1, 1},
-        int32_t                     smem_bytes = 0,
-        int32_t                     num_warps = 4,
-        int32_t                     num_stages = 3
+        std::array<int32_t, 3>      grid_dims = {1, 1, 1},
+        std::array<int32_t, 3>      block_dims = {256, 1, 1},
+        int32_t                     shared_memory_bytes = 0
     );
 
     // Returns nullptr if not found.

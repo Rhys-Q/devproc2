@@ -4,6 +4,7 @@ import pytest
 import devproc2.frontend.dsl as dp
 from devproc2.compiler.passes.control_flow_normalize import ControlFlowNormalizePass
 from devproc2.compiler.passes.control_flow_verify import ControlFlowVerifyPass
+from devproc2.compiler.passes.infer_struct_info import InferStructInfoPass
 from devproc2.ir import (
     Block,
     Function,
@@ -37,7 +38,7 @@ def test_frontend_decode_step():
         else:
             y = dp.ops.gelu(x)
         for i in dp.range(0, n):
-            y = dp.ops.layernorm(y)
+            y = dp.ops.silu(y)
         return y
 
     module = decode_step.lower_module()
@@ -75,7 +76,7 @@ def test_frontend_decode_step_printed_ir():
         else:
             y = dp.ops.gelu(x)
         for i in dp.range(0, n):
-            y = dp.ops.layernorm(y)
+            y = dp.ops.silu(y)
         return y
 
     text = print_module(decode_step.lower_module())
@@ -85,7 +86,7 @@ def test_frontend_decode_step_printed_ir():
     assert "@gelu" in text
     assert "for %i in range" in text
     assert "iter_args" in text
-    assert "@layernorm" in text
+    assert "@silu" in text
     assert "return" in text
 
 
@@ -271,19 +272,71 @@ def test_normalize_pass_nested_if_result_substitution():
     assert "f" in normalized.functions
 
 
+def test_inferred_ir_verifies_control_flow_result_struct_info():
+    B = dp.symbolic_dim("B", upper=8)
+
+    @dp.function
+    def f(x: dp.Tensor[(B, 16), "float16", "cuda"], flag):
+        if flag:
+            y = dp.ops.relu(x)
+        else:
+            y = dp.ops.silu(x)
+        return y
+
+    normalized = ControlFlowNormalizePass().run(f.lower_module())
+    inferred = InferStructInfoPass().run(normalized)
+
+    verify(inferred, stage="InferredIR")
+    if_op = next(op for op in inferred.functions["f"].body.entry_block.ops if isinstance(op, IfOp))
+    assert if_op.results[0].struct_info is not None
+
+
+def test_inferred_ir_rejects_partially_unknown_control_flow_result():
+    from devproc2.ir import (
+        Block,
+        Function,
+        IRModule,
+        IntImm,
+        Region,
+        ReturnOp,
+        ScalarStructInfo,
+        TensorStructInfo,
+        Var,
+        YieldOp,
+    )
+
+    x = Var("x", TensorStructInfo((IntImm(4),), "float16", "cuda"))
+    unknown = Var("unknown")
+    flag = Var("flag", ScalarStructInfo("bool"))
+    if_op = IfOp(
+        cond=flag,
+        then_region=Region((Block(args=(), ops=(YieldOp((x,)),)),)),
+        else_region=Region((Block(args=(), ops=(YieldOp((unknown,)),)),)),
+        result_names=("out",),
+    )
+    module = IRModule({
+        "f": Function(Region((Block(args=(x, unknown, flag), ops=(if_op, ReturnOp((if_op.results[0],)))),)))
+    })
+
+    inferred = InferStructInfoPass().run(module)
+
+    with pytest.raises(IRVerificationError, match="result without struct_info"):
+        verify(inferred, stage="InferredIR")
+
+
 # ---------------------------------------------------------------------------
 # ControlFlowVerifyPass error cases (issue 10)
 # ---------------------------------------------------------------------------
 
 def test_cf_verify_rejects_effect_only_if_with_yielded_values():
     """An effect-only IfOp (no result_names) whose branches yield values
-    passes the base verifier but must be caught by ControlFlowVerifyPass."""
-    from devproc2.ir import Block, CallOp, Function, IfOp, IRModule, Region, ReturnOp, Var, YieldOp
+    is rejected by the base verifier and by ControlFlowVerifyPass."""
+    from devproc2.ir import Block, CallOp, Function, IfOp, IRModule, Region, ReturnOp, StandardOpRef, Var, YieldOp
     from devproc2.ir.verifier import IRVerificationError
 
     x = Var("x"); flag = Var("flag")
-    relu_op = CallOp(callee="@relu", args=(x,), result_name="v"); v = relu_op.results[0]
-    silu_op = CallOp(callee="@silu", args=(x,), result_name="v2"); v2 = silu_op.results[0]
+    relu_op = CallOp(StandardOpRef("relu"), args=(x,), result_name="v"); v = relu_op.results[0]
+    silu_op = CallOp(StandardOpRef("silu"), args=(x,), result_name="v2"); v2 = silu_op.results[0]
 
     # result_names=() means effect-only, but both branches yield a value —
     # base verifier doesn't catch this; ControlFlowVerifyPass must.
@@ -293,10 +346,8 @@ def test_cf_verify_rejects_effect_only_if_with_yielded_values():
     block = Block(args=(x, flag), ops=(if_op, ReturnOp((x,))))
     module = IRModule({"f": Function(Region((block,)))})
 
-    # Base verifier passes (yield counts are consistent: 1 == 1).
-    verify(module)
+    with pytest.raises(IRVerificationError, match="IfOp has 0 results"):
+        verify(module)
 
-    # ControlFlowVerifyPass must reject it.
     with pytest.raises(IRVerificationError, match="effect-only"):
         ControlFlowVerifyPass().run(module)
-
