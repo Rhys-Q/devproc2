@@ -48,7 +48,7 @@ current weight package: /root/tw/devproc2/build/pi05_fp8.weights
 tools/pi05/convert_weights.py
   -> build/pi05_fp8.weights
 
-python -m devproc2.export.cli --recipe devproc2.models.pi05.recipe:sample_tokens
+python -m devproc2.export.cli --recipe devproc2.models.pi05.model:sample_tokens
   -> GraphBuilder
   -> InferStructInfo / DPSLowering / MemoryPlanning / VMCodegen
   -> EmitExecutablePass / EmitABIPass
@@ -70,7 +70,7 @@ runtime C++ / bench
 - `python/devproc2/export/cli.py`：通用 recipe export CLI。
 - `python/devproc2/export/pipeline.py`：通用 compile / emit / artifact pipeline。
 - `python/devproc2/artifact/builder.py`：安装 weights、resources、kernels、packed backends。
-- `python/devproc2/models/pi05/recipe.py`：Pi0.5 entrypoint recipe、legacy compile/export helper、packed backend recipe。
+- `python/devproc2/models/pi05/model.py`：Pi0.5 product entrypoint recipe 和 packed backend recipe。
 - `runtime/CMakeLists.txt`：迁移前同时构建 runtime core 和 `devproc2_pi05_cuda_backend`。
 - `runtime/src/vm.cc`：加载 artifact、权重、kernel table、packed backend table 和 tokenizer resource。
 
@@ -94,7 +94,7 @@ PyTorch dump、raw oracle、Nsight profile 应该放到验证章节，作为 bui
 
 ```bash
 python -m devproc2.export.cli \
-  --recipe devproc2.models.pi05.recipe:sample_tokens \
+  --recipe devproc2.models.pi05.model:sample_tokens \
   --artifact-dir ... \
   --weight-package-dir ... \
   --resource tokenizer=... \
@@ -125,9 +125,9 @@ cmake --build <build_dir> --target devproc2_pi05_cuda_backend
 
 这和期望的“先把 devproc2 runtime core 编译好，再 build model”不一致。更准确的边界是：model build 可以编译 Pi0.5 专用 backend extension，但必须作为 `devproc2 build` 的显式、可配置子阶段，而不是 artifact packager 找不到 `.so` 后偷偷猜 CMake build dir。
 
-### 4. Pi0.5 recipe 里仍保留两套 compile/export 路径
+### 4. 旧 Pi0.5 recipe 曾保留两套 compile/export 路径
 
-`python/devproc2/models/pi05/recipe.py` 现在同时有：
+旧 `python/devproc2/models/pi05/recipe.py` 曾同时有：
 
 - 底部的 `EntrypointRecipe` / `CompileRecipe`，这是正确方向。
 - 大量 `build_pi05_*`、`compile_pi05_*`、`emit_pi05_*`、`export_pi05_*_artifact` helper。
@@ -168,15 +168,15 @@ convert_report.json
 precision=fp8
 fp8_layout=nk
 activation_scales=static | dynamic
-entrypoints_supported=[sample_tokens, ...]
+entrypoints_supported=[sample_tokens]
 shape_profile=pi05_libero_base_3v200
 ```
 
 model build 根据声明选择 graph variant，或者在选项不兼容时直接失败。
 
-### 7. config 默认值重复，shape/profile 没有产品化命名
+### 7. config 默认值需要统一到 shape/profile
 
-`python/devproc2/models/pi05/config.py` 已经有 `PI05Config`，但 `recipe.py` 仍重复维护大量默认常量和 option parsing。用户还需要从 torch dump 推导 `prefix_rows=968`、`max_prompt_len=200`、`num_views=3`。
+`python/devproc2/models/pi05/config.py` 已经有 `PI05Config`。模型 export 声明应复用这些默认值，避免在多个文件里重复维护 shape/profile。用户不应该再从 torch dump 手工推导 `prefix_rows=968`、`max_prompt_len=200`、`num_views=3`。
 
 更合适的是把这些固定成 profile：
 
@@ -285,7 +285,7 @@ python -m devproc2.build \
 
 ```python
 from devproc2.build import build
-from devproc2.models.pi05.recipe import pi05_recipe
+from devproc2.models.pi05.model import pi05_recipe
 from devproc2.models.pi05.config import PI05Config
 
 summary = build(
@@ -348,7 +348,7 @@ python/devproc2/models/pi05/
   cuda/
 ```
 
-长期不需要单独保留一个 2000 行 `recipe.py`。更合理的形态是：先把 `recipe.py` 里的 compile/export/package 行为全部抽到通用 `devproc2.build`，再把剩下的“模型 export 声明”合并进 `model.py`。`model.py` 作为 Pi0.5 的模型类型入口，声明这个模型有哪些可编译 entrypoint、默认 config/profile、资源和 backend 依赖。
+不再单独保留 `recipe.py` 或 `export_spec.py`。更合理的形态是：先把旧 recipe 里的 compile/export/package 行为全部抽到通用 `devproc2.build`，再把剩下的“模型 export 声明”收敛到 `model.py`。`model.py` 作为 Pi0.5 的模型类型入口，声明这个模型有哪些可编译 entrypoint、默认 config/profile、资源和 backend 依赖。
 
 目标形态可以是：
 
@@ -364,17 +364,16 @@ PI05_MODEL = ModelExportSpec(
             backends=("pi05.cuda",),
             resources=("tokenizer",),
         ),
-        "sample_precomputed_prefix": EntrySpec(...),
     },
 )
 ```
 
-如果短期仍复用现有 `CompileRecipe` / `EntrypointRecipe` 类型，也应该从 `model.py` 导出声明对象，例如 `PI05_MODEL` 或 `pi05_recipe`。`recipe.py` 只作为兼容 re-export 存在一段时间：
+逐段验证用的 `step`、`loop`、`vision_encoder`、`paligemma_prefix_encoder`
+等不属于产品 `PI05_MODEL/pi05_recipe` 的公开 ABI；它们保留在
+`diagnostic_export_spec.py` 的 `pi05_diagnostic_recipe` 中，用于 oracle、
+benchmark 和性能归因。
 
-```python
-# python/devproc2/models/pi05/recipe.py
-from devproc2.models.pi05.model import PI05_MODEL as pi05_recipe
-```
+当前仍复用现有 `CompileRecipe` / `EntrypointRecipe` 类型，但产品声明从 `model.py` 导出；`recipe.py` 和 `export_spec.py` 已删除，不再作为兼容 re-export。
 
 模型 export 声明应能表达：
 
@@ -395,7 +394,7 @@ from devproc2.models.pi05.model import PI05_MODEL as pi05_recipe
 - Pi0.5 专用 CLI `main(...)`
 - 直接 import compiler passes、artifact builder、VM codegen 的逻辑
 
-这些都属于通用 `devproc2.build` 的职责。否则只是把 `recipe.py` 的 2000 行问题移动到 `model.py`。
+这些都属于通用 `devproc2.build` 的职责。否则只是把旧 recipe 的膨胀问题移动到 `model.py`。
 
 ### 4. Weight binding 和 validation
 
@@ -485,10 +484,9 @@ python -m devproc2.inspect <artifact>
 
 ```bash
 python -m devproc2.export.cli ...
-python -m devproc2.models.pi05.recipe ...
 ```
 
-但文档中只推荐 `devproc2.build`。兼容 CLI 标记为 internal/debug，并在后续删除 legacy Pi0.5 export helpers。
+但文档中只推荐 `devproc2.build`。兼容 CLI 标记为 internal/debug。
 
 ### 7. 文档拆分
 
@@ -581,15 +579,15 @@ python -m devproc2.build --model pi05 --entry sample_tokens ...
 - 删除或 deprecate `compile_pi05_*`、`emit_pi05_*`、`export_pi05_*_artifact`。
 - 把 `_compile_pi05_ir_module(...)`、`_emit_compile_result(...)`、`prepare_pi05_artifact(...)` 和 Pi0.5 专用 CLI 行为迁到 generic `devproc2.build` 或删除。
 - 把剩余的 entrypoint builders、input specs、backend/resource declarations 收敛成 typed model export declaration，并合并到 `model.py`。
-- 短期保留 `recipe.py` 作为兼容 re-export；新文档、测试和 CLI 不再直接依赖 `devproc2.models.pi05.recipe`。
-- 默认 shape/profile 从 `PI05Config` 读取，不再在 `recipe.py` 重复维护常量。
+- 删除 `recipe.py` 兼容 re-export；新文档、测试和 CLI 不再直接依赖 `devproc2.models.pi05.recipe`。
+- 默认 shape/profile 从 `PI05Config` 读取，不再在模型 export 声明里重复维护常量。
 
 验收：
 
 - Pi0.5 artifact 只通过 generic `devproc2.build` 生成。
 - tests 不再调用 Pi0.5 legacy export helpers。
 - `model.py` 只包含模型 re-export 和 typed export declaration，不 import compiler passes、artifact builder 或 VM codegen。
-- `recipe.py` 要么删除，要么只剩兼容 re-export。
+- `recipe.py` 已删除。
 
 ### Phase 4：整理 runtime/backend 边界
 

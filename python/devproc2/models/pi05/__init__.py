@@ -9,6 +9,15 @@ from devproc2.models.pi05.config import (
     PI05LayoutConfig,
     PI05ShapeConfig,
 )
+from devproc2.models.pi05.diagnostic_export_spec import (
+    loop,
+    paligemma_prefix_encoder,
+    paligemma_prefix_kv_encoder,
+    sample_precomputed_prefix,
+    sample_precomputed_prefix_embs,
+    step,
+    vision_encoder,
+)
 from devproc2.models.pi05.model import (
     PI05_MODEL,
     PI05FFN,
@@ -25,18 +34,9 @@ from devproc2.models.pi05.model import (
     PI05VisionEncoder,
     PI05VisionEncoderLayer,
     PI05VisionPatchEmbedding,
-)
-from devproc2.models.pi05.recipe import (
-    loop,
-    paligemma_prefix_encoder,
-    paligemma_prefix_kv_encoder,
     pi05_cuda_backend,
     pi05_recipe,
-    sample_precomputed_prefix,
-    sample_precomputed_prefix_embs,
     sample_tokens,
-    step,
-    vision_encoder,
 )
 from devproc2.models.pi05.weights import (
     PI05_MODEL_NAME,

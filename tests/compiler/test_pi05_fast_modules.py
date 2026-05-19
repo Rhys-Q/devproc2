@@ -25,6 +25,16 @@ from devproc2.ir.ops import (
     TensorViewOp,
     TupleOp,
 )
+from devproc2.models.pi05.diagnostic_export_spec import (
+    pi05_denoise_input_specs,
+    pi05_denoise_loop_input_specs,
+    pi05_diagnostic_recipe,
+    pi05_paligemma_prefix_encoder_input_specs,
+    pi05_paligemma_prefix_kv_encoder_input_specs,
+    pi05_sample_actions_precomputed_prefix_embs_input_specs,
+    pi05_sample_actions_precomputed_prefix_input_specs,
+    pi05_vision_encoder_input_specs,
+)
 from devproc2.models.pi05.model import (
     PI05FFN,
     PI05Attention,
@@ -39,16 +49,8 @@ from devproc2.models.pi05.model import (
     PI05VisionEncoder,
     PI05VisionEncoderLayer,
     PI05VisionPatchEmbedding,
-)
-from devproc2.models.pi05.recipe import (
-    pi05_denoise_input_specs,
-    pi05_denoise_loop_input_specs,
-    pi05_paligemma_prefix_encoder_input_specs,
-    pi05_paligemma_prefix_kv_encoder_input_specs,
     pi05_recipe,
-    pi05_sample_actions_precomputed_prefix_embs_input_specs,
-    pi05_sample_actions_precomputed_prefix_input_specs,
-    pi05_vision_encoder_input_specs,
+    sample_tokens,
 )
 from devproc2.nn import GraphBuilder, Module, ScalarSpec, TensorSpec
 
@@ -93,7 +95,7 @@ def _lowered_ops(module, fn_name: str):
 
 def _emit_entry_artifact(entry: str, output_dir: Path, **options):
     return emit_entrypoint(
-        pi05_recipe.entrypoint(entry),
+        _pi05_test_entrypoint(entry),
         output_dir,
         options=options,
         target_arch="sm89",
@@ -104,16 +106,22 @@ def _emit_entry_artifact(entry: str, output_dir: Path, **options):
 
 def _compile_entry_graph(entry: str, **options):
     return compile_entrypoint(
-        pi05_recipe.entrypoint(entry),
+        _pi05_test_entrypoint(entry),
         options=options,
         sm_arch=89,
         compile_mode=options.get("compile_mode"),
     )
 
 
+def _pi05_test_entrypoint(entry: str):
+    if entry in pi05_recipe.entrypoints:
+        return pi05_recipe.entrypoint(entry)
+    return pi05_diagnostic_recipe.entrypoint(entry)
+
+
 def test_pi05_model_layer_keeps_backend_ops_behind_ops_facade():
     assert not _PI05_LEGACY_MODULE_SOURCE.exists()
-    assert len(_PI05_MODEL_SOURCE.read_text().splitlines()) <= 120
+    assert len(_PI05_MODEL_SOURCE.read_text().splitlines()) <= 260
     for path in _PI05_MODEL_LAYER_SOURCES:
         assert path.exists(), path
         source = path.read_text()
@@ -130,9 +138,9 @@ def test_pi05_model_layer_keeps_backend_ops_behind_ops_facade():
 def test_pi05_public_imports_use_canonical_modules():
     import devproc2.models.pi05 as pkg
     import devproc2.models.pi05.config as config
+    import devproc2.models.pi05.diagnostic_export_spec as diagnostic_export_spec
     import devproc2.models.pi05.model as model
     import devproc2.models.pi05.ops as pi05_ops
-    import devproc2.models.pi05.recipe as recipe
     import devproc2.models.pi05.weights as weights
     import devproc2.weights as package_weights
 
@@ -148,15 +156,21 @@ def test_pi05_public_imports_use_canonical_modules():
     assert pkg.PI05DenoiseLoop is model.PI05DenoiseLoop
     assert pkg.PI05PaliGemmaPrefixEncoder is model.PI05PaliGemmaPrefixEncoder
     assert weights.WeightPackageWriter is pkg.WeightPackageWriter
-    assert recipe.pi05_recipe.entrypoint("sample_tokens") is recipe.sample_tokens
-    assert recipe.sample_tokens.packed_backends[0].name == "pi05.cuda"
-    assert recipe.sample_tokens.packed_backends[0].kind == "compiled_packed_backend"
-    assert recipe.sample_tokens.packed_backends[0].to_table_obj(
+    assert model.pi05_recipe.entrypoint("sample_tokens") is sample_tokens
+    assert set(model.pi05_recipe.entrypoints) == {"sample_tokens"}
+    assert diagnostic_export_spec.pi05_diagnostic_recipe.entrypoint(
+        "loop"
+    ) is diagnostic_export_spec.loop
+    assert sample_tokens.packed_backends[0].name == "pi05.cuda"
+    assert sample_tokens.packed_backends[0].kind == "compiled_packed_backend"
+    assert sample_tokens.packed_backends[0].to_table_obj(
         target_arch="sm89",
     )["library"] == "backends/pi05_cuda.so"
-    assert pkg.pi05_cuda_backend is recipe.pi05_cuda_backend
+    assert pkg.pi05_cuda_backend is model.pi05_cuda_backend
     assert package_weights.WeightPackageWriter is not None
     for legacy_name in (
+        "devproc2.models.pi05.export_spec",
+        "devproc2.models.pi05.recipe",
         "devproc2.models.pi05.modules",
         "devproc2.models.pi05.artifact",
         "devproc2.models.pi05.export",

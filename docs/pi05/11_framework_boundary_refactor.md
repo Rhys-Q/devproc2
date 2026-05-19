@@ -257,7 +257,7 @@ python/devproc2/weights/
 python/devproc2/models/pi05/
   __init__.py
   config.py            # PI05Config and defaults
-  model.py             # public re-export facade only
+  model.py             # public re-export facade + product export declaration
   graph/
     __init__.py        # graph fragment exports
     layers.py          # reusable primitive layers: Linear / Embedding / Attention
@@ -270,7 +270,7 @@ python/devproc2/models/pi05/
     _helpers.py        # private shape/grid/reference helpers
   ops.py               # Pi0.5 CUDA/HPC facade
   weights.py           # Pi0.5 logical weight names and deploy manifest
-  recipe.py            # Pi0.5 CompileRecipe / entrypoints / artifact resources
+  diagnostic_export_spec.py  # oracle / benchmark entrypoints
   cuda/
     kernels/           # source-symbol CUDA kernels
     backends/          # Pi0.5-owned cuBLASLt/CUTLASS/FA2 host runners
@@ -284,7 +284,7 @@ tools/pi05/
 
 ```python
 from devproc2.export import export_artifact
-from devproc2.models.pi05.recipe import pi05_recipe
+from devproc2.models.pi05.model import pi05_recipe
 
 summary = export_artifact(
     recipe=pi05_recipe.entrypoint("sample_tokens"),
@@ -298,22 +298,14 @@ CLI 也应该是通用 CLI 加 recipe，而不是 `python -m python/devproc2/exp
 
 ```bash
 PYTHONPATH=python python -m devproc2.export.cli \
-  --recipe devproc2.models.pi05.recipe:sample_tokens \
+  --recipe devproc2.models.pi05.model:sample_tokens \
   --artifact-dir build/pi05_fp8_sample_tokens_artifact \
   --weight-package-dir build/pi05_fp8.weights \
   --sm-arch 89 \
   --compile-mode fast
 ```
 
-如果希望有业务友好的短命令，可以放在模型命名空间或 tools 里：
-
-```bash
-PYTHONPATH=python python -m devproc2.models.pi05.recipe export \
-  --entry sample_tokens \
-  --artifact-dir build/pi05_fp8_sample_tokens_artifact
-```
-
-但 `devproc2.export` 自身不再出现 `pi05.py`。
+如果希望有业务友好的短命令，应使用通用产品入口 `python -m devproc2.build --model pi05 --entry sample_tokens ...`。`devproc2.export` 自身不再出现 `pi05.py`。
 
 ### 模型包内部边界
 
@@ -459,7 +451,7 @@ class PackedBackendRecipe:
     packed_funcs: tuple[PackedFuncSpec, ...] = ()
 ```
 
-Pi0.5 可以通过 `PI05Config` 或 `recipe.py` 产生这个通用 recipe：
+Pi0.5 可以通过 `PI05Config` 或 `model.py` 产生这个通用 recipe：
 
 ```python
 PackedBackendRecipe(
@@ -627,19 +619,19 @@ Pi0.5 旧导出函数先调用 generic pipeline，确保行为不变。
 PYTHONPATH=python pytest tests/compiler/test_pi05_fast_modules.py
 ```
 
-### Phase 2：建立 Pi0.5 recipe
+### Phase 2：建立 Pi0.5 export spec
 
 新增：
 
-- `python/devproc2/models/pi05/recipe.py`
+- `python/devproc2/models/pi05/diagnostic_export_spec.py`
 
-把以下内容从 `export/pi05.py` 移入 Pi0.5 recipe：
+把以下内容从 `export/pi05.py` 移入 Pi0.5 model-owned export spec：
 
 - Pi0.5 entrypoint 列表；
 - input spec factory；
 - Pi0.5 Module 构造；
 - default model names；
-- `step`、`loop`、`sample_precomputed_prefix`、`sample_precomputed_prefix_embs`、`sample_tokens`、`vision_encoder`、`paligemma_prefix_encoder`、`paligemma_prefix_kv_encoder`。
+- 产品 recipe 只暴露 `sample_tokens`。`step`、`loop`、`sample_precomputed_prefix`、`sample_precomputed_prefix_embs`、`vision_encoder`、`paligemma_prefix_encoder`、`paligemma_prefix_kv_encoder` 归入 diagnostic recipe，用于 oracle、benchmark 和性能归因。
 
 `devproc2.export` 只暴露：
 
@@ -671,7 +663,7 @@ rg -n "PI05|pi05|openpi|paligemma" python/devproc2/export
 - 通用 packed backend source 编译、动态库安装和 `packed_backend_table.json` 写入；
 - 通用 `metadata/artifact.json` 写入。
 
-Pi0.5 的 tokenizer、model id、resource policy、packed backend recipe 移到 `models/pi05/recipe.py`。
+Pi0.5 的 tokenizer、model id、resource policy、packed backend recipe 移到 `models/pi05/model.py`。
 
 最终删除：
 
@@ -863,7 +855,7 @@ PYTHONPATH=python python tools/pi05/convert_weights.py \
 
 ```bash
 PYTHONPATH=python python -m devproc2.export.cli \
-  --recipe devproc2.models.pi05.recipe:sample_tokens \
+  --recipe devproc2.models.pi05.model:sample_tokens \
   --artifact-dir build/pi05_fp8_sample_tokens_artifact \
   --weight-package-dir build/pi05_fp8.weights \
   --resource tokenizer=/root/autodl-tmp/openpi/outputs/pi05_torch_infer/tokenizer.model \
@@ -875,7 +867,7 @@ PYTHONPATH=python python -m devproc2.export.cli \
 
 ```python
 from devproc2.export import export_artifact
-from devproc2.models.pi05.recipe import pi05_recipe
+from devproc2.models.pi05.model import pi05_recipe
 
 summary = export_artifact(
     recipe=pi05_recipe.entrypoint("sample_tokens"),
