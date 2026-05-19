@@ -2232,7 +2232,7 @@ PTX 用于：
 
 ## 15. Compiler Pipeline
 
-MVP pipeline（共 18 步，详见 [docs/mvp_impl/02_compiler_pipeline.md](../mvp_impl/02_compiler_pipeline.md)）：
+MVP pipeline（共 18 步，历史拆分文档见 [docs/archive/mvp_impl/02_compiler_pipeline.md](../archive/mvp_impl/02_compiler_pipeline.md)）：
 
 ```text
 [1]  Python DSL Capture

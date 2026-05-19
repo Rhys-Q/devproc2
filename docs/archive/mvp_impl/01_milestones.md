@@ -102,7 +102,7 @@ verifier 能检测到 `alloc_storage` 出现时报错。
 
 ## M3：Control Flow MVP
 
-**目标**：支持 Python `if/elif/else` 和 `for/dp.range`，IR 采用结构化表达（Structured CF + Region + Yield），不引入 CFG / φ 节点。详细设计见 [docs/design/control_flow.md](../design/control_flow.md)。
+**目标**：支持 Python `if/elif/else` 和 `for/dp.range`，IR 采用结构化表达（Structured CF + Region + Yield），不引入 CFG / φ 节点。详细设计见 [docs/design/control_flow.md](../../design/control_flow.md)。
 
 ### 子里程碑
 

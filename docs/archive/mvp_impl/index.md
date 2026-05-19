@@ -13,10 +13,10 @@
 
 | 文档 | 内容 |
 |---|---|
-| [docs/design/overview.md](../design/overview.md) | 系统整体架构、模块分解、长期路线图 |
-| [docs/design/mvp.md](../design/mvp.md) | IR 设计、控制流、内存规划、VM、里程碑 1–12 + X1–X3 |
-| [docs/design/control_flow.md](../design/control_flow.md) | M3 控制流详细设计：Structured CF + Region + Yield + IterArgs + Effect-aware IR |
-| [docs/design/从llama.cpp中学到了什么.md](../design/从llama.cpp中学到了什么.md) | 从 llama.cpp 学到的关键设计经验和四阶段演进路线 |
+| [docs/design/overview.md](../../design/overview.md) | 系统整体架构、模块分解、长期路线图 |
+| [docs/design/mvp.md](../../design/mvp.md) | IR 设计、控制流、内存规划、VM、里程碑 1–12 + X1–X3 |
+| [docs/design/control_flow.md](../../design/control_flow.md) | M3 控制流详细设计：Structured CF + Region + Yield + IterArgs + Effect-aware IR |
+| [docs/design/从llama.cpp中学到了什么.md](../../design/从llama.cpp中学到了什么.md) | 从 llama.cpp 学到的关键设计经验和四阶段演进路线 |
 
 ## 推荐开发顺序
 
