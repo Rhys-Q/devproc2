@@ -20,10 +20,10 @@ export OPENPI_ROOT=/root/tw/openpi
 export OPENPI_PY=$OPENPI_ROOT/.venv/bin/python
 
 export PI05_CKPT=/root/tools/pi05_libero_base
-export PI05_TORCH_DUMP=/root/tw/openpi/outputs/pi05_torch_infer_libero_base
+export PI05_TORCH_DUMP=/root/tw/openpi/outputs/pi05_torch_infer
 export PI05_TOKENIZER=$PI05_TORCH_DUMP/tokenizer.model
 export PI05_WEIGHT_PKG=$DEVPROC2_ROOT/build/pi05_fp8.weights
-export PI05_DUMP_RAW=$DEVPROC2_ROOT/build/pi05_torch_dump_oracle_libero_base
+export PI05_DUMP_RAW=$DEVPROC2_ROOT/build/pi05_torch_dump_oracle
 
 export DEVPROC2_FLASHRT_FA2_SO=/root/tw/FlashRT/flash_rt/flash_rt_fa2.cpython-312-x86_64-linux-gnu.so
 export DEVPROC2_LIBPYTHON_SO=/root/miniforge3/envs/py312/lib/libpython3.12.so.1.0
@@ -40,7 +40,7 @@ test -f "$DEVPROC2_FLASHRT_FA2_SO"
 test -f "$DEVPROC2_LIBPYTHON_SO"
 ```
 
-历史目录 `/root/tw/openpi/outputs/pi05_torch_infer` 的 metadata 指向 `/root/autodl-tmp/tools/pi05-pytorch-base`。如果 devproc2 权重包来自 `/root/tools/pi05_libero_base/model.safetensors`，不要拿这个历史 dump 做 actions 级结论；它只能作为输入格式参考。
+如果 `$PI05_TORCH_DUMP/metadata.json` 的 `ckpt` 不是 `$PI05_CKPT`，先按第 2 节重新生成 dump；actions 级对点必须保证 PyTorch dump、tokenizer 和 devproc2 weight package 同源。
 
 ## 机器与软件要求
 
@@ -114,7 +114,7 @@ python - <<'PY'
 import json
 from pathlib import Path
 
-dump_meta = json.loads(Path("/root/tw/openpi/outputs/pi05_torch_infer_libero_base/metadata.json").read_text())
+dump_meta = json.loads(Path("/root/tw/openpi/outputs/pi05_torch_infer/metadata.json").read_text())
 report = json.loads(Path("build/pi05_fp8.weights/convert_report.json").read_text())
 print("torch dump ckpt:", dump_meta.get("ckpt"))
 print("weight pkg source:", report.get("source", {}).get("path"))
@@ -148,7 +148,7 @@ convert_pi05_weights(
 PY
 ```
 
-注意：基础 converter 不会自动生成当前性能包里的 `act_scale.*`。如果新包缺少 `act_scale.*`，导出 artifact 时不要加 `--use-static-act-scales`；它能用于 smoke test，但不等同于当前性能 baseline。
+注意：基础 converter 不会自动生成当前性能包里的 `act_scale.*`。如果新包缺少 `act_scale.*`，导出 artifact 时不要加 `--option use_static_act_scales=true`；它能用于 smoke test，但不等同于当前性能 baseline。
 
 ## 2. 生成同权重 PyTorch Dump
 
@@ -165,7 +165,7 @@ PYTHONPATH=$OPENPI_ROOT:$OPENPI_ROOT/src \
   --num-steps 10
 ```
 
-本机 2026-05-18 实测输出：
+本机 2026-05-19 实测输出：
 
 ```text
 shape: [10, 50, 32]
@@ -230,6 +230,7 @@ OMP_NUM_THREADS=1 \
 PYTHONPATH=$OPENPI_ROOT:$OPENPI_ROOT/src \
 "$OPENPI_PY" - <<'PY'
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -237,8 +238,8 @@ import torch
 from openpi.models import pi0_config
 from scripts import dump_pi05_torch_infer as dump
 
-src = Path("/root/tw/openpi/outputs/pi05_torch_infer_libero_base")
-out_root = Path("/root/tw/devproc2/build/pi05_torch_dump_oracle_libero_base")
+src = Path(os.environ["PI05_TORCH_DUMP"])
+out_root = Path(os.environ["PI05_DUMP_RAW"])
 inputs = dump._load_inputs(src / "inputs.npz")  # noqa: SLF001
 targets = np.load(src / "bf16" / "outputs.npz")["actions"].astype(np.float32)
 config = pi0_config.Pi0Config(pi05=True, dtype="bfloat16", pytorch_compile_mode=None)
@@ -305,7 +306,7 @@ for i in range(targets.shape[0]):
     meta = {
         "format": "devproc2.pi05_sample_tokens_raw_from_openpi_dump",
         "source": str(src),
-        "ckpt": "/root/tools/pi05_libero_base",
+        "ckpt": os.environ["PI05_CKPT"],
         "example_index": i,
         "target_precision": "bf16",
         "num_views": V,
@@ -341,6 +342,22 @@ token_valid_len: [127, 132, 138, 132, 136, 126, 134, 138, 130, 137]
 
 ## 4. 导出 Pi0.5 Artifact
 
+当前 artifact 会打包 `pi05.cuda` packed backend。导出前先确保 `build/root-cuda` 已按 CUDA/CUTLASS 配置，并且 backend shared library 可用：
+
+```bash
+cmake -S . -B build/root-cuda \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DDEVPROC2_WITH_CUDA=ON \
+  -DDEVPROC2_WITH_TOKENIZERS=ON \
+  -DDEVPROC2_BUILD_TESTS=ON \
+  -DDEVPROC2_WITH_CUTLASS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+
+cmake --build build/root-cuda \
+  --target devproc2_pi05_cuda_backend \
+  -j2
+```
+
 真实 dump 对点主线使用 3-view / P=968：
 
 ```bash
@@ -353,6 +370,7 @@ PYTHONPATH=python python -m devproc2.export.cli \
   --option max_prompt_len=200 \
   --option num_views=3 \
   --sm-arch 89 \
+  --backend-build-dir build/root-cuda \
   --option use_static_act_scales=true
 ```
 
@@ -367,8 +385,9 @@ PYTHONPATH=python python -m devproc2.export.cli \
   --option prefix_rows=769 \
   --option max_prompt_len=1 \
   --option num_views=3 \
-  --sm-arch 89
-  --use-static-act-scales
+  --sm-arch 89 \
+  --backend-build-dir build/root-cuda \
+  --option use_static_act_scales=true
 ```
 
 导出完成后检查：
@@ -380,7 +399,8 @@ python devproc_cli.py inspect build/pi05_fp8_sample_tokens_3v968_artifact
 至少应看到：
 
 - `executable.vm`
-- `metadata/pi05_artifact.json`
+- `metadata/artifact.json`
+- `metadata/packed_backend_table.json`
 - `weights/weights.index.json`
 - `resources/tokenizer.model`
 - `kernels/*.cubin`
@@ -399,7 +419,7 @@ cmake -S . -B build/root-cuda \
   -DCMAKE_CUDA_ARCHITECTURES=89
 
 cmake --build build/root-cuda \
-  --target bench_pi05_denoise test_pi05_cuda_gemm test_cuda_graph \
+  --target devproc2_pi05_cuda_backend bench_pi05_denoise test_pi05_cuda_gemm test_cuda_graph \
   -j2
 ```
 
@@ -444,13 +464,14 @@ build/root-cuda/runtime/tests/bench_pi05_denoise 50 \
 - `mean_10step_ms`：full-token 路径整体延迟，包含 vision encoder、language embedding、prefix KV materialization 和 10-step denoise。
 - `final_abs_max/final_abs_mean`：devproc2 FP8 artifact output vs PyTorch BF16 raw target。只有 checkpoint、token、RoPE、prefix rows 和 target 都同源时才是有效 actions 级对点。
 
-本机 2026-05-18 同权重 P=968 batch 观测值：
+本机 2026-05-19 同权重 P=968 batch 观测值：
 
 ```text
-mean_10step_ms mean: 33.771
-mean_10step_ms max: 34.352
-final_abs_max mean: 0.795
-final_abs_max worst: 1.983
+mean_10step_ms mean: 33.680
+mean_10step_ms max: 34.110
+mean_step_ms mean: 3.368
+final_abs_max mean: 0.800
+final_abs_max worst: 1.981
 final_abs_mean mean: 0.0054
 final_abs_mean worst: 0.018
 ```
@@ -459,7 +480,7 @@ final_abs_mean worst: 0.018
 
 | 形态 | Artifact | raw 来源 | 参考延迟 |
 | --- | --- | --- | --- |
-| 3-view / P=968 / max_token_len=200 | `build/pi05_fp8_sample_tokens_3v968_artifact` | 同权重 openpi dump | `~33.8ms` |
+| 3-view / P=968 / max_token_len=200 | `build/pi05_fp8_sample_tokens_3v968_artifact` | 同权重 openpi dump | `~33.7ms` |
 | 3-view / P=769 / max_prompt_len=1 | `build/pi05_fp8_sample_tokens_3v769_artifact` | 历史 synthetic raw | `~29.3ms` |
 | 3-view / P=895 / max_prompt_len=127 | `build/pi05_fp8_sample_tokens_3v895_artifact` | 需匹配 raw | `~28-31ms` |
 | 2-view / P=562 / max_prompt_len=50 | `build/pi05_fp8_sample_tokens_2v562_artifact` | 需匹配 raw | `~23.4ms` |
@@ -477,7 +498,7 @@ import subprocess
 from pathlib import Path
 
 root = Path("/root/tw/devproc2")
-raw_root = root / "build/pi05_torch_dump_oracle_libero_base"
+raw_root = Path(os.environ.get("PI05_DUMP_RAW", root / "build/pi05_torch_dump_oracle"))
 artifact = root / "build/pi05_fp8_sample_tokens_3v968_artifact"
 bin_path = root / "build/root-cuda/runtime/tests/bench_pi05_denoise"
 summary = json.loads((raw_root / "summary.json").read_text())
@@ -494,7 +515,7 @@ for meta in summary:
     i = meta["example_index"]
     cmd = [
         str(bin_path),
-        "20",
+        "50",
         "--entry-kind",
         "sample_tokens",
         "--artifact-dir",
@@ -516,20 +537,22 @@ for meta in summary:
         "tok": meta["token_valid_len"],
         "pv": meta["prefix_valid_rows"],
         "mean_ms": mean_ms,
+        "step_ms": step_ms,
         "abs_max": abs_max,
         "abs_mean": abs_mean,
     }
     rows.append(row)
     print(
         f"example={i} tok={row['tok']} pv={row['pv']} "
-        f"mean_10step_ms={mean_ms:.3f} final_abs_max={abs_max:.6f} "
-        f"final_abs_mean={abs_mean:.6f}"
+        f"mean_10step_ms={mean_ms:.3f} mean_step_ms={step_ms:.3f} "
+        f"final_abs_max={abs_max:.3f} final_abs_mean={abs_mean:.3f}"
     )
 
 print("summary")
-print("mean_ms=%.3f max_ms=%.3f mean_abs_max=%.6f max_abs_max=%.6f mean_abs_mean=%.6f max_abs_mean=%.6f" % (
+print("mean_ms=%.3f max_ms=%.3f mean_step_ms=%.3f mean_abs_max=%.6f max_abs_max=%.6f mean_abs_mean=%.6f max_abs_mean=%.6f" % (
     sum(r["mean_ms"] for r in rows) / len(rows),
     max(r["mean_ms"] for r in rows),
+    sum(r["step_ms"] for r in rows) / len(rows),
     sum(r["abs_max"] for r in rows) / len(rows),
     max(r["abs_max"] for r in rows),
     sum(r["abs_mean"] for r in rows) / len(rows),
@@ -542,16 +565,16 @@ PY
 
 | example | token_valid_len | prefix_valid_rows | mean_10step_ms | final_abs_max | final_abs_mean |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 0 | 127 | 895 | 34.352 | 0.026 | 0.002 |
-| 1 | 132 | 900 | 33.278 | 0.037 | 0.003 |
-| 2 | 138 | 906 | 33.793 | 1.983 | 0.018 |
-| 3 | 132 | 900 | 33.896 | 0.022 | 0.003 |
-| 4 | 136 | 904 | 34.172 | 0.044 | 0.004 |
-| 5 | 126 | 894 | 33.338 | 1.946 | 0.007 |
-| 6 | 134 | 902 | 33.396 | 0.039 | 0.003 |
-| 7 | 138 | 906 | 33.408 | 1.900 | 0.006 |
-| 8 | 130 | 898 | 34.079 | 1.913 | 0.005 |
-| 9 | 137 | 905 | 34.002 | 0.040 | 0.003 |
+| 0 | 127 | 895 | 33.563 | 0.026 | 0.002 |
+| 1 | 132 | 900 | 33.550 | 0.037 | 0.003 |
+| 2 | 138 | 906 | 33.447 | 1.981 | 0.018 |
+| 3 | 132 | 900 | 33.567 | 0.024 | 0.003 |
+| 4 | 136 | 904 | 34.012 | 0.044 | 0.004 |
+| 5 | 126 | 894 | 33.566 | 1.946 | 0.007 |
+| 6 | 134 | 902 | 33.929 | 0.039 | 0.003 |
+| 7 | 138 | 906 | 33.573 | 1.900 | 0.006 |
+| 8 | 130 | 898 | 34.110 | 1.965 | 0.005 |
+| 9 | 137 | 905 | 33.483 | 0.040 | 0.003 |
 
 解读：
 
@@ -620,23 +643,23 @@ nsys stats build/pi05_profiles/pi05_sample_tokens_3v968_same_weight_ex0.nsys-rep
 
 当前预期结论：主耗时集中在 FP8 GEMM，尤其是 vision/prefix encoder FFN gate/up/down；FlashRT attention 次之；不是 tokenizer、attention fallback 或零散 elementwise kernel。
 
-本机 2026-05-18 same-weight example0 profile 已生成：
+本机 2026-05-19 same-weight example0 profile 已生成：
 
 ```text
-build/pi05_profiles/pi05_sample_tokens_3v968_same_weight_ex0.nsys-rep
-bench output: mean_10step_ms=34.050 final_abs_max=0.021 final_abs_mean=0.002
+build/pi05_profiles/pi05_sample_tokens_3v968_same_weight_ex0_20260519.nsys-rep
+bench output: mean_10step_ms=33.622 final_abs_max=0.021 final_abs_mean=0.002
 ```
 
 `nsys stats` 的 top GPU kernel 仍是 FP8 GEMM 和 FlashRT attention：
 
 | Kernel 类别 | Time |
 | --- | ---: |
-| `sm89_xmma_gemm...128x128...` | 24.2% |
-| `sm89_xmma_gemm...64x64...` | 20.7% |
-| `sm89_xmma_gemm...32x64...` | 10.1% |
-| FlashRT `flash_fwd_splitkv_kernel` | 8.8% |
-| `sm89_xmma_gemm...64x128...` | 8.0% |
-| `pi05_geglu_to_fp8_bf16` | 4.0% |
+| `sm89_xmma_gemm...128x128...` | 22.4% |
+| `sm89_xmma_gemm...64x64...` | 21.3% |
+| `sm89_xmma_gemm...32x64...` | 10.0% |
+| FlashRT/FA2 `flash_fwd_splitkv_kernel` | 8.9% |
+| `sm89_xmma_gemm...64x128...` | 8.2% |
+| `pi05_geglu_to_fp8_bf16` | 3.9% |
 
 如果要看非 CUDA Graph 的 launch overhead，可加 `--no-graph`：
 
@@ -776,7 +799,7 @@ export DEVPROC2_LIBPYTHON_SO=/root/miniforge3/envs/py312/lib/libpython3.12.so.1.
 
 `act_scale.* missing`
 
-说明权重包不是当前性能包。可以先去掉 artifact export 里的 `--use-static-act-scales` 做 smoke test；要复现本文性能数字，需要带静态 activation scale 的权重包。
+说明权重包不是当前性能包。可以先去掉 artifact export 里的 `--option use_static_act_scales=true` 做 smoke test；要复现本文性能数字，需要带静态 activation scale 的权重包。
 
 CUTLASS 构建失败
 
@@ -808,10 +831,10 @@ export DEVPROC2_ROOT=/root/tw/devproc2
 export OPENPI_ROOT=/root/tw/openpi
 export OPENPI_PY=$OPENPI_ROOT/.venv/bin/python
 export PI05_CKPT=/root/tools/pi05_libero_base
-export PI05_TORCH_DUMP=/root/tw/openpi/outputs/pi05_torch_infer_libero_base
+export PI05_TORCH_DUMP=/root/tw/openpi/outputs/pi05_torch_infer
 export PI05_TOKENIZER=$PI05_TORCH_DUMP/tokenizer.model
 export PI05_WEIGHT_PKG=$PWD/build/pi05_fp8.weights
-export PI05_DUMP_RAW=$PWD/build/pi05_torch_dump_oracle_libero_base
+export PI05_DUMP_RAW=$PWD/build/pi05_torch_dump_oracle
 export DEVPROC2_FLASHRT_FA2_SO=/root/tw/FlashRT/flash_rt/flash_rt_fa2.cpython-312-x86_64-linux-gnu.so
 export DEVPROC2_LIBPYTHON_SO=/root/miniforge3/envs/py312/lib/libpython3.12.so.1.0
 export PYTHONPATH=$PWD/python:${PYTHONPATH:-}
@@ -827,7 +850,20 @@ OMP_NUM_THREADS=1 PYTHONPATH=$OPENPI_ROOT:$OPENPI_ROOT/src "$OPENPI_PY" \
 
 # 2. 按“从 Dump 生成 Runtime Raw”一节生成 $PI05_DUMP_RAW。
 
-# 3. 导出 P=968 full-token artifact。
+# 3. 配置并构建 CUDA backend / benchmark。
+cmake -S . -B build/root-cuda \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DDEVPROC2_WITH_CUDA=ON \
+  -DDEVPROC2_WITH_TOKENIZERS=ON \
+  -DDEVPROC2_BUILD_TESTS=ON \
+  -DDEVPROC2_WITH_CUTLASS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+
+cmake --build build/root-cuda \
+  --target devproc2_pi05_cuda_backend bench_pi05_denoise \
+  -j2
+
+# 4. 导出 P=968 full-token artifact。
 PYTHONPATH=python python -m devproc2.export.cli \
   --recipe devproc2.models.pi05.recipe:sample_tokens \
   --artifact-dir build/pi05_fp8_sample_tokens_3v968_artifact \
@@ -837,10 +873,8 @@ PYTHONPATH=python python -m devproc2.export.cli \
   --option max_prompt_len=200 \
   --option num_views=3 \
   --sm-arch 89 \
-  --use-static-act-scales
-
-# 4. 编译 benchmark。
-cmake --build build/root-cuda --target bench_pi05_denoise -j2
+  --backend-build-dir build/root-cuda \
+  --option use_static_act_scales=true
 
 # 5. 跑 example0 benchmark。
 export META=$PI05_DUMP_RAW/bf16_example0/metadata.json
