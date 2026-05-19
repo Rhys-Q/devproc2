@@ -37,7 +37,13 @@ def cmd_inspect(artifact_dir: str) -> int:
         return 1
 
     abi_path      = os.path.join(artifact_dir, "abi.json")
-    manifest_path = os.path.join(artifact_dir, "manifest.json")
+    artifact_manifest_path = os.path.join(artifact_dir, "metadata", "artifact.json")
+    legacy_manifest_path = os.path.join(artifact_dir, "manifest.json")
+    manifest_path = (
+        artifact_manifest_path
+        if os.path.exists(artifact_manifest_path)
+        else legacy_manifest_path
+    )
     fn_table_path = os.path.join(artifact_dir, "metadata", "function_table.json")
     vm_path       = os.path.join(artifact_dir, "executable.vm")
 
@@ -48,7 +54,7 @@ def cmd_inspect(artifact_dir: str) -> int:
         manifest = _read_json(manifest_path)
         _print_section("Manifest", manifest)
     else:
-        print("\n[manifest.json not found]")
+        print("\n[metadata/artifact.json or manifest.json not found]")
 
     # ABI
     if os.path.exists(abi_path):

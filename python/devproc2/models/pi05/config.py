@@ -1,8 +1,7 @@
 """Typed Pi0.5 configuration defaults."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
+from dataclasses import asdict, dataclass, field
 
 DEFAULT_PREFIX_ROWS = 968
 DEFAULT_ACTION_HORIZON = 50
@@ -28,6 +27,7 @@ DEFAULT_VISION_INTERMEDIATE_SIZE = 4304
 DEFAULT_VISION_HEADS = 16
 DEFAULT_VISION_OUTPUT_SIZE = 2048
 DEFAULT_TOKENIZER_MODEL = None
+DEFAULT_PROFILE = "pi05_libero_base_3v200"
 
 
 @dataclass(frozen=True)
@@ -110,6 +110,57 @@ class PI05Config:
         if self.layout.fp8_layout not in {"nk", "kn"}:
             raise ValueError("PI05Config.layout.fp8_layout must be 'nk' or 'kn'")
 
+    @classmethod
+    def default_profile(cls) -> str:
+        return DEFAULT_PROFILE
+
+    @classmethod
+    def profiles(cls) -> dict[str, PI05Config]:
+        return {
+            DEFAULT_PROFILE: cls(),
+        }
+
+    @classmethod
+    def for_profile(cls, name: str) -> PI05Config:
+        profiles = cls.profiles()
+        try:
+            return profiles[name]
+        except KeyError as exc:
+            available = ", ".join(sorted(profiles))
+            raise KeyError(f"unknown Pi0.5 profile {name!r}; available: {available}") from exc
+
+    def to_options(self) -> dict[str, object]:
+        shape = self.shape
+        return {
+            "prefix_rows": shape.prefix_rows,
+            "action_horizon": shape.action_horizon,
+            "action_dim": shape.action_dim,
+            "num_steps": shape.num_steps,
+            "num_layers": shape.num_layers,
+            "hidden_size": shape.hidden_size,
+            "intermediate_size": shape.intermediate_size,
+            "num_q_heads": shape.num_q_heads,
+            "num_kv_heads": shape.num_kv_heads,
+            "head_dim": shape.head_dim,
+            "prefix_hidden_size": shape.prefix_hidden_size,
+            "prefix_intermediate_size": shape.prefix_intermediate_size,
+            "max_prompt_len": shape.max_prompt_len,
+            "vocab_size": shape.vocab_size,
+            "vision_layers": shape.vision_layers,
+            "num_views": shape.vision_views,
+            "image_size": shape.image_size,
+            "patch_size": shape.patch_size,
+            "image_channels": shape.image_channels,
+            "vision_hidden_size": shape.vision_hidden_size,
+            "vision_intermediate_size": shape.vision_intermediate_size,
+            "vision_heads": shape.vision_heads,
+            "output_size": shape.vision_output_size,
+            "compile_mode": self.entrypoint.compile_mode,
+        }
+
+    def to_json_obj(self) -> dict[str, object]:
+        return asdict(self)
+
 
 __all__ = [
     "PI05ArtifactRecipeConfig",
@@ -118,4 +169,5 @@ __all__ = [
     "PI05KernelConfig",
     "PI05LayoutConfig",
     "PI05ShapeConfig",
+    "DEFAULT_PROFILE",
 ]

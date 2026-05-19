@@ -116,10 +116,14 @@ cmake -S . -B build/root-cuda \
   -DCMAKE_CUDA_ARCHITECTURES=89
 
 cmake --build build/root-cuda \
-  --target bench_pi05_denoise test_pi05_cuda_gemm test_pi05_denoise_oracle -j2
+  --target bench_pi05_denoise test_pi05_denoise_oracle -j2
 
 ctest --test-dir build/root-cuda/runtime \
-  -R 'test_pi05_cuda_gemm|test_pi05_denoise_oracle' \
+  -R test_pi05_denoise_oracle \
+  --output-on-failure
+
+ctest --test-dir build/pi05-cuda-backend-sm89 \
+  -R test_pi05_cuda_gemm \
   --output-on-failure
 
 build/root-cuda/runtime/tests/bench_pi05_denoise 50 --entry-kind sample_tokens \

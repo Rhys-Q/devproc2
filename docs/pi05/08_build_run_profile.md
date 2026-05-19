@@ -1,6 +1,14 @@
 # Pi0.5 编译、运行与性能 Profile 手册
 
-本文面向第一次接触 devproc2 的同学，目标是从同一个 Pi0.5 checkpoint 出发，生成 openpi PyTorch oracle，导出 devproc2 full-token `sample_tokens` artifact，运行 actions 级精度对点，并用 Nsight 做性能 profile。
+本文面向第一次接触 devproc2 的同学，目标是从同一个 Pi0.5 checkpoint 出发，生成 openpi PyTorch oracle，构建 devproc2 full-token `sample_tokens` artifact，运行 actions 级精度对点，并用 Nsight 做性能 profile。
+
+产品化主流程已经收敛到：
+
+```text
+runtime build -> weight convert -> devproc2 build -> runtime infer
+```
+
+只想构建可部署 artifact 时优先看 `13_product_build_quickstart.md`。本文保留 PyTorch dump、raw oracle 和 Nsight profile 步骤，作为 build 产物的验证手册。
 
 当前推荐流程使用已经安装好的 openpi venv：
 
@@ -148,7 +156,7 @@ convert_pi05_weights(
 PY
 ```
 
-注意：基础 converter 不会自动生成当前性能包里的 `act_scale.*`。如果新包缺少 `act_scale.*`，导出 artifact 时不要加 `--option use_static_act_scales=true`；它能用于 smoke test，但不等同于当前性能 baseline。
+注意：基础 converter 如果没有生成当前性能包里的 `act_scale.*`，会在 `convert_report.json` 写入 `"activation_scales": "missing"` 和 `"supports_static_act_scales": false`。此时 `devproc2 build --activation-scales static` 会在 build 阶段失败；使用 dynamic activation scale 可以做 smoke test，但不等同于当前性能 baseline。
 
 ## 2. 生成同权重 PyTorch Dump
 
@@ -340,60 +348,50 @@ prefix_valid_rows: [895, 900, 906, 900, 904, 894, 902, 906, 898, 905]
 token_valid_len: [127, 132, 138, 132, 136, 126, 134, 138, 130, 137]
 ```
 
-## 4. 导出 Pi0.5 Artifact
+## 4. Build Pi0.5 Artifact
 
-当前 artifact 会打包 `pi05.cuda` packed backend。导出前先确保 `build/root-cuda` 已按 CUDA/CUTLASS 配置，并且 backend shared library 可用：
-
-```bash
-cmake -S . -B build/root-cuda \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DDEVPROC2_WITH_CUDA=ON \
-  -DDEVPROC2_WITH_TOKENIZERS=ON \
-  -DDEVPROC2_BUILD_TESTS=ON \
-  -DDEVPROC2_WITH_CUTLASS=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=89
-
-cmake --build build/root-cuda \
-  --target devproc2_pi05_cuda_backend \
-  -j2
-```
-
-真实 dump 对点主线使用 3-view / P=968：
+真实 dump 对点主线使用 3-view / P=968。当前推荐入口是 `devproc2 build`：
 
 ```bash
-PYTHONPATH=python python -m devproc2.export.cli \
-  --recipe devproc2.models.pi05.recipe:sample_tokens \
-  --artifact-dir build/pi05_fp8_sample_tokens_3v968_artifact \
-  --weight-package-dir "$PI05_WEIGHT_PKG" \
-  --resource tokenizer="$PI05_TOKENIZER" \
-  --option prefix_rows=968 \
-  --option max_prompt_len=200 \
-  --option num_views=3 \
+PYTHONPATH=python python -m devproc2.build \
+  --model pi05 \
+  --entry sample_tokens \
+  --weights "$PI05_WEIGHT_PKG" \
+  --out build/pi05_fp8_sample_tokens_3v968_artifact \
+  --profile pi05_libero_base_3v200 \
+  --target cuda \
   --sm-arch 89 \
-  --backend-build-dir build/root-cuda \
-  --option use_static_act_scales=true
+  --build-backends auto \
+  --backend-cache-dir build/model-backends \
+  --resource tokenizer="$PI05_TOKENIZER" \
+  --activation-scales static
 ```
+
+`pi05.cuda` packed backend 由 `devproc2 build --build-backends auto` 显式构建到 backend cache，再复制进 artifact；`artifact.builder` 不再在找不到 `.so` 时偷偷猜 CMake build dir 并触发编译。
 
 性能 smoke 可继续导出 3-view / P=769 的历史 synthetic 形态：
 
 ```bash
-PYTHONPATH=python python -m devproc2.export.cli \
-  --recipe devproc2.models.pi05.recipe:sample_tokens \
-  --artifact-dir build/pi05_fp8_sample_tokens_3v769_artifact \
-  --weight-package-dir "$PI05_WEIGHT_PKG" \
-  --resource tokenizer="$PI05_TOKENIZER" \
-  --option prefix_rows=769 \
-  --option max_prompt_len=1 \
-  --option num_views=3 \
+PYTHONPATH=python python -m devproc2.build \
+  --model pi05 \
+  --entry sample_tokens \
+  --weights "$PI05_WEIGHT_PKG" \
+  --out build/pi05_fp8_sample_tokens_3v769_artifact \
+  --profile pi05_libero_base_3v200 \
+  --target cuda \
   --sm-arch 89 \
-  --backend-build-dir build/root-cuda \
-  --option use_static_act_scales=true
+  --build-backends auto \
+  --backend-cache-dir build/model-backends \
+  --resource tokenizer="$PI05_TOKENIZER" \
+  --activation-scales static \
+  --option prefix_rows=769 \
+  --option max_prompt_len=1
 ```
 
 导出完成后检查：
 
 ```bash
-python devproc_cli.py inspect build/pi05_fp8_sample_tokens_3v968_artifact
+python -m devproc2.inspect build/pi05_fp8_sample_tokens_3v968_artifact
 ```
 
 至少应看到：
@@ -407,7 +405,8 @@ python devproc_cli.py inspect build/pi05_fp8_sample_tokens_3v968_artifact
 
 ## 5. 编译 C++ Runtime 和 Benchmark
 
-推荐打开 CUTLASS 复现当前性能路径：
+runtime build 不编译 Pi0.5 专用 backend；CUTLASS/FA2 backend 由 `devproc2 build`
+的 backend substage 构建并打包进 artifact。
 
 ```bash
 cmake -S . -B build/root-cuda \
@@ -415,22 +414,38 @@ cmake -S . -B build/root-cuda \
   -DDEVPROC2_WITH_CUDA=ON \
   -DDEVPROC2_WITH_TOKENIZERS=ON \
   -DDEVPROC2_BUILD_TESTS=ON \
-  -DDEVPROC2_WITH_CUTLASS=ON \
   -DCMAKE_CUDA_ARCHITECTURES=89
 
 cmake --build build/root-cuda \
-  --target devproc2_pi05_cuda_backend bench_pi05_denoise test_pi05_cuda_gemm test_cuda_graph \
+  --target devproc2_runtime bench_pi05_denoise test_cuda_graph \
   -j2
 ```
-
-如果 CMake 报 `DEVPROC2_WITH_CUTLASS=ON requires DEVPROC2_CUTLASS_ROOT`，要么指定 CUTLASS checkout，要么先用 `-DDEVPROC2_WITH_CUTLASS=OFF` 跑功能 smoke。关闭 CUTLASS 后性能数字不能和本文 baseline 直接比较。
 
 基础 smoke test：
 
 ```bash
 ctest --test-dir build/root-cuda/runtime \
-  -R 'test_cuda_graph|test_pi05_artifact_load|test_pi05_kernel_launch|test_pi05_cuda_gemm' \
+  -R 'test_cuda_graph|test_pi05_artifact_load|test_pi05_kernel_launch' \
   --output-on-failure
+```
+
+`test_pi05_cuda_gemm` 是 model-owned backend extension 单测，不在 runtime
+CMake tree 里生成。需要单测 backend 时直接配置 Pi0.5 CUDA backend project：
+
+```bash
+cmake -S python/devproc2/models/pi05/cuda \
+  -B build/pi05-cuda-backend-sm89 \
+  -DDEVPROC2_REPO_ROOT=$PWD \
+  -DDEVPROC2_WITH_CUDA=ON \
+  -DDEVPROC2_WITH_CUTLASS=ON \
+  -DDEVPROC2_BUILD_TESTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+
+cmake --build build/pi05-cuda-backend-sm89 \
+  --target test_pi05_cuda_gemm -j
+
+ctest --test-dir build/pi05-cuda-backend-sm89 \
+  -R test_pi05_cuda_gemm --output-on-failure
 ```
 
 `test_pi05_denoise_oracle` 和 `test_pi05_sample_tokens_tokenizer` 依赖历史 raw oracle 的具体形状和额外文件。如果本地 raw 是只给 `sample_tokens` 用的 `.npz` 转换 raw，这些测试失败不等同于 full-token artifact 不能跑。
@@ -799,7 +814,7 @@ export DEVPROC2_LIBPYTHON_SO=/root/miniforge3/envs/py312/lib/libpython3.12.so.1.
 
 `act_scale.* missing`
 
-说明权重包不是当前性能包。可以先去掉 artifact export 里的 `--option use_static_act_scales=true` 做 smoke test；要复现本文性能数字，需要带静态 activation scale 的权重包。
+说明权重包不是当前性能包。可以先用 `devproc2 build --activation-scales dynamic` 做 smoke test；要复现本文性能数字，需要带静态 activation scale 的权重包。
 
 CUTLASS 构建失败
 
@@ -850,31 +865,34 @@ OMP_NUM_THREADS=1 PYTHONPATH=$OPENPI_ROOT:$OPENPI_ROOT/src "$OPENPI_PY" \
 
 # 2. 按“从 Dump 生成 Runtime Raw”一节生成 $PI05_DUMP_RAW。
 
-# 3. 配置并构建 CUDA backend / benchmark。
+# 3. 配置并构建 runtime / benchmark。
 cmake -S . -B build/root-cuda \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DDEVPROC2_WITH_CUDA=ON \
   -DDEVPROC2_WITH_TOKENIZERS=ON \
   -DDEVPROC2_BUILD_TESTS=ON \
-  -DDEVPROC2_WITH_CUTLASS=ON \
   -DCMAKE_CUDA_ARCHITECTURES=89
 
 cmake --build build/root-cuda \
-  --target devproc2_pi05_cuda_backend bench_pi05_denoise \
+  --target devproc2_runtime bench_pi05_denoise \
   -j2
 
-# 4. 导出 P=968 full-token artifact。
-PYTHONPATH=python python -m devproc2.export.cli \
-  --recipe devproc2.models.pi05.recipe:sample_tokens \
-  --artifact-dir build/pi05_fp8_sample_tokens_3v968_artifact \
-  --weight-package-dir "$PI05_WEIGHT_PKG" \
+# 4. Build P=968 full-token artifact；pi05.cuda backend 由 devproc2 build 管理。
+PYTHONPATH=python python -m devproc2.build \
+  --model pi05 \
+  --entry sample_tokens \
+  --weights "$PI05_WEIGHT_PKG" \
+  --out build/pi05_fp8_sample_tokens_3v968_artifact \
+  --profile pi05_libero_base_3v200 \
+  --target cuda \
+  --sm-arch 89 \
+  --build-backends auto \
+  --backend-cache-dir build/model-backends \
   --resource tokenizer="$PI05_TOKENIZER" \
+  --activation-scales static \
   --option prefix_rows=968 \
   --option max_prompt_len=200 \
-  --option num_views=3 \
-  --sm-arch 89 \
-  --backend-build-dir build/root-cuda \
-  --option use_static_act_scales=true
+  --option num_views=3
 
 # 5. 跑 example0 benchmark。
 export META=$PI05_DUMP_RAW/bf16_example0/metadata.json

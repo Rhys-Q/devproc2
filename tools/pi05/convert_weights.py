@@ -7,32 +7,21 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from devproc2.models.pi05.weights import (
-    ACTION_DIM,
     ACTION_HORIZON,
     DEC_D,
-    DEC_H,
     DEC_L,
-    ENC_D,
-    ENC_H,
     ENC_L,
     NUM_STEPS_DEFAULT,
     PI05_MODEL_NAME,
-    VIS_D,
-    VIS_H,
     VIS_L,
-    pi05_act_scale_name,
-    pi05_fp8_scale_name,
-    pi05_fp8_weight_name,
     select_fp8_layout,
 )
 from devproc2.quantization import common_fp8_scale
 from devproc2.weights import (
     BF16,
-    FP16,
-    FP32,
     FP8_E4M3,
+    FP32,
     QuantSpec,
     WeightPackageWriter,
     write_json,
@@ -45,11 +34,14 @@ def convert_pi05_weights(
     *,
     hardware: str | None = "rtx_sm89",
     fp8_layout: str | None = None,
+    activation_scales: str = "missing",
+    shape_profile: str = "pi05_libero_base_3v200",
     include_bf16: bool = True,
     include_support_bf16: bool = True,
     include_fp8: bool = True,
     include_precomputed_styles: bool = True,
     action_horizon: int = ACTION_HORIZON,
+    num_steps: int = NUM_STEPS_DEFAULT,
     device: str = "cuda",
 ) -> None:
     """Convert the local Pi0.5 safetensors checkpoint to a devproc2 package."""
@@ -86,7 +78,7 @@ def convert_pi05_weights(
         styles = _precompute_decoder_styles(
             weights,
             chunk_size=action_horizon,
-            num_steps=NUM_STEPS_DEFAULT,
+            num_steps=num_steps,
             device=device,
         )
         for name, tensor in styles.items():
@@ -119,17 +111,57 @@ def convert_pi05_weights(
             )
 
     writer.write()
+    has_act_scales = any(entry.name.startswith("act_scale.") for entry in writer.entries)
+    requested_static = activation_scales == "static"
+    resolved_activation_scales = (
+        "static"
+        if has_act_scales
+        else "missing"
+        if requested_static or activation_scales == "missing"
+        else "dynamic"
+    )
+    _update_weight_manifest(Path(output_dir) / "manifest.json", {
+        "target_hardware": hardware,
+        "shape_profile": shape_profile,
+        "activation_scales": resolved_activation_scales,
+        "supports_static_act_scales": has_act_scales,
+        "entrypoints_supported": [
+            "step",
+            "loop",
+            "sample_precomputed_prefix",
+            "sample_precomputed_prefix_embs",
+            "sample_tokens",
+            "vision_encoder",
+            "paligemma_prefix_encoder",
+            "paligemma_prefix_kv_encoder",
+        ],
+    })
     write_json(Path(output_dir) / "convert_report.json", {
         "source": {"type": "safetensors", "path": str(safetensors_path)},
         "ruleset": "openpi05_hf_to_devproc2_flashrt_v1",
+        "target_hardware": hardware,
+        "shape_profile": shape_profile,
         "fp8_layout": layout,
+        "activation_scales": resolved_activation_scales,
+        "supports_static_act_scales": has_act_scales,
         "include_bf16": include_bf16,
         "include_support_bf16": include_support_bf16,
         "include_fp8": include_fp8,
         "include_precomputed_styles": include_precomputed_styles,
         "action_horizon": int(action_horizon),
+        "num_steps": int(num_steps),
         "num_entries": len(writer.entries),
     })
+
+
+def _update_weight_manifest(path: Path, extra: dict[str, Any]) -> None:
+    manifest = {}
+    if path.exists():
+        import json
+
+        manifest = json.loads(path.read_text())
+    manifest.update(extra)
+    write_json(path, manifest)
 
 
 def _convert_pi05_safetensors(safetensors_path: Path) -> dict[str, Any]:
@@ -440,11 +472,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--hardware", default="rtx_sm89")
     parser.add_argument("--fp8-layout", choices=("kn", "nk"), default=None)
+    parser.add_argument(
+        "--activation-scales",
+        choices=("missing", "dynamic", "static"),
+        default="missing",
+    )
+    parser.add_argument("--shape-profile", default="pi05_libero_base_3v200")
     parser.add_argument("--no-bf16", action="store_true")
     parser.add_argument("--no-support-bf16", action="store_true")
     parser.add_argument("--no-fp8", action="store_true")
     parser.add_argument("--no-precomputed-styles", action="store_true")
     parser.add_argument("--action-horizon", type=int, default=ACTION_HORIZON)
+    parser.add_argument("--num-steps", type=int, default=NUM_STEPS_DEFAULT)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
     convert_pi05_weights(
@@ -452,11 +491,14 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=args.output_dir,
         hardware=args.hardware,
         fp8_layout=args.fp8_layout,
+        activation_scales=args.activation_scales,
+        shape_profile=args.shape_profile,
         include_bf16=not args.no_bf16,
         include_support_bf16=not args.no_support_bf16,
         include_fp8=not args.no_fp8,
         include_precomputed_styles=not args.no_precomputed_styles,
         action_horizon=args.action_horizon,
+        num_steps=args.num_steps,
         device=args.device,
     )
 

@@ -42,7 +42,7 @@ current weight package: /root/tw/devproc2/build/pi05_fp8.weights
 
 ## 当前链路
 
-当前实际可跑流程大致是：
+迁移前实际可跑流程大致是：
 
 ```text
 tools/pi05/convert_weights.py
@@ -71,7 +71,7 @@ runtime C++ / bench
 - `python/devproc2/export/pipeline.py`：通用 compile / emit / artifact pipeline。
 - `python/devproc2/artifact/builder.py`：安装 weights、resources、kernels、packed backends。
 - `python/devproc2/models/pi05/recipe.py`：Pi0.5 entrypoint recipe、legacy compile/export helper、packed backend recipe。
-- `runtime/CMakeLists.txt`：同时构建 runtime core 和 `devproc2_pi05_cuda_backend`。
+- `runtime/CMakeLists.txt`：迁移前同时构建 runtime core 和 `devproc2_pi05_cuda_backend`。
 - `runtime/src/vm.cc`：加载 artifact、权重、kernel table、packed backend table 和 tokenizer resource。
 
 ## 不符合预期的地方
@@ -115,7 +115,7 @@ python -m devproc2.export.cli \
 
 ### 3. runtime build 和 model-specific backend build 边界不清
 
-`runtime/CMakeLists.txt` 在 `DEVPROC2_WITH_CUDA=ON` 时直接定义 `devproc2_pi05_cuda_backend`。这说明 runtime CMake 目前既在编译 devproc2 framework runtime，也在编译 Pi0.5 模型专用 CUDA backend。
+迁移前 `runtime/CMakeLists.txt` 在 `DEVPROC2_WITH_CUDA=ON` 时直接定义 `devproc2_pi05_cuda_backend`。这说明旧 runtime CMake 既在编译 devproc2 framework runtime，也在编译 Pi0.5 模型专用 CUDA backend。
 
 同时，`artifact.builder.prepare_artifact(...)` 在找不到 packed backend shared library 时，会尝试在候选 CMake build dir 里执行：
 
@@ -236,7 +236,7 @@ cmake --build build/runtime-sm89 \
   -j
 ```
 
-Pi0.5 的 `pi05.cuda` backend 是模型专用能力，不是 runtime core。短期如果 CMake 目标还在 `runtime/CMakeLists.txt` 中，也要把它当成 model-owned backend extension；长期应迁到 model backend build registry 或 `python/devproc2/models/pi05/cuda` 附近的 build 描述。
+Pi0.5 的 `pi05.cuda` backend 是模型专用能力，不是 runtime core。当前 target 定义已经迁到 `python/devproc2/models/pi05/cuda/CMakeLists.txt`，由 `devproc2 build` backend substage 或 model CUDA project 直接构建。
 
 如果需要跑本机验证工具，可以在 runtime build 后额外构建 benchmark/test binary；这些 binary 不是 runtime core 的一部分。
 
@@ -596,6 +596,8 @@ python -m devproc2.build --model pi05 --entry sample_tokens ...
 - 把 `devproc2_pi05_cuda_backend` 语义标注为 model backend extension。
 - runtime build 只产出 devproc2 runtime core，不默认构建 Pi0.5 backend。
 - `devproc2.build` 的 backend substage 负责构建或复用 Pi0.5 backend extension。
+- Pi0.5 backend CMake target 定义位于 `python/devproc2/models/pi05/cuda`，
+  不再由 runtime CMake tree 承载。
 - artifact builder 只安装 backend substage 的 build result，不负责 CMake build。
 - runtime core 保留 `ModelSession::LoadArtifact`、packed backend dlopen、kernel table load、WeightStore；不拥有 Pi0.5 专用默认路径。
 
@@ -603,6 +605,7 @@ python -m devproc2.build --model pi05 --entry sample_tokens ...
 
 - runtime core 可独立编译。
 - Pi0.5 backend 可由 `devproc2 build --build-backends auto` 编译、缓存并打包进 artifact。
+- `test_pi05_cuda_gemm` 由 Pi0.5 model CUDA project 构建，不属于 runtime core test tree。
 - artifact 在另一台相同 ABI/SM 的机器上只依赖 runtime core 和 artifact 内容即可加载。
 
 ## 目标命令形态
@@ -669,4 +672,5 @@ build/runtime-sm89/runtime/tests/bench_pi05_denoise 50 \
 - profile/oracle 文档只作为验证补充，不再定义生产编译流程。
 - 同权重精度不能回退：使用 `/root/tools/pi05_libero_base`、`/root/tw/openpi/outputs/pi05_torch_infer`、`/root/tw/devproc2/build/pi05_torch_dump_oracle` 验收，same-weight example0 `final_abs_max/final_abs_mean` 不应劣于当前 `0.021 / 0.002` 量级；10-example profile 的 `mean_abs_mean`、`max_abs_mean` 不应劣于当前 `0.0054 / 0.018` 量级。
 - 性能不能回退：3-view / P=968 / `sample_tokens` / CUDA Graph 路径应维持当前 `mean_10step_ms ~= 33.7ms` 水平，默认允许不超过 5% 的测量波动；超过该范围必须定位并说明。
-- 基础 runtime tests 必须通过：`test_cuda_graph`、`test_pi05_artifact_load`、`test_pi05_kernel_launch`、`test_pi05_cuda_gemm`。
+- 基础 runtime tests 必须通过：`test_cuda_graph`、`test_pi05_artifact_load`、`test_pi05_kernel_launch`。
+- Pi0.5 model backend test 必须通过：`test_pi05_cuda_gemm`。

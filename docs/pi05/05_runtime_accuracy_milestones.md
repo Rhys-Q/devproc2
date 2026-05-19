@@ -94,8 +94,11 @@
 
 ```bash
 ctest --test-dir build/root-cuda/runtime \
-  -R 'test_cuda_graph|test_pi05_artifact_load|test_pi05_weight_store|test_pi05_kernel_launch|test_pi05_cuda_gemm|test_pi05_denoise_oracle|test_pi05_sample_tokens_tokenizer' \
+  -R 'test_cuda_graph|test_pi05_artifact_load|test_pi05_weight_store|test_pi05_kernel_launch|test_pi05_denoise_oracle|test_pi05_sample_tokens_tokenizer' \
   --output-on-failure
+
+ctest --test-dir build/pi05-cuda-backend-sm89 \
+  -R test_pi05_cuda_gemm --output-on-failure
 
 ctest --test-dir build/root-tokenizers/runtime \
   -R test_pi05_tokenizer --output-on-failure

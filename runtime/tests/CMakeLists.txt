@@ -67,17 +67,6 @@ target_compile_options(test_pi05_kernel_launch PRIVATE
 )
 add_test(NAME test_pi05_kernel_launch COMMAND test_pi05_kernel_launch)
 
-add_executable(test_pi05_cuda_gemm test_pi05_cuda_gemm.cu)
-target_link_libraries(test_pi05_cuda_gemm PRIVATE devproc2_runtime)
-add_dependencies(test_pi05_cuda_gemm devproc2_pi05_cuda_backend)
-target_compile_definitions(test_pi05_cuda_gemm PRIVATE
-    DEVPROC2_PI05_CUDA_BACKEND_SO="$<TARGET_FILE:devproc2_pi05_cuda_backend>"
-)
-target_compile_options(test_pi05_cuda_gemm PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:$<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>>
-)
-add_test(NAME test_pi05_cuda_gemm COMMAND test_pi05_cuda_gemm)
-
 add_executable(test_pi05_denoise_oracle test_pi05_denoise_oracle.cc)
 target_link_libraries(test_pi05_denoise_oracle PRIVATE devproc2_runtime)
 target_compile_definitions(test_pi05_denoise_oracle PRIVATE

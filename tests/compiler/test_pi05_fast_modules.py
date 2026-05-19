@@ -4,16 +4,17 @@ import importlib
 import json
 from pathlib import Path
 
-import pytest
-
 import devproc2 as dp
 import devproc2.frontend.dsl as dsl
+import pytest
 from devproc2.compiler.pass_context import PassContext
 from devproc2.compiler.passes.dps_lowering import DPSLoweringPass
 from devproc2.compiler.passes.infer_struct_info import InferStructInfoPass
 from devproc2.compiler.passes.lower_tensor_create_to_alloc import LowerTensorCreateToAllocPass
 from devproc2.compiler.passes.memory_planning import MemoryPlanningPass
 from devproc2.compiler.passes.vm_codegen import VMCodegenPass
+from devproc2.export.pipeline import build_graph, compile_entrypoint, emit_entrypoint
+from devproc2.export.recipe import EntrypointRecipe
 from devproc2.ir.op_ref import KernelRef, PackedFuncRef
 from devproc2.ir.ops import (
     CallDPSOp,
@@ -24,13 +25,12 @@ from devproc2.ir.ops import (
     TensorViewOp,
     TupleOp,
 )
-from devproc2.nn import GraphBuilder, ScalarSpec, TensorSpec
 from devproc2.models.pi05.model import (
+    PI05FFN,
     PI05Attention,
     PI05DecoderLayer,
     PI05DenoiseLoop,
     PI05DenoiseStep,
-    PI05FFN,
     PI05LanguageEmbedding,
     PI05Linear,
     PI05PaliGemmaEncoderLayer,
@@ -41,24 +41,16 @@ from devproc2.models.pi05.model import (
     PI05VisionPatchEmbedding,
 )
 from devproc2.models.pi05.recipe import (
-    emit_pi05_denoise_executable,
-    emit_pi05_denoise_loop_executable,
-    emit_pi05_paligemma_prefix_encoder_executable,
-    emit_pi05_paligemma_prefix_kv_encoder_executable,
-    emit_pi05_sample_actions_precomputed_prefix_embs_executable,
-    emit_pi05_sample_actions_precomputed_prefix_executable,
-    emit_pi05_vision_encoder_executable,
-    compile_pi05_sample_actions_tokens_executable,
     pi05_denoise_input_specs,
     pi05_denoise_loop_input_specs,
     pi05_paligemma_prefix_encoder_input_specs,
     pi05_paligemma_prefix_kv_encoder_input_specs,
+    pi05_recipe,
     pi05_sample_actions_precomputed_prefix_embs_input_specs,
     pi05_sample_actions_precomputed_prefix_input_specs,
     pi05_vision_encoder_input_specs,
 )
-from devproc2.nn import Module
-
+from devproc2.nn import GraphBuilder, Module, ScalarSpec, TensorSpec
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PI05_MODEL_SOURCE = _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "model.py"
@@ -97,6 +89,26 @@ def _call_names(module):
 def _lowered_ops(module, fn_name: str):
     lowered = DPSLoweringPass(dsl.get_kernel_registry(), sm_arch=89).run(module)
     return lowered.functions[fn_name].body.blocks[0].ops
+
+
+def _emit_entry_artifact(entry: str, output_dir: Path, **options):
+    return emit_entrypoint(
+        pi05_recipe.entrypoint(entry),
+        output_dir,
+        options=options,
+        target_arch="sm89",
+        sm_arch=89,
+        compile_mode=options.get("compile_mode"),
+    )
+
+
+def _compile_entry_graph(entry: str, **options):
+    return compile_entrypoint(
+        pi05_recipe.entrypoint(entry),
+        options=options,
+        sm_arch=89,
+        compile_mode=options.get("compile_mode"),
+    )
 
 
 def test_pi05_model_layer_keeps_backend_ops_behind_ops_facade():
@@ -158,8 +170,6 @@ def test_pi05_public_imports_use_canonical_modules():
 
 
 def test_pi05_normal_compile_rejects_backend_ops_in_forward():
-    from devproc2.models.pi05.recipe import _build_pi05_graph
-
     source = _REPO_ROOT / "python" / "devproc2" / "models" / "pi05" / "cuda" / "pi05_kernels.cu"
 
     class UnsafeCudaForward(Module):
@@ -189,19 +199,25 @@ def test_pi05_normal_compile_rejects_backend_ops_in_forward():
             return out
 
     input_specs = {"x": TensorSpec((2, 4), "bfloat16")}
-    with pytest.raises(RuntimeError, match="normal Pi0.5 path emitted cuda_call"):
-        _build_pi05_graph(
-            UnsafeCudaForward(),
-            input_specs,
-            function_name="main",
+    with pytest.raises(RuntimeError, match="normal path emitted cuda_call"):
+        build_graph(
+            EntrypointRecipe(
+                name="unsafe_cuda",
+                model_id="unit",
+                build_module=lambda opts: UnsafeCudaForward(),
+                input_specs=lambda opts: input_specs,
+            ),
             compile_mode="normal",
         )
 
-    with pytest.raises(RuntimeError, match="normal Pi0.5 path emitted DPS/packed call"):
-        _build_pi05_graph(
-            UnsafePackedForward(),
-            input_specs,
-            function_name="main",
+    with pytest.raises(RuntimeError, match="normal path emitted DPS/packed call"):
+        build_graph(
+            EntrypointRecipe(
+                name="unsafe_packed",
+                model_id="unit",
+                build_module=lambda opts: UnsafePackedForward(),
+                input_specs=lambda opts: input_specs,
+            ),
             compile_mode="normal",
         )
 
@@ -640,7 +656,6 @@ def test_pi05_paligemma_prefix_kv_encoder_materializes_cache_tuple():
             "rope_interleaved": TensorSpec((5, 4), "bfloat16"),
         },
     )
-    fn = module.functions["materialize_kv_fast"]
     ops = _lowered_ops(module, "materialize_kv_fast")
     creates = [op for op in ops if isinstance(op, TensorCreateOp)]
     dps_ops = [op for op in ops if isinstance(op, CallDPSOp)]
@@ -1124,7 +1139,7 @@ def test_pi05_paligemma_prefix_kv_encoder_input_specs_include_valid_rows():
 
 
 def test_pi05_denoise_export_emits_main_vm_and_abi(tmp_path):
-    summary = emit_pi05_denoise_executable(
+    summary = _emit_entry_artifact("step",
         tmp_path,
         num_layers=2,
         hidden_size=8,
@@ -1160,7 +1175,7 @@ def test_pi05_denoise_export_emits_main_vm_and_abi(tmp_path):
 
 
 def test_pi05_denoise_loop_export_emits_main_vm_and_abi(tmp_path):
-    summary = emit_pi05_denoise_loop_executable(
+    summary = _emit_entry_artifact("loop",
         tmp_path,
         num_layers=1,
         hidden_size=8,
@@ -1190,7 +1205,7 @@ def test_pi05_denoise_loop_export_emits_main_vm_and_abi(tmp_path):
 
 
 def test_pi05_sample_actions_precomputed_prefix_export_emits_sample_actions_abi(tmp_path):
-    summary = emit_pi05_sample_actions_precomputed_prefix_executable(
+    summary = _emit_entry_artifact("sample_precomputed_prefix",
         tmp_path,
         num_layers=1,
         hidden_size=8,
@@ -1225,7 +1240,7 @@ def test_pi05_sample_actions_precomputed_prefix_export_emits_sample_actions_abi(
 
 
 def test_pi05_sample_actions_precomputed_prefix_embs_export_emits_single_artifact_abi(tmp_path):
-    summary = emit_pi05_sample_actions_precomputed_prefix_embs_executable(
+    summary = _emit_entry_artifact("sample_precomputed_prefix_embs",
         tmp_path,
         num_layers=1,
         prefix_hidden_size=8,
@@ -1265,7 +1280,7 @@ def test_pi05_sample_actions_precomputed_prefix_embs_export_emits_single_artifac
 
 
 def test_pi05_vision_encoder_export_emits_main_vm_and_abi(tmp_path):
-    summary = emit_pi05_vision_encoder_executable(
+    summary = _emit_entry_artifact("vision_encoder",
         tmp_path,
         num_layers=1,
         num_views=1,
@@ -1294,7 +1309,7 @@ def test_pi05_vision_encoder_export_emits_main_vm_and_abi(tmp_path):
 
 
 def test_pi05_paligemma_prefix_encoder_export_emits_main_vm_and_abi(tmp_path):
-    summary = emit_pi05_paligemma_prefix_encoder_executable(
+    summary = _emit_entry_artifact("paligemma_prefix_encoder",
         tmp_path,
         prefix_rows=5,
         num_layers=1,
@@ -1322,7 +1337,7 @@ def test_pi05_paligemma_prefix_encoder_export_emits_main_vm_and_abi(tmp_path):
 
 
 def test_pi05_paligemma_prefix_kv_encoder_export_emits_tuple_outputs(tmp_path):
-    summary = emit_pi05_paligemma_prefix_kv_encoder_executable(
+    summary = _emit_entry_artifact("paligemma_prefix_kv_encoder",
         tmp_path,
         prefix_rows=5,
         num_layers=2,
@@ -1351,7 +1366,7 @@ def test_pi05_paligemma_prefix_kv_encoder_export_emits_tuple_outputs(tmp_path):
 
 
 def test_pi05_sample_tokens_normal_mode_compiles_without_cuda_kernels():
-    result = compile_pi05_sample_actions_tokens_executable(
+    result = _compile_entry_graph("sample_tokens",
         function_name="main",
         action_horizon=2,
         action_dim=4,

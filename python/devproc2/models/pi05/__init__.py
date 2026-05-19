@@ -10,11 +10,12 @@ from devproc2.models.pi05.config import (
     PI05ShapeConfig,
 )
 from devproc2.models.pi05.model import (
+    PI05_MODEL,
+    PI05FFN,
     PI05Attention,
     PI05DecoderLayer,
     PI05DenoiseLoop,
     PI05DenoiseStep,
-    PI05FFN,
     PI05LanguageEmbedding,
     PI05Linear,
     PI05PaliGemmaEncoderLayer,
@@ -49,7 +50,6 @@ from devproc2.models.pi05.weights import (
     select_fp8_layout,
 )
 
-
 __all__ = [
     "PI05Attention",
     "PI05ArtifactRecipeConfig",
@@ -63,6 +63,7 @@ __all__ = [
     "PI05LanguageEmbedding",
     "PI05Linear",
     "PI05LayoutConfig",
+    "PI05_MODEL",
     "PI05_MODEL_NAME",
     "PI05PaliGemmaEncoderLayer",
     "PI05PaliGemmaPrefixEncoder",

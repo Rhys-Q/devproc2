@@ -1,16 +1,16 @@
 """Generic artifact resource packaging."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import datetime as _dt
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
-import subprocess
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from devproc2.artifact.manifest import PackedBackendRecipe, ResourceSpec
 from devproc2.kernel import KernelLaunchSpec, KernelSpec
@@ -254,24 +254,19 @@ def _resolve_compiled_backend_library(
         if found is not None:
             return found
 
-    build_dirs = _candidate_backend_build_dirs(backend_build_dir)
-    for build_dir in build_dirs:
-        found = _find_library(build_dir, library_names)
+    if backend_build_dir is not None:
+        found = _find_library(backend_build_dir, library_names)
         if found is not None:
             return found
 
-    for build_dir in build_dirs:
-        if not (build_dir / "CMakeCache.txt").exists():
-            continue
-        _build_backend_target(build_dir, target)
-        found = _find_library(build_dir, library_names)
-        if found is not None:
-            return found
-
-    searched = ", ".join(str(path) for path in [*search_dirs, *build_dirs])
+    searched_dirs = [*search_dirs]
+    if backend_build_dir is not None:
+        searched_dirs.append(backend_build_dir)
+    searched = ", ".join(str(path) for path in searched_dirs)
     raise FileNotFoundError(
         f"Could not locate compiled packed backend {backend.name!r}. "
-        f"Set {env_name} or build CMake target {target}. Searched: {searched}"
+        f"Set {env_name}, pass --backend-library-dir, or run "
+        f"devproc2 build --build-backends auto. Searched: {searched}"
     )
 
 
@@ -288,29 +283,6 @@ def _backend_library_names(target: str) -> tuple[str, ...]:
     )
 
 
-def _candidate_backend_build_dirs(explicit: Path | None) -> list[Path]:
-    dirs: list[Path] = []
-    if explicit is not None:
-        dirs.append(explicit)
-    env_dir = os.environ.get("DEVPROC2_CMAKE_BUILD_DIR")
-    if env_dir:
-        dirs.append(Path(env_dir))
-    root = Path(__file__).resolve().parents[3]
-    build_root = root / "build"
-    dirs.extend([build_root / "root-cuda", build_root / "root-default"])
-    if build_root.exists():
-        dirs.extend(sorted(path for path in build_root.iterdir() if path.is_dir()))
-
-    deduped: list[Path] = []
-    seen: set[Path] = set()
-    for path in dirs:
-        resolved = path.resolve()
-        if resolved not in seen:
-            deduped.append(path)
-            seen.add(resolved)
-    return deduped
-
-
 def _find_library(root: Path, names: tuple[str, ...]) -> Path | None:
     if not root.exists():
         return None
@@ -323,26 +295,6 @@ def _find_library(root: Path, names: tuple[str, ...]) -> Path | None:
     if not matches:
         return None
     return max(matches, key=lambda path: path.stat().st_mtime)
-
-
-def _build_backend_target(build_dir: Path, target: str) -> None:
-    jobs = str(max(1, min(os.cpu_count() or 2, 8)))
-    try:
-        subprocess.run(
-            ["cmake", "--build", str(build_dir), "--target", target, "-j", jobs],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("cmake is required to build packed backend libraries") from exc
-    except subprocess.CalledProcessError as exc:
-        output = exc.stdout or ""
-        tail = output[-4000:]
-        raise RuntimeError(
-            f"Failed to build packed backend target {target!r} in {build_dir}:\n{tail}"
-        ) from exc
 
 
 def _load_cuda_kernel_specs(path: Path, *, sm_arch: int) -> list[KernelSpec]:

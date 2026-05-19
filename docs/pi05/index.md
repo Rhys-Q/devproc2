@@ -90,6 +90,7 @@ PyTorch 侧 `sample_actions` 的核心流程：
 - [09_pi05_refactor_plan.md](09_pi05_refactor_plan.md)：当前 Pi0.5 实现锐评、边界问题和保持性能不回退的重构方案。
 - [11_framework_boundary_refactor.md](11_framework_boundary_refactor.md)：Pi0.5 业务模型不应进入 devproc2 框架层的锐评、目标结构和迁移方案。
 - [12_compile_flow_refactor.md](12_compile_flow_refactor.md)：按 runtime build、weight convert、model build、runtime inference 重塑 Pi0.5 产品化编译流程。
+- [13_product_build_quickstart.md](13_product_build_quickstart.md)：产品化主线：runtime build、weight convert、`devproc2 build`、runtime inference。
 
 ## Milestones
 
